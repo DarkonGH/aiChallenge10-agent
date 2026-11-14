@@ -7,6 +7,10 @@ package main
 
 import "fmt"
 
+// terminalWidth — заглушка для платформ без сырого режима: редактор там
+// деградирует до построчного ввода и ширину терминала не использует.
+func terminalWidth() int { return 80 }
+
 type rawState struct{}
 
 func makeRaw(fd uintptr) (*rawState, error) {

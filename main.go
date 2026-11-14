@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ type app struct {
 	maxToolChars int
 	noCompact    bool
 	compactEvery int
+	strategy     Strategy
+	window       int
 
 	hist  *History
 	agent *Agent
@@ -166,12 +169,23 @@ func main() {
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
+	strategyFlag := flag.String("strategy", string(StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
+	windowFlag := flag.Int("window", 0, "размер окна для стратегий window и facts (обязателен для них)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
 	flag.Parse()
+
+	strategy, err := ParseStrategy(*strategyFlag)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	window := *windowFlag
+	if strategy.needsWindow() && window <= 0 {
+		fatalf("стратегии %s нужен размер окна: -window N (сколько последних сообщений отправлять модели)", strategy)
+	}
 
 	dataDir := *dataFlag
 	if dataDir == "" {
@@ -231,6 +245,8 @@ func main() {
 		maxToolChars: *maxToolChars,
 		noCompact:    *noCompact,
 		compactEvery: *compactEvery,
+		strategy:     strategy,
+		window:       window,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
@@ -271,11 +287,18 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	a.agent.SetNoCompact(a.noCompact)
 	a.agent.SetCompactEvery(a.compactEvery)
+	a.agent.SetStrategy(a.strategy)
+	a.agent.SetWindow(a.window)
 	return nil
 }
 
 func (a *app) repl() {
-	fmt.Printf("сессия %s · модель %s · сжатие %s\n/help — команды: /model — модель, /session — сессия, /exit — выход; статистика — после каждого ответа\n", a.hist.ID(), a.hist.ChatModel(), a.hist.SummaryModel())
+	mode := fmt.Sprintf(" · стратегия %s", a.strategy)
+	if a.strategy.needsWindow() {
+		mode += fmt.Sprintf(" (%d сообщ.)", a.window)
+	}
+	fmt.Printf("сессия %s · модель %s · сжатие %s%s\n/help — команды: /model — модель, /session — сессия, /branch — ветки, /exit — выход; статистика — после каждого ответа\n",
+		a.hist.ID(), a.hist.ChatModel(), a.hist.SummaryModel(), mode)
 	if envModel := strings.TrimSpace(os.Getenv("LLM_MODEL")); envModel != "" && envModel != a.hist.ChatModel() {
 		fmt.Printf("внимание: сессия сохранена с моделью %s, а LLM_MODEL=%s; переключить: /model %s\n",
 			a.hist.ChatModel(), envModel, envModel)
@@ -379,6 +402,9 @@ func (a *app) footer() {
 	if a.hist.HasSummary() {
 		extra = fmt.Sprintf(" · конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
 	}
+	if a.strategy.needsWindow() {
+		extra += fmt.Sprintf(" · %s(%d)", a.strategy, a.window)
+	}
 	prompt := a.agent.comp.PromptTokens(a.hist.SystemPrompt())
 	over := ""
 	if prompt > a.budget.MaxPromptTokens {
@@ -390,6 +416,18 @@ func (a *app) footer() {
 		prompt, a.budget.MaxPromptTokens,
 		a.agent.LastAnswerTokens(),
 		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost, over)
+}
+
+// describeStrategy prints the active context strategy in one line.
+func describeStrategy(s Strategy, window int) {
+	switch s {
+	case StrategySummary:
+		fmt.Println("стратегия контекста: summary — старые ходы сворачиваются в конспект моделью сжатия")
+	case StrategyWindow:
+		fmt.Printf("стратегия контекста: window — в промпте только последние %d сообщений, остальное вытесняется в архив без конспекта\n", window)
+	case StrategyFacts:
+		fmt.Printf("стратегия контекста: facts — блок «ключ: значение» (обновляется после каждого сообщения) + последние %d сообщений\n", window)
+	}
 }
 
 func (a *app) command(line string) (bool, error) {
@@ -472,6 +510,100 @@ func (a *app) command(line string) (bool, error) {
 		a.hist.SetSummaryModel(arg)
 		fmt.Println("модель сжатия:", arg, "— вступит в силу со следующего сжатия (/compact — сжать сейчас)")
 
+	case "/strategy":
+		if arg == "" {
+			describeStrategy(a.strategy, a.window)
+			fmt.Println("переключить: /strategy summary | window | facts [N]")
+			return false, nil
+		}
+		fields := strings.Fields(arg)
+		st, err := ParseStrategy(fields[0])
+		if err != nil {
+			return false, err
+		}
+		win := a.window
+		if len(fields) > 1 {
+			n, perr := strconv.Atoi(fields[1])
+			if perr != nil || n <= 0 {
+				return false, fmt.Errorf("размер окна — целое число > 0: /strategy %s N", st)
+			}
+			win = n
+		}
+		if st.needsWindow() && win <= 0 {
+			return false, fmt.Errorf("стратегии %s нужен размер окна: /strategy %s N", st, st)
+		}
+		a.strategy = st
+		a.window = win
+		a.agent.SetStrategy(st)
+		a.agent.SetWindow(win)
+		describeStrategy(a.strategy, a.window)
+
+	case "/facts":
+		facts := a.hist.Facts()
+		if len(facts) == 0 {
+			fmt.Println("фактов нет; стратегия facts наполняет их после каждого сообщения")
+			return false, nil
+		}
+		fmt.Printf("факты (%d ключей, ~%d ток.):\n", len(facts), EstimateTokens(renderFacts(facts)))
+		fmt.Println(renderFacts(facts))
+
+	case "/branch":
+		if arg == "" {
+			if p := a.hist.ForkOf(); p != "" {
+				fmt.Printf("родитель: %s (чекпоинт seq %d)\n", p, a.hist.ForkSeq())
+			}
+			kids, err := ListForks(a.dataDir, a.hist.ID())
+			if err != nil {
+				return false, err
+			}
+			if len(kids) == 0 {
+				fmt.Println("веток от этой сессии пока нет")
+			} else {
+				fmt.Println("ветки от текущей сессии:")
+				for _, k := range kids {
+					marker := ""
+					if k == a.hist.ID() {
+						marker = " (вы здесь)"
+					}
+					fmt.Println("  ·", k+marker)
+				}
+			}
+			fmt.Println("создать ветку от текущего места: /branch <имя>; переключиться: /branch <имя существующей>")
+			return false, nil
+		}
+		name := strings.Fields(arg)[0]
+		if name == a.hist.ID() {
+			fmt.Println("уже в этой сессии:", name)
+			return false, nil
+		}
+		exists := false
+		if infos, err := SummarizeSessions(a.dataDir); err == nil {
+			for _, inf := range infos {
+				if inf.ID == name {
+					exists = true
+					break
+				}
+			}
+		}
+		if !exists {
+			id, err := ForkSession(a.dataDir, a.hist.ID(), name)
+			if err != nil {
+				return false, err
+			}
+			fmt.Printf("чекпоинт: ветка %s создана от %s (seq %d); продолжить в ней: /branch %s\n",
+				id, a.hist.ID(), a.hist.LastSeq(), id)
+			return false, nil
+		}
+		if err := a.newSession(name, "", ""); err != nil {
+			return false, err
+		}
+		line := fmt.Sprintf("сессия: %s · модель %s · сжатие %s", a.hist.ID(), a.hist.ChatModel(), a.hist.SummaryModel())
+		if p := a.hist.ForkOf(); p != "" {
+			line += fmt.Sprintf(" · ветка от %s (seq %d)", p, a.hist.ForkSeq())
+		}
+		activeMsgs, _, archivedMsgs, _ := a.hist.Stats()
+		fmt.Printf("%s · сообщений %d (актив %d, архив %d)\n", line, activeMsgs+archivedMsgs, activeMsgs, archivedMsgs)
+
 	case "/system":
 		fmt.Println(a.hist.SystemPrompt())
 
@@ -546,14 +678,14 @@ func (a *app) printHistory() {
 // prompt, the rolling summary, the verbatim tail and the tool schemas, with a
 // token estimate per block. It is the "what did compression do" view.
 func (a *app) printContext() {
-	active := a.hist.Active()
-	base := EstimateTokens(a.hist.SystemPrompt()) + 4
-	sumTok := 0
-	if a.hist.HasSummary() {
-		sumTok = EstimateTokens("Конспект предыдущего диалога:\n"+a.hist.SummaryText()) + 4
+	promptMsgs := a.agent.comp.promptWindow()
+	base := EstimateTokens(a.agent.comp.promptSystem(a.hist.SystemPrompt()))
+	factsTok := 0
+	if facts := a.hist.Facts(); len(facts) > 0 {
+		factsTok = EstimateTokens("Факты диалога (память о договорённостях):\n" + renderFacts(facts))
 	}
 	histTok := 0
-	for _, m := range active {
+	for _, m := range promptMsgs {
 		msg := *m
 		if msg.Role == "tool" {
 			msg.Content = truncate(msg.Content, a.maxToolChars)
@@ -572,17 +704,30 @@ func (a *app) printContext() {
 		}
 	}
 
-	fmt.Printf("что уходит в модель (сессия %s, модель %s):\n", a.hist.ID(), a.hist.ChatModel())
+	fmt.Printf("что уходит в модель (сессия %s, модель %s, стратегия %s):\n", a.hist.ID(), a.hist.ChatModel(), a.strategy)
 	fmt.Printf("  system prompt        ~%d ток.\n", base)
-	if a.hist.HasSummary() {
-		cov := a.hist.SummaryCovers()
-		fmt.Printf("  конспект seq %d..%d   ~%d ток.\n", cov[0], cov[1], sumTok)
-	} else {
-		fmt.Println("  конспект             нет")
+	switch a.strategy {
+	case StrategyFacts:
+		if factsTok > 0 {
+			fmt.Printf("  факты                ~%d ток. (%d ключей)\n", factsTok, len(a.hist.Facts()))
+		} else {
+			fmt.Println("  факты                нет")
+		}
+		fmt.Printf("  окно                 последние %d сообщ.\n", a.window)
+	case StrategyWindow:
+		fmt.Printf("  окно                 последние %d сообщ. (без конспекта — стратегия window)\n", a.window)
+	default:
+		if a.hist.HasSummary() {
+			cov := a.hist.SummaryCovers()
+			sumTok := EstimateTokens("Конспект предыдущего диалога:\n"+a.hist.SummaryText()) + 4
+			fmt.Printf("  конспект seq %d..%d   ~%d ток.\n", cov[0], cov[1], sumTok)
+		} else {
+			fmt.Println("  конспект             нет")
+		}
 	}
-	if len(active) > 0 {
+	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
-			histTok, len(active), active[0].Seq, active[len(active)-1].Seq)
+			histTok, len(promptMsgs), promptMsgs[0].Seq, promptMsgs[len(promptMsgs)-1].Seq)
 	} else {
 		fmt.Println("  история дословно     пусто")
 	}
@@ -591,26 +736,45 @@ func (a *app) printContext() {
 	fmt.Printf("  итого                ~%d ток. из %d (калибровка ×%.2f)\n",
 		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
 
-	if a.noCompact {
-		fmt.Println("  авто-сжатие отключено (-no-compact)")
-	} else {
-		limit := a.budget.MaxPromptTokens - a.budget.ReserveOutput
-		if limit < 500 {
-			limit = 500
+	switch a.strategy {
+	case StrategyWindow, StrategyFacts:
+		fmt.Printf("  вытеснение           всё старше %d сообщений → архив (без конспекта)\n", a.window)
+	case StrategySummary:
+		if a.noCompact {
+			fmt.Println("  авто-сжатие отключено (-no-compact)")
+		} else {
+			limit := a.budget.MaxPromptTokens - a.budget.ReserveOutput
+			if limit < 500 {
+				limit = 500
+			}
+			fmt.Printf("  сжатие начнётся при  %d ток.", limit*85/100)
+			if a.compactEvery > 0 {
+				fmt.Printf(" или %d сообщ.", a.compactEvery)
+			}
+			fmt.Println()
 		}
-		fmt.Printf("  сжатие начнётся при  %d ток.", limit*85/100)
-		if a.compactEvery > 0 {
-			fmt.Printf(" или %d сообщ.", a.compactEvery)
-		}
-		fmt.Println()
 	}
 
-	if a.hist.HasSummary() {
+	if a.strategy == StrategySummary && a.hist.HasSummary() {
 		fmt.Println("\nконспект вместо старой истории:")
 		for _, line := range strings.Split(strings.TrimSpace(a.hist.SummaryText()), "\n") {
 			fmt.Println("  " + line)
 		}
 	}
+	if a.strategy == StrategyFacts && len(a.hist.Facts()) > 0 {
+		fmt.Println("\nфакты вместо старой истории:")
+		fmt.Println(indentBlock(renderFacts(a.hist.Facts()), "  "))
+	}
+}
+
+// indentBlock prefixes every line of s with prefix; used for the facts block
+// in /context.
+func indentBlock(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *app) printTokens() {
@@ -621,6 +785,12 @@ func (a *app) printTokens() {
 		covers := a.hist.SummaryCovers()
 		fmt.Printf("конспект: ~%d ток., покрывает seq %d..%d\n",
 			EstimateTokens(a.hist.SummaryText()), covers[0], covers[1])
+	}
+	if facts := a.hist.Facts(); len(facts) > 0 {
+		fmt.Printf("факты: %d ключей, ~%d ток. (стратегия facts)\n", len(facts), EstimateTokens(renderFacts(facts)))
+	}
+	if a.strategy.needsWindow() {
+		fmt.Printf("стратегия %s: в промпт идут последние %d сообщений, старое вытесняется в архив без конспекта\n", a.strategy, a.window)
 	}
 	fmt.Printf("оценка промпта: ~%d ток. (бюджет %d, калибровка ×%.2f)\n",
 		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
@@ -700,20 +870,27 @@ func printSessions(dataDir string) {
 	}
 }
 
-func printHelp() {
-	fmt.Print(`Команды:
+const helpText = `Команды:
   /help            эта справка
   /exit            выход (также /quit)
   /new             новая сессия
   /session [id]    список сессий или переключение на сессию
   /model [id]      список моделей или смена чат-модели
   /summary [id]    модель сжатия: список или смена
+  /strategy [имя [N]]
+                   стратегия контекста: summary (конспект), window (последние
+                   N сообщений), facts (ключ-значение + последние N); без
+                   аргумента — текущая; N — размер окна для window/facts
+  /facts           память «ключ-значение» стратегии facts
+  /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
+                   чекпоинт (создать ветку от текущего места), повторный
+                   /branch <существующее имя> — переключение
   /system          показать системный промпт
   /tools           список инструментов
   /history         последние сообщения активного окна
-  /context         что реально уходит в модель: system, конспект, хвост, tools
-  /tokens          токены, архив, конспект, расходы API
-  /compact         принудительно сжать контекст
+  /context         что реально уходит в модель: system, память, хвост, tools
+  /tokens          токены, архив, память, расходы API
+  /compact         принудительно сжать контекст (стратегия summary)
   /recall <текст>  поиск по архиву
 
 Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
@@ -724,7 +901,10 @@ Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — ст�
 Ctrl-C — отменить ввод, Ctrl-D — выход.
 
 Всё остальное отправляется модели.
-`)
+`
+
+func printHelp() {
+	fmt.Print(helpText)
 }
 
 func defaultDataDir() string {

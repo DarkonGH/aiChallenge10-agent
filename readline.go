@@ -5,8 +5,10 @@ package main
 // строки и несколько управляющих клавиш. Терминал на время чтения
 // переключается в сырой режим (readline_raw_darwin.go), поэтому Backspace и
 // escape-последовательности долетают до программы как есть, а не как
-// отредактированная строка. Вне TTY (пайпы, -script) ввод остаётся прежним —
-// обычный построчный сканер.
+// отредактированная строка. Отрисовка учитывает перенос длинных строк:
+// перед перерисовкой курсор поднимается на первую экранную строку ввода, и
+// весь ввод стирается целиком. Вне TTY (пайпы, -script) ввод остаётся
+// прежним — обычный построчный сканер.
 
 import (
 	"bufio"
@@ -65,10 +67,49 @@ func (ed *lineEditor) read(prompt string) (string, error) {
 	fmt.Print("\n")
 	line := make([]rune, 0, 64)
 	cur := 0 // позиция курсора в рунах
+	promptLen := len([]rune(prompt))
+	cols := terminalWidth() // ширина экрана; обновляется при каждой отрисовке
+	prevRows := 1           // сколько экранных строк заняла прошлая отрисовка
+	curRow := 0             // строка экрана, на которой курсор оставлен
 	draw := func() {
-		fmt.Printf("\r\x1b[K%s%s", prompt, string(line))
-		if cur < len(line) {
-			fmt.Printf("\x1b[%dD", len(line)-cur)
+		cols = terminalWidth()
+		all := promptLen + len(line)
+		rows, tRow, tCol := wrapLayout(all, promptLen+cur, cols)
+
+		// Стереть прошлую отрисовку: подняться на её первую экранную строку
+		// (строка ввода могло переноситься) и очистить всё ниже курсора.
+		if prevRows > 1 {
+			fmt.Printf("\x1b[%dA", prevRows-1)
+		}
+		fmt.Print("\r\x1b[J")
+		// Напечатать заново; на экранные строки текст раскладывает сам
+		// терминал авто-переносом — все перемещения ниже относительные, поэтому
+		// способ раскладки не важен.
+		fmt.Print(prompt + string(line))
+		// Вернуть курсор в позицию редактирования: на строку tRow (после
+		// печати он на последней строке текста) и в колонку tCol.
+		if n := rows - 1 - tRow; n > 0 {
+			fmt.Printf("\x1b[%dA", n)
+		}
+		fmt.Print("\r")
+		if tCol > 0 {
+			fmt.Printf("\x1b[%dC", tCol)
+		}
+		prevRows, curRow = rows, tRow
+	}
+	// finish ставит курсор в самый конец отрисованного ввода (на последнюю его
+	// экранную строку), чтобы перевод строки ушёл ниже всего перенесённого
+	// текста, а не внутрь его хвоста.
+	finish := func() {
+		if all := promptLen + len(line); all > 0 {
+			_, endRow, endCol := wrapLayout(all, all, cols)
+			if endRow > curRow {
+				fmt.Printf("\x1b[%dB", endRow-curRow)
+			}
+			fmt.Print("\r")
+			if endCol > 0 {
+				fmt.Printf("\x1b[%dC", endCol)
+			}
 		}
 	}
 	draw()
@@ -131,6 +172,7 @@ func (ed *lineEditor) read(prompt string) (string, error) {
 				}
 			}
 		case '\r', '\n':
+			finish()
 			fmt.Print("\n") // завершить строку ввода, иначе следующий вывод клеится к промпту
 			s := strings.TrimSpace(string(line))
 			ed.append(s)
@@ -142,7 +184,12 @@ func (ed *lineEditor) read(prompt string) (string, error) {
 				draw()
 			}
 		case 0x03: // Ctrl-C — отменить строку, вернуться к пустому промпту
-			fmt.Print("\r\x1b[K^C")
+			// Стереть весь (возможно перенесённый) ввод, а не только текущую
+			// экранную строку.
+			if prevRows > 1 {
+				fmt.Printf("\x1b[%dA", prevRows-1)
+			}
+			fmt.Print("\r\x1b[J^C")
 			rb.reset()
 			return "", nil
 		case 0x04: // Ctrl-D на пустой строке — выход
@@ -187,6 +234,27 @@ func (ed *lineEditor) read(prompt string) (string, error) {
 			draw()
 		}
 	}
+}
+
+// wrapLayout — раскладка текста длиной total руны на экране шириной cols:
+// сколько экранных строк он занимает и где (строка, колонка) визуально стоит
+// курсор, указывающий на руну idx (idx == total — позиция за последней
+// руной). Терминал, у которого текст занял строку целиком, оставляет курсор
+// в последней колонке заполненной строки (pending-wrap), а не переносит его
+// на следующую — этот случай учтён. Чистая функция, покрыта тестом.
+func wrapLayout(total, idx, cols int) (rows, row, col int) {
+	if cols < 1 {
+		cols = 1
+	}
+	rows = (total + cols - 1) / cols
+	if rows < 1 {
+		rows = 1
+	}
+	row, col = idx/cols, idx%cols
+	if row >= rows { // idx == total на полностью заполненной последней строке
+		row, col = rows-1, cols-1
+	}
+	return rows, row, col
 }
 
 // readPlain — построчный ввод без сырого режима.

@@ -12,7 +12,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
+
+// Fact is one sticky-facts entry: a short key and its current value.
+type Fact struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 
 // Event is one line of the append-only session log. The log is event-sourced:
 // the active window, the rolling summary and the archive are all reconstructed
@@ -30,7 +37,9 @@ type Event struct {
 	Covers  []int64  `json:"covers,omitempty"`
 	Summary string   `json:"summary,omitempty"`
 	Model   string   `json:"model,omitempty"`
-	Role    string   `json:"role,omitempty"` // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
+	Role    string   `json:"role,omitempty"`  // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
+	Facts   []Fact   `json:"facts,omitempty"` // facts: полный снимок памяти ключ-значение
+	Fork    string   `json:"fork,omitempty"`  // fork: id сессии-родителя
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -55,6 +64,11 @@ type History struct {
 	// verbatim tail kept after a compaction is not part of the summary, so the
 	// count trigger measures new messages from here, not from summaryCovers[1].
 	compactMark int64
+
+	facts []Fact // sticky facts (strategy "facts"), replayed from the log
+
+	forkOf  string // parent session id, when this session is a branch
+	forkSeq int64  // seq of the parent's log at the fork point
 
 	warnf func(format string, args ...any)
 }
@@ -194,6 +208,17 @@ func (h *History) apply(ev *Event) {
 				h.chatModel = ev.Model
 			}
 		}
+	case "facts":
+		h.facts = ev.Facts
+	case "evict":
+		if len(ev.Covers) == 2 {
+			h.applyEvict(ev.Covers[0], ev.Covers[1])
+		}
+	case "fork":
+		h.forkOf = ev.Fork
+		if len(ev.Covers) == 2 {
+			h.forkSeq = ev.Covers[1]
+		}
 	}
 }
 
@@ -211,6 +236,21 @@ func (h *History) applyCompact(covers [2]int64, summary string) {
 	h.summaryCovers = covers
 	h.hasSummary = true
 	h.compactMark = h.seq
+}
+
+// applyEvict moves a seq range out of the prompt like applyCompact, but leaves
+// the summary alone — the sliding-window strategy drops the text, nothing
+// replaces it.
+func (h *History) applyEvict(from, to int64) {
+	keep := make([]*Message, 0, len(h.msgs))
+	for _, m := range h.msgs {
+		if m.Seq >= from && m.Seq <= to {
+			h.archived = append(h.archived, m)
+			continue
+		}
+		keep = append(keep, m)
+	}
+	h.msgs = keep
 }
 
 func (h *History) writeEvent(ev Event) error {
@@ -266,6 +306,40 @@ func (h *History) Compact(from, to int64, summary string) error {
 	h.applyCompact([2]int64{from, to}, summary)
 	return nil
 }
+
+// Evict moves messages with seq in [from,to] out of the prompt without
+// touching the summary — the "drop it" step of the sliding-window strategy.
+// Raw messages stay in the archive, so /recall still finds them.
+func (h *History) Evict(from, to int64) error {
+	if from > to {
+		return fmt.Errorf("history: неверный диапазон %d..%d", from, to)
+	}
+	if err := h.writeEvent(Event{Type: "evict", Covers: []int64{from, to}}); err != nil {
+		return err
+	}
+	h.applyEvict(from, to)
+	return nil
+}
+
+// SetFacts replaces the sticky-facts store and records the full snapshot in
+// the log: replaying a facts event simply becomes the stored list.
+func (h *History) SetFacts(facts []Fact) error {
+	if err := h.writeEvent(Event{Type: "facts", Facts: facts}); err != nil {
+		return err
+	}
+	h.facts = facts
+	return nil
+}
+
+// Facts returns the sticky-facts store (empty when the strategy never wrote
+// any).
+func (h *History) Facts() []Fact { return h.facts }
+
+// ForkOf returns the parent session id when this session is a branch.
+func (h *History) ForkOf() string { return h.forkOf }
+
+// ForkSeq returns the parent's newest seq at the fork point.
+func (h *History) ForkSeq() int64 { return h.forkSeq }
 
 // SetChatModel switches the chat model and records the switch in the log.
 func (h *History) SetChatModel(model string) {
@@ -405,6 +479,93 @@ func LatestSession(dataDir string) (string, error) {
 	return ids[0], nil
 }
 
+// ForkSession copies the source session's log into a new session and marks the
+// copy as a branch of the original at the copy point (a checkpoint). The
+// original keeps running untouched; from here both lines evolve independently.
+// The branch id doubles as the session id, so /branch <имя> both creates and
+// switches between branches.
+func ForkSession(dataDir, srcID, branchName string) (string, error) {
+	if !validBranchName(branchName) {
+		return "", fmt.Errorf("имя ветки: 1-64 знака, буквы, цифры, «-» и «_»")
+	}
+	dstDir := filepath.Join(dataDir, branchName)
+	if _, err := os.Stat(dstDir); err == nil {
+		return "", fmt.Errorf("сессия %q уже существует", branchName)
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, srcID, "session.jsonl"))
+	if err != nil {
+		return "", err
+	}
+
+	// The newest seq in the copied log is the checkpoint point.
+	lastSeq := int64(0)
+	for _, line := range strings.Split(string(data), "\n") {
+		var ev Event
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) != nil || ev.Message == nil {
+			continue
+		}
+		if ev.Message.Seq > lastSeq {
+			lastSeq = ev.Message.Seq
+		}
+	}
+
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return "", err
+	}
+	fork, err := json.Marshal(Event{Type: "fork", Fork: srcID, Covers: []int64{0, lastSeq}})
+	if err != nil {
+		return "", err
+	}
+	out := strings.TrimRight(string(data), "\n") + "\n" + string(fork) + "\n"
+	if err := os.WriteFile(filepath.Join(dstDir, "session.jsonl"), []byte(out), 0o644); err != nil {
+		return "", err
+	}
+	return branchName, nil
+}
+
+// ListForks returns ids of the sessions forked directly from parentID, newest
+// first.
+func ListForks(dataDir, parentID string) ([]string, error) {
+	ids, err := ListSessions(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, id := range ids {
+		data, err := os.ReadFile(filepath.Join(dataDir, id, "session.jsonl"))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			var ev Event
+			if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) != nil {
+				continue
+			}
+			if ev.Type == "fork" && ev.Fork == parentID {
+				out = append(out, id)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// validBranchName accepts short names safe to use as a session directory.
+func validBranchName(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r == '-' || r == '_':
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // SessionInfo is a one-line summary of a stored session for /session.
 type SessionInfo struct {
 	ID           string
@@ -526,6 +687,19 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 				fmt.Fprintf(w, "       — сжатие: seq %d..%d → архив, конспект ~%d ток.\n",
 					ev.Covers[0], ev.Covers[1], EstimateTokens(ev.Summary))
 			}
+		case "evict":
+			if len(ev.Covers) == 2 {
+				fmt.Fprintf(w, "       — вытеснено из окна: seq %d..%d → архив (sliding window)\n",
+					ev.Covers[0], ev.Covers[1])
+			}
+		case "facts":
+			fmt.Fprintf(w, "       — факты: %d ключей\n", len(ev.Facts))
+		case "fork":
+			point := ""
+			if len(ev.Covers) == 2 && ev.Covers[1] > 0 {
+				point = fmt.Sprintf(" (seq %d)", ev.Covers[1])
+			}
+			fmt.Fprintf(w, "       — ветка от сессии %s%s\n", ev.Fork, point)
 		case "message":
 			if ev.Message == nil {
 				continue
