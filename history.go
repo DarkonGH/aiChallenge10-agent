@@ -573,6 +573,8 @@ type SessionInfo struct {
 	ChatModel    string
 	SummaryModel string
 	Msgs         int
+	ForkOf       string // parent session id when this session is a branch
+	ForkSeq      int64  // parent's last message seq at the fork point
 }
 
 // SummarizeSessions lists sessions newest first with a little metadata,
@@ -604,6 +606,11 @@ func SummarizeSessions(dataDir string) ([]SessionInfo, error) {
 					info.SummaryModel = ev.SummaryModel
 				case "message":
 					info.Msgs++
+				case "fork":
+					info.ForkOf = ev.Fork
+					if len(ev.Covers) == 2 {
+						info.ForkSeq = ev.Covers[1]
+					}
 				case "model_switch":
 					if ev.Role == "summary" {
 						info.SummaryModel = ev.Model

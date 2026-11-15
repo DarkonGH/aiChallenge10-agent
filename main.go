@@ -393,14 +393,28 @@ func (a *app) ask(text string) {
 	a.footer()
 }
 
+// summaryStatus renders the rolling summary as a status fragment, honestly
+// marking it when the active strategy does not send it to the model (the
+// summary stays in the log after a switch to window/facts).
+func (a *app) summaryStatus() string {
+	if !a.hist.HasSummary() {
+		return ""
+	}
+	s := fmt.Sprintf("конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
+	if a.strategy != StrategySummary {
+		s += " (не в промпте)"
+	}
+	return s
+}
+
 // footer is the one-line stats line printed after every turn: model, prompt
 // estimate vs budget, last answer size, active/archive split and accumulated
 // API cost. An overflowing prompt is flagged explicitly.
 func (a *app) footer() {
 	activeMsgs, _, archivedMsgs, _ := a.hist.Stats()
 	extra := ""
-	if a.hist.HasSummary() {
-		extra = fmt.Sprintf(" · конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
+	if s := a.summaryStatus(); s != "" {
+		extra = " · " + s
 	}
 	if a.strategy.needsWindow() {
 		extra += fmt.Sprintf(" · %s(%d)", a.strategy, a.window)
@@ -556,16 +570,25 @@ func (a *app) command(line string) (bool, error) {
 			if err != nil {
 				return false, err
 			}
+			byID := map[string]SessionInfo{}
+			if infos, err := SummarizeSessions(a.dataDir); err == nil {
+				for _, inf := range infos {
+					byID[inf.ID] = inf
+				}
+			}
 			if len(kids) == 0 {
 				fmt.Println("веток от этой сессии пока нет")
 			} else {
 				fmt.Println("ветки от текущей сессии:")
 				for _, k := range kids {
-					marker := ""
-					if k == a.hist.ID() {
-						marker = " (вы здесь)"
+					line := "  · " + k
+					if inf, ok := byID[k]; ok {
+						line += fmt.Sprintf(" · %d сообщ.", inf.Msgs)
+						if inf.ForkSeq > 0 {
+							line += fmt.Sprintf(" · seq %d", inf.ForkSeq)
+						}
 					}
-					fmt.Println("  ·", k+marker)
+					fmt.Println(line)
 				}
 			}
 			fmt.Println("создать ветку от текущего места: /branch <имя>; переключиться: /branch <имя существующей>")
@@ -622,6 +645,12 @@ func (a *app) command(line string) (bool, error) {
 		a.printTokens()
 
 	case "/compact":
+		if a.strategy.needsWindow() {
+			fmt.Printf("стратегия %s не сворачивает историю в конспект: промпт ограничен последними %d сообщениями, старое уходит в архив.\n",
+				a.strategy, a.window)
+			fmt.Println("нужен конспект — переключитесь: /strategy summary, затем /compact")
+			return false, nil
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		ok, err := a.agent.comp.ForceCompact(ctx, a.hist.SystemPrompt())
@@ -670,7 +699,11 @@ func (a *app) printHistory() {
 		fmt.Printf("[%d] %-9s ~%-5d ток. %s\n", m.Seq, m.Role, tok, oneLine(m.Content))
 	}
 	if a.hist.HasSummary() {
-		fmt.Println("(плюс конспект предыдущего диалога)")
+		if a.strategy == StrategySummary {
+			fmt.Println("(плюс конспект предыдущего диалога)")
+		} else {
+			fmt.Printf("(конспект есть, но в промпт не идёт — стратегия %s)\n", a.strategy)
+		}
 	}
 }
 
@@ -724,6 +757,10 @@ func (a *app) printContext() {
 		} else {
 			fmt.Println("  конспект             нет")
 		}
+	}
+	if a.strategy != StrategySummary && a.hist.HasSummary() {
+		fmt.Printf("  конспект (старый)    ~%d ток. — не в промпте (остался от summary)\n",
+			EstimateTokens(a.hist.SummaryText()))
 	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
@@ -781,10 +818,9 @@ func (a *app) printTokens() {
 	activeMsgs, activeTokens, archivedMsgs, archivedTokens := a.hist.Stats()
 	fmt.Printf("активное окно: %d сообщений, ~%d ток.\n", activeMsgs, activeTokens)
 	fmt.Printf("архив: %d сообщений, ~%d ток.\n", archivedMsgs, archivedTokens)
-	if a.hist.HasSummary() {
+	if s := a.summaryStatus(); s != "" {
 		covers := a.hist.SummaryCovers()
-		fmt.Printf("конспект: ~%d ток., покрывает seq %d..%d\n",
-			EstimateTokens(a.hist.SummaryText()), covers[0], covers[1])
+		fmt.Printf("%s: покрывает seq %d..%d\n", s, covers[0], covers[1])
 	}
 	if facts := a.hist.Facts(); len(facts) > 0 {
 		fmt.Printf("факты: %d ключей, ~%d ток. (стратегия facts)\n", len(facts), EstimateTokens(renderFacts(facts)))
@@ -838,9 +874,23 @@ func (a *app) printSessionList() {
 		if inf.ID == a.hist.ID() {
 			mark = "*"
 		}
-		fmt.Printf(" %s %s · %s · модель %s · сжатие %s\n", mark, inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel)
+		fmt.Printf(" %s %s · %s · модель %s · сжатие %s · сообщений %d%s\n",
+			mark, inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel, inf.Msgs, forkMark(inf))
 	}
 	fmt.Println("* — текущая; переключиться: /session <id>")
+}
+
+// forkMark renders the branch suffix of a session line: parent id and the
+// parent's seq at the fork point. Empty for ordinary (non-branch) sessions.
+func forkMark(inf SessionInfo) string {
+	if inf.ForkOf == "" {
+		return ""
+	}
+	point := ""
+	if inf.ForkSeq > 0 {
+		point = fmt.Sprintf(" (seq %d)", inf.ForkSeq)
+	}
+	return fmt.Sprintf(" · ← ветка от %s%s", inf.ForkOf, point)
 }
 
 func printModels() {
@@ -865,8 +915,8 @@ func printSessions(dataDir string) {
 		return
 	}
 	for _, inf := range infos {
-		fmt.Printf("%s · %s · модель %s · сжатие %s · сообщений %d\n",
-			inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel, inf.Msgs)
+		fmt.Printf("%s · %s · модель %s · сжатие %s · сообщений %d%s\n",
+			inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel, inf.Msgs, forkMark(inf))
 	}
 }
 

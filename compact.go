@@ -118,20 +118,21 @@ func (c *Compactor) promptWindow() []*Message {
 	return msgs
 }
 
-// windowCut returns the index where the kept tail starts: at most n messages
-// stay, and the cut is advanced to a user message so an assistant+tool group
-// is never split. 0 means "nothing to cut".
+// windowCut returns the index where the kept tail starts: exactly the last n
+// messages, so the window slides one message at a time. The cut moves forward
+// only when it lands on a tool result — a tool message cannot be sent without
+// the assistant call that produced it. 0 means "nothing to cut".
 func windowCut(msgs []*Message, n int) int {
 	if n <= 0 || len(msgs) <= n {
 		return 0
 	}
 	cut := len(msgs) - n
-	for cut < len(msgs) && msgs[cut].Role != "user" {
+	for cut < len(msgs) && msgs[cut].Role == "tool" {
 		cut++
 	}
 	if cut >= len(msgs) {
-		// Even one turn does not fit into n: keep the last complete turn
-		// anyway, so eviction still makes progress.
+		// The window is too small to hold even one complete turn: keep the
+		// last turn anyway, so eviction still makes progress.
 		for i := len(msgs) - 1; i > 0; i-- {
 			if msgs[i].Role == "user" {
 				return i

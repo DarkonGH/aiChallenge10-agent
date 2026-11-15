@@ -78,15 +78,42 @@ func TestPromptWindowCut(t *testing.T) {
 			&Message{Role: "user", Seq: int64(i*2 + 1)},
 			&Message{Role: "assistant", Seq: int64(i*2 + 2)})
 	}
-	// Окно 4: срез по user-границе — остаются ходы 2 и 3.
+	// Окно 4: ровно 4 последних сообщения — ходы 2 и 3.
 	if cut := windowCut(msgs, 4); cut != 2 {
 		t.Errorf("windowCut(4) = %d, хотим 2", cut)
 	}
 	if cut := windowCut(msgs, 6); cut != 0 {
 		t.Errorf("windowCut(6) = %d, хотим 0 (нечего резать)", cut)
 	}
-	if cut := windowCut(msgs, 1); cut != 4 {
-		t.Errorf("windowCut(1) = %d, хотим 4 (последний целый ход)", cut)
+	// Окно меньше хода: всё равно двигаемся, оставляя последний ход целиком.
+	if cut := windowCut(msgs, 1); cut != 5 {
+		t.Errorf("windowCut(1) = %d, хотим 5 (последний ход)", cut)
+	}
+
+	// Срез не должен начинать окно с tool-результата: пара assistant+tool
+	// переезжает в окно целиком, сдвиг — только на один такой результат.
+	withTools := []*Message{
+		{Role: "user", Seq: 1},
+		{Role: "assistant", Seq: 2},
+		{Role: "user", Seq: 3},
+		{Role: "assistant", Seq: 4},
+		{Role: "tool", Seq: 5},
+		{Role: "tool", Seq: 6},
+		{Role: "assistant", Seq: 7},
+		{Role: "user", Seq: 8},
+		{Role: "assistant", Seq: 9},
+	}
+	// Окно 5 → срез на seq 5 (tool) → сдвиг до seq 7: окно 7..9.
+	if cut := windowCut(withTools, 5); cut != 6 {
+		t.Errorf("windowCut(tools,5) = %d, хотим 6 (tool-результат не отрывается)", cut)
+	}
+	// Окно 4 → срез на seq 6 (tool) → сдвиг до seq 7: окно 7..9.
+	if cut := windowCut(withTools, 4); cut != 6 {
+		t.Errorf("windowCut(tools,4) = %d, хотим 6", cut)
+	}
+	// Окно 3 → срез на seq 7 (assistant): окно 7..9 без сдвига.
+	if cut := windowCut(withTools, 3); cut != 6 {
+		t.Errorf("windowCut(tools,3) = %d, хотим 6", cut)
 	}
 }
 
@@ -281,14 +308,14 @@ func TestBuildMessagesWindow(t *testing.T) {
 	a.SetStrategy(StrategyFacts)
 	a.SetWindow(3)
 	msgs = a.buildMessages()
-	// 6 сообщений, окно 3: срез сдвигается к user-границе, остаётся 2.
-	if len(msgs) != 3 {
-		t.Fatalf("facts: сообщений %d, хотим system+2 (срез по user-границе)", len(msgs))
+	// 6 сообщений, окно 3: ровно три последних — ответ хода 1, вопрос и ответ хода 2.
+	if len(msgs) != 4 {
+		t.Fatalf("facts: сообщений %d, хотим system+3", len(msgs))
 	}
 	if !strings.Contains(msgs[0].Content, "Факты диалога") || !strings.Contains(msgs[0].Content, "- срок: 15 декабря") {
 		t.Errorf("facts: блок фактов не попал в system: %q", msgs[0].Content)
 	}
-	if msgs[1].Content != "вопрос номер 2" {
-		t.Errorf("facts: хвост = %q, хотим последний целый ход", msgs[1].Content)
+	if msgs[1].Content != "ответ номер 1" {
+		t.Errorf("facts: хвост = %q, хотим ровно 3 последних сообщения", msgs[1].Content)
 	}
 }
