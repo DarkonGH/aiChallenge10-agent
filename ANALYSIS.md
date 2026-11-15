@@ -73,10 +73,5 @@ window < facts < summary. facts даёт максимальную точност
 
 ## Материалы
 
-- Логи прогонов (те, что на видео): `logs/day10/window.jsonl`, `logs/day10/facts.jsonl`,
-  `logs/day10/summary.jsonl`; смотреть — `./task2-06 -data logs/day10 -print-session window`.
-- Видео: `video/прогоны-день-10-стратегии-без-голоса.mp4` (3:54, заглавный экран,
+- Видео: `video/прогоны-день-10-стратегии.mp4` (3:54, заглавный экран,
   карточки стратегий, субтитры, выводы).
-- Исходные записи и склейка: `/tmp/day10-{window,facts,summary}.cast`,
-  `/tmp/day10-*-v2.mp4`, сборка — `/tmp/day10_cards.sh`.
-- Сравнение цифр: `/tmp/day10_compare.py`, аудит: `check_details.py --data /tmp/day10-<стратегия>`.
