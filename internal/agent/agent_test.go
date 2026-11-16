@@ -1,8 +1,12 @@
-package main
+package agent
 
 import (
 	"context"
 	"encoding/json"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +17,7 @@ func TestAgentToolLoop(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		var req chatRequest
+		var req llm.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
 			return
@@ -69,14 +73,14 @@ func TestAgentToolLoop(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	client := llm.NewChatClientAt(srv.URL, "test")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 
-	agent := NewAgent(client, NewToolRegistry(nil), h, DefaultBudget(), 4, 0, 800)
+	agent := NewAgent(client, tools.NewToolRegistry(nil), h, compact.DefaultBudget(), 4, 0, 800)
 	got, err := agent.Chat(context.Background(), "сколько будет 17*23?")
 	if err != nil {
 		t.Fatalf("chat: %v", err)
@@ -104,7 +108,7 @@ func TestAgentNoTools(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		var req chatRequest
+		var req llm.ChatRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if len(req.Tools) == 0 {
 			t.Error("tools should always be advertised")
@@ -119,14 +123,14 @@ func TestAgentNoTools(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	client := llm.NewChatClientAt(srv.URL, "test")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 
-	agent := NewAgent(client, NewToolRegistry(nil), h, DefaultBudget(), 4, 0, 800)
+	agent := NewAgent(client, tools.NewToolRegistry(nil), h, compact.DefaultBudget(), 4, 0, 800)
 	got, err := agent.Chat(context.Background(), "что такое рекурсия?")
 	if err != nil {
 		t.Fatalf("chat: %v", err)
@@ -143,7 +147,7 @@ func TestAgentToolErrorIsReturnedToModel(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		var req chatRequest
+		var req llm.ChatRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if calls == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -176,14 +180,14 @@ func TestAgentToolErrorIsReturnedToModel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	client := llm.NewChatClientAt(srv.URL, "test")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 
-	agent := NewAgent(client, NewToolRegistry(nil), h, DefaultBudget(), 4, 0, 800)
+	agent := NewAgent(client, tools.NewToolRegistry(nil), h, compact.DefaultBudget(), 4, 0, 800)
 	if _, err := agent.Chat(context.Background(), "сколько будет 1/0?"); err != nil {
 		t.Fatalf("chat: %v", err)
 	}

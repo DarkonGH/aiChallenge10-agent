@@ -1,6 +1,6 @@
 //go:build darwin
 
-package main
+package readline
 
 // Сырой режим терминала для lineEditor на macOS: termios через stdlib
 // syscall, без внешних зависимостей.
@@ -42,9 +42,9 @@ func (s *rawState) restore() error {
 	return ioctlTermios(s.fd, syscall.TIOCSETA, &s.saved)
 }
 
-// terminalWidth возвращает ширину терминала в колонках (TIOCGWINSZ); при
+// TerminalWidth возвращает ширину терминала в колонках (TIOCGWINSZ); при
 // неудаче или нулевом ответе — 80.
-func terminalWidth() int {
+func TerminalWidth() int {
 	var ws struct{ Row, Col, X, Y uint16 }
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(),
 		uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)))

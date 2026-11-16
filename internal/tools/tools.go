@@ -1,8 +1,10 @@
-package main
+package tools
 
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +27,7 @@ type ToolRegistry struct {
 
 // NewToolRegistry builds the agent's tool set. tasks is the in-memory list from
 // tasks.txt, exposed through find_task.
-func NewToolRegistry(tasks []Task) *ToolRegistry {
+func NewToolRegistry(tasks []config.Task) *ToolRegistry {
 	r := &ToolRegistry{tools: map[string]*Tool{}, maxResult: 8000}
 
 	r.add(&Tool{
@@ -81,13 +83,13 @@ func (r *ToolRegistry) add(t *Tool) {
 }
 
 // Schemas returns the tool schemas for the API request.
-func (r *ToolRegistry) Schemas() []ToolSchema {
-	out := make([]ToolSchema, 0, len(r.order))
+func (r *ToolRegistry) Schemas() []llm.ToolSchema {
+	out := make([]llm.ToolSchema, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
-		out = append(out, ToolSchema{
+		out = append(out, llm.ToolSchema{
 			Type: "function",
-			Function: ToolFunction{
+			Function: llm.ToolFunction{
 				Name:        t.Name,
 				Description: t.Description,
 				Parameters:  t.Parameters,
@@ -115,7 +117,7 @@ func (r *ToolRegistry) Describe() []string {
 // Execute runs a tool call and always returns a string for the model: errors
 // and panics become text so the model can correct itself instead of crashing
 // the loop.
-func (r *ToolRegistry) Execute(call ToolCall) (out string) {
+func (r *ToolRegistry) Execute(call llm.ToolCall) (out string) {
 	name := call.Function.Name
 	t, ok := r.tools[name]
 	if !ok {
@@ -137,7 +139,7 @@ func (r *ToolRegistry) Execute(call ToolCall) (out string) {
 	if err != nil {
 		return fmt.Sprintf("ошибка инструмента %s: %v", name, err)
 	}
-	return truncate(res, r.maxResult)
+	return config.Truncate(res, r.maxResult)
 }
 
 func runNow(json.RawMessage) (string, error) {
@@ -164,7 +166,7 @@ func runCalc(raw json.RawMessage) (string, error) {
 	return strconv.FormatFloat(v, 'f', -1, 64), nil
 }
 
-func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
+func runFindTask(tasks []config.Task) func(json.RawMessage) (string, error) {
 	return func(raw json.RawMessage) (string, error) {
 		var a struct {
 			Query string `json:"query"`
@@ -205,7 +207,7 @@ func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
 				b.WriteString("…есть ещё совпадения, уточни запрос\n")
 				break
 			}
-			fmt.Fprintf(&b, "%d. %s — ответ %s\n", t.ID, t.Label, formatAnswer(t.Answer))
+			fmt.Fprintf(&b, "%d. %s — ответ %s\n", t.ID, t.Label, config.FormatAnswer(t.Answer))
 			shown++
 		}
 		return strings.TrimRight(b.String(), "\n"), nil
@@ -213,16 +215,16 @@ func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
 }
 
 // listTasks renders the whole task list, one line per task.
-func listTasks(tasks []Task) string {
+func listTasks(tasks []config.Task) string {
 	var b strings.Builder
 	for _, t := range tasks {
-		fmt.Fprintf(&b, "%d. %s — ответ %s\n", t.ID, t.Label, formatAnswer(t.Answer))
+		fmt.Fprintf(&b, "%d. %s — ответ %s\n", t.ID, t.Label, config.FormatAnswer(t.Answer))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func matchTasks(tasks []Task, q string) []Task {
-	var out []Task
+func matchTasks(tasks []config.Task, q string) []config.Task {
+	var out []config.Task
 	for _, t := range tasks {
 		hay := strings.ToLower(t.Label + " " + t.Condition)
 		if strings.Contains(hay, q) {

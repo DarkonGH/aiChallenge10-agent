@@ -1,4 +1,4 @@
-package main
+package llm
 
 import (
 	"bufio"
@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"io"
 	"net/http"
 	"os"
@@ -76,7 +77,7 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-type chatRequest struct {
+type ChatRequest struct {
 	Model         string         `json:"model"`
 	Messages      []wireMessage  `json:"messages"`
 	Tools         []ToolSchema   `json:"tools,omitempty"`
@@ -173,14 +174,23 @@ type ChatClient struct {
 
 // NewChatClient builds a client from LLM_BASE_URL and OPENAI_API_KEY.
 func NewChatClient() *ChatClient {
+	return NewChatClientAt(os.Getenv("LLM_BASE_URL"), os.Getenv("OPENAI_API_KEY"))
+}
+
+// NewChatClientAt builds a client for an explicit endpoint: a self-hosted
+// gateway, a proxy, or a stub server in tests.
+func NewChatClientAt(baseURL, apiKey string) *ChatClient {
 	return &ChatClient{
-		baseURL:   os.Getenv("LLM_BASE_URL"),
-		apiKey:    os.Getenv("OPENAI_API_KEY"),
+		baseURL:   baseURL,
+		apiKey:    apiKey,
 		http:      &http.Client{Timeout: 180 * time.Second},
 		maxTokens: 4096,
 		stats:     ClientStats{ByModel: map[string]int{}},
 	}
 }
+
+// Configured reports whether an endpoint and a key were provided.
+func (c *ChatClient) Configured() bool { return c.baseURL != "" && c.apiKey != "" }
 
 // SetMaxTokens bounds completion length. Reasoning models spend this budget on
 // hidden reasoning first, so an unbounded request can hang for minutes.
@@ -229,7 +239,7 @@ func (c *ChatClient) record(model string, u usage) {
 	c.stats.CompletionTokens += u.CompletionTokens
 	c.stats.TotalTokens += u.TotalTokens
 	c.stats.ByModel[model]++
-	if m, ok := FindModel(model); ok {
+	if m, ok := config.FindModel(model); ok {
 		c.stats.Cost += float64(u.TotalTokens) * m.RatePerM / 1e6
 	}
 }
@@ -249,7 +259,7 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 	for i, m := range messages {
 		wire[i] = toWire(m)
 	}
-	body := chatRequest{
+	body := ChatRequest{
 		Model:       model,
 		Messages:    wire,
 		Tools:       tools,
@@ -284,11 +294,11 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 			continue
 		}
 		if status == http.StatusTooManyRequests || status >= 500 {
-			lastErr = fmt.Errorf("%s: status %d: %s", model, status, truncate(string(data), 500))
+			lastErr = fmt.Errorf("%s: status %d: %s", model, status, config.Truncate(string(data), 500))
 			continue
 		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("%s: status %d: %s", model, status, truncate(string(data), 2000))
+			return nil, fmt.Errorf("%s: status %d: %s", model, status, config.Truncate(string(data), 2000))
 		}
 
 		var parsed chatResponseBody
@@ -347,7 +357,7 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 	for i, m := range messages {
 		wire[i] = toWire(m)
 	}
-	body := chatRequest{
+	body := ChatRequest{
 		Model:         model,
 		Messages:      wire,
 		Tools:         tools,
@@ -425,11 +435,11 @@ func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byt
 
 	if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
 		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		return nil, false, failRetry, fmt.Errorf("status %d: %s", httpResp.StatusCode, truncate(string(data), 500))
+		return nil, false, failRetry, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 500))
 	}
 	if httpResp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 8192))
-		return nil, false, failFallback, fmt.Errorf("status %d: %s", httpResp.StatusCode, truncate(string(data), 2000))
+		return nil, false, failFallback, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 2000))
 	}
 
 	sc := bufio.NewScanner(httpResp.Body)

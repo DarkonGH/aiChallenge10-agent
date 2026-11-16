@@ -6,6 +6,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/agent"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,21 +24,21 @@ import (
 
 // app wires the CLI, the agent and the session together.
 type app struct {
-	client       *ChatClient
-	tools        *ToolRegistry
+	client       *llm.ChatClient
+	tools        *tools.ToolRegistry
 	dataDir      string
 	system       string
-	budget       Budget
+	budget       compact.Budget
 	maxSteps     int
 	temperature  float64
 	maxToolChars int
 	noCompact    bool
 	compactEvery int
-	strategy     Strategy
+	strategy     compact.Strategy
 	window       int
 
-	hist  *History
-	agent *Agent
+	hist  *history.History
+	agent *agent.Agent
 	ui    *ui
 }
 
@@ -121,7 +129,7 @@ func (u *ui) reasoning(s string) {
 		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
 		u.spinning = false
 	}
-	width := terminalWidth()
+	width := readline.TerminalWidth()
 	if width < 24 {
 		width = 24
 	}
@@ -253,7 +261,7 @@ func main() {
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
-	strategyFlag := flag.String("strategy", string(StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
+	strategyFlag := flag.String("strategy", string(compact.StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
 	windowFlag := flag.Int("window", 0, "размер окна для стратегий window и facts (обязателен для них)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
@@ -262,12 +270,12 @@ func main() {
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
 	flag.Parse()
 
-	strategy, err := ParseStrategy(*strategyFlag)
+	strategy, err := compact.ParseStrategy(*strategyFlag)
 	if err != nil {
 		fatalf("%v", err)
 	}
 	window := *windowFlag
-	if strategy.needsWindow() && window <= 0 {
+	if strategy.NeedsWindow() && window <= 0 {
 		fatalf("стратегии %s нужен размер окна: -window N (сколько последних сообщений отправлять модели)", strategy)
 	}
 
@@ -288,17 +296,17 @@ func main() {
 		id := *printSession
 		if id == "last" {
 			var err error
-			if id, err = LatestSession(dataDir); err != nil {
+			if id, err = history.LatestSession(dataDir); err != nil {
 				fatalf("%v", err)
 			}
 		}
-		if err := PrintSessionLog(dataDir, id, os.Stdout); err != nil {
+		if err := history.PrintSessionLog(dataDir, id, os.Stdout); err != nil {
 			fatalf("%v", err)
 		}
 		return
 	}
 
-	system := DefaultSystemPrompt
+	system := config.DefaultSystemPrompt
 	if *systemFlag != "" {
 		b, err := os.ReadFile(*systemFlag)
 		if err != nil {
@@ -307,23 +315,23 @@ func main() {
 		system = strings.TrimSpace(string(b))
 	}
 
-	tasks, err := loadTasks(*tasksFlag)
+	tasks, err := config.LoadTasks(*tasksFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "предупреждение: список задач не загружен (%v); find_task будет пустым\n", err)
 	}
 
-	client := NewChatClient()
-	if client.baseURL == "" || client.apiKey == "" {
+	client := llm.NewChatClient()
+	if !client.Configured() {
 		fatalf("нужны переменные окружения LLM_BASE_URL и OPENAI_API_KEY")
 	}
 	client.SetMaxTokens(*maxTokens)
 
 	a := &app{
 		client:       client,
-		tools:        NewToolRegistry(tasks),
+		tools:        tools.NewToolRegistry(tasks),
 		dataDir:      dataDir,
 		system:       system,
-		budget:       Budget{MaxPromptTokens: *maxPrompt, ReserveOutput: *reserve, MinTailTokens: *minTail},
+		budget:       compact.Budget{MaxPromptTokens: *maxPrompt, ReserveOutput: *reserve, MinTailTokens: *minTail},
 		maxSteps:     *maxSteps,
 		temperature:  *temp,
 		maxToolChars: *maxToolChars,
@@ -336,7 +344,7 @@ func main() {
 
 	sessionID := *sessionFlag
 	if *continueFlag {
-		id, err := LatestSession(dataDir)
+		id, err := history.LatestSession(dataDir)
 		if err != nil {
 			fatalf("%v", err)
 		}
@@ -361,12 +369,12 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	if a.hist != nil {
 		_ = a.hist.Close()
 	}
-	h, err := OpenHistory(a.dataDir, id, requestedChat, requestedSummary, a.system)
+	h, err := history.OpenHistory(a.dataDir, id, requestedChat, requestedSummary, a.system)
 	if err != nil {
 		return err
 	}
 	a.hist = h
-	a.agent = NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
+	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	a.agent.SetReasoningUI(a.ui.reasoning)
@@ -379,7 +387,7 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 
 func (a *app) repl() {
 	mode := fmt.Sprintf(" · стратегия %s", a.strategy)
-	if a.strategy.needsWindow() {
+	if a.strategy.NeedsWindow() {
 		mode += fmt.Sprintf(" (%d сообщ.)", a.window)
 	}
 	fmt.Printf("сессия %s · модель %s · сжатие %s%s\n/help — команды: /model — модель, /session — сессия, /branch — ветки, /exit — выход; статистика — после каждого ответа\n",
@@ -389,9 +397,9 @@ func (a *app) repl() {
 			a.hist.ChatModel(), envModel, envModel)
 	}
 
-	ed := newLineEditor(isTerminal(os.Stdin), filepath.Join(a.dataDir, "history"))
+	ed := readline.NewLineEditor(isTerminal(os.Stdin), filepath.Join(a.dataDir, "history"))
 	for {
-		line, err := ed.read("agent> ")
+		line, err := ed.Read("agent> ")
 		if err != nil {
 			break
 		}
@@ -485,8 +493,8 @@ func (a *app) summaryStatus() string {
 	if !a.hist.HasSummary() {
 		return ""
 	}
-	s := fmt.Sprintf("конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
-	if a.strategy != StrategySummary {
+	s := fmt.Sprintf("конспект ~%d ток", tokens.EstimateTokens(a.hist.SummaryText()))
+	if a.strategy != compact.StrategySummary {
 		s += " (не в промпте)"
 	}
 	return s
@@ -501,10 +509,10 @@ func (a *app) footer() {
 	if s := a.summaryStatus(); s != "" {
 		extra = " · " + s
 	}
-	if a.strategy.needsWindow() {
+	if a.strategy.NeedsWindow() {
 		extra += fmt.Sprintf(" · %s(%d)", a.strategy, a.window)
 	}
-	prompt := a.agent.comp.PromptTokens(a.hist.SystemPrompt())
+	prompt := a.agent.Comp.PromptTokens(a.hist.SystemPrompt())
 	over := ""
 	if prompt > a.budget.MaxPromptTokens {
 		over = " · ПЕРЕПОЛНЕНИЕ"
@@ -518,13 +526,13 @@ func (a *app) footer() {
 }
 
 // describeStrategy prints the active context strategy in one line.
-func describeStrategy(s Strategy, window int) {
+func describeStrategy(s compact.Strategy, window int) {
 	switch s {
-	case StrategySummary:
+	case compact.StrategySummary:
 		fmt.Println("стратегия контекста: summary — старые ходы сворачиваются в конспект моделью сжатия")
-	case StrategyWindow:
+	case compact.StrategyWindow:
 		fmt.Printf("стратегия контекста: window — в промпте только последние %d сообщений, остальное вытесняется в архив без конспекта\n", window)
-	case StrategyFacts:
+	case compact.StrategyFacts:
 		fmt.Printf("стратегия контекста: facts — блок «ключ: значение» (обновляется после каждого сообщения) + последние %d сообщений\n", window)
 	}
 }
@@ -554,7 +562,7 @@ func (a *app) command(line string) (bool, error) {
 			return false, nil
 		}
 		id := arg
-		infos, err := SummarizeSessions(a.dataDir)
+		infos, err := history.SummarizeSessions(a.dataDir)
 		if err != nil {
 			return false, err
 		}
@@ -583,11 +591,11 @@ func (a *app) command(line string) (bool, error) {
 		if arg == "" {
 			printModels()
 			fmt.Println("текущая чат-модель:", a.hist.ChatModel())
-			fmt.Printf("переключить: /model <id>, например /model %s\n", ModelSet[0].ID)
+			fmt.Printf("переключить: /model <id>, например /model %s\n", config.ModelSet[0].ID)
 			return false, nil
 		}
-		if _, ok := FindModel(arg); !ok {
-			return false, fmt.Errorf("неизвестная модель %q; доступны: %s", arg, strings.Join(ModelIDs(), ", "))
+		if _, ok := config.FindModel(arg); !ok {
+			return false, fmt.Errorf("неизвестная модель %q; доступны: %s", arg, strings.Join(config.ModelIDs(), ", "))
 		}
 		a.hist.SetChatModel(arg)
 		fmt.Println("чат-модель:", arg)
@@ -599,8 +607,8 @@ func (a *app) command(line string) (bool, error) {
 			fmt.Println("переключить: /summary <id>; вступит в силу со следующего сжатия, /compact — сжать сейчас")
 			return false, nil
 		}
-		if _, ok := FindModel(arg); !ok {
-			return false, fmt.Errorf("неизвестная модель %q; доступны: %s", arg, strings.Join(ModelIDs(), ", "))
+		if _, ok := config.FindModel(arg); !ok {
+			return false, fmt.Errorf("неизвестная модель %q; доступны: %s", arg, strings.Join(config.ModelIDs(), ", "))
 		}
 		if arg == a.hist.SummaryModel() {
 			fmt.Println("модель сжатия уже:", arg)
@@ -616,7 +624,7 @@ func (a *app) command(line string) (bool, error) {
 			return false, nil
 		}
 		fields := strings.Fields(arg)
-		st, err := ParseStrategy(fields[0])
+		st, err := compact.ParseStrategy(fields[0])
 		if err != nil {
 			return false, err
 		}
@@ -628,7 +636,7 @@ func (a *app) command(line string) (bool, error) {
 			}
 			win = n
 		}
-		if st.needsWindow() && win <= 0 {
+		if st.NeedsWindow() && win <= 0 {
 			return false, fmt.Errorf("стратегии %s нужен размер окна: /strategy %s N", st, st)
 		}
 		a.strategy = st
@@ -643,20 +651,20 @@ func (a *app) command(line string) (bool, error) {
 			fmt.Println("фактов нет; стратегия facts наполняет их после каждого сообщения")
 			return false, nil
 		}
-		fmt.Printf("факты (%d ключей, ~%d ток.):\n", len(facts), EstimateTokens(renderFacts(facts)))
-		fmt.Println(renderFacts(facts))
+		fmt.Printf("факты (%d ключей, ~%d ток.):\n", len(facts), tokens.EstimateTokens(compact.RenderFacts(facts)))
+		fmt.Println(compact.RenderFacts(facts))
 
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
 				fmt.Printf("родитель: %s (чекпоинт seq %d)\n", p, a.hist.ForkSeq())
 			}
-			kids, err := ListForks(a.dataDir, a.hist.ID())
+			kids, err := history.ListForks(a.dataDir, a.hist.ID())
 			if err != nil {
 				return false, err
 			}
-			byID := map[string]SessionInfo{}
-			if infos, err := SummarizeSessions(a.dataDir); err == nil {
+			byID := map[string]history.SessionInfo{}
+			if infos, err := history.SummarizeSessions(a.dataDir); err == nil {
 				for _, inf := range infos {
 					byID[inf.ID] = inf
 				}
@@ -685,7 +693,7 @@ func (a *app) command(line string) (bool, error) {
 			return false, nil
 		}
 		exists := false
-		if infos, err := SummarizeSessions(a.dataDir); err == nil {
+		if infos, err := history.SummarizeSessions(a.dataDir); err == nil {
 			for _, inf := range infos {
 				if inf.ID == name {
 					exists = true
@@ -694,7 +702,7 @@ func (a *app) command(line string) (bool, error) {
 			}
 		}
 		if !exists {
-			id, err := ForkSession(a.dataDir, a.hist.ID(), name)
+			id, err := history.ForkSession(a.dataDir, a.hist.ID(), name)
 			if err != nil {
 				return false, err
 			}
@@ -730,7 +738,7 @@ func (a *app) command(line string) (bool, error) {
 		a.printTokens()
 
 	case "/compact":
-		if a.strategy.needsWindow() {
+		if a.strategy.NeedsWindow() {
 			fmt.Printf("стратегия %s не сворачивает историю в конспект: промпт ограничен последними %d сообщениями, старое уходит в архив.\n",
 				a.strategy, a.window)
 			fmt.Println("нужен конспект — переключитесь: /strategy summary, затем /compact")
@@ -738,7 +746,7 @@ func (a *app) command(line string) (bool, error) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		ok, err := a.agent.comp.ForceCompact(ctx, a.hist.SystemPrompt())
+		ok, err := a.agent.Comp.ForceCompact(ctx, a.hist.SystemPrompt())
 		if err != nil {
 			return false, err
 		}
@@ -761,7 +769,7 @@ func (a *app) command(line string) (bool, error) {
 				fmt.Println("…")
 				break
 			}
-			fmt.Printf("[%d] %s: %s\n", m.Seq, m.Role, oneLine(m.Content))
+			fmt.Printf("[%d] %s: %s\n", m.Seq, m.Role, config.OneLine(m.Content))
 		}
 
 	default:
@@ -779,12 +787,12 @@ func (a *app) printHistory() {
 	for _, m := range msgs[start:] {
 		tok := m.Tokens
 		if tok == 0 {
-			tok = EstimateMessage(*m)
+			tok = tokens.EstimateMessage(*m)
 		}
-		fmt.Printf("[%d] %-9s ~%-5d ток. %s\n", m.Seq, m.Role, tok, oneLine(m.Content))
+		fmt.Printf("[%d] %-9s ~%-5d ток. %s\n", m.Seq, m.Role, tok, config.OneLine(m.Content))
 	}
 	if a.hist.HasSummary() {
-		if a.strategy == StrategySummary {
+		if a.strategy == compact.StrategySummary {
 			fmt.Println("(плюс конспект предыдущего диалога)")
 		} else {
 			fmt.Printf("(конспект есть, но в промпт не идёт — стратегия %s)\n", a.strategy)
@@ -796,19 +804,19 @@ func (a *app) printHistory() {
 // prompt, the rolling summary, the verbatim tail and the tool schemas, with a
 // token estimate per block. It is the "what did compression do" view.
 func (a *app) printContext() {
-	promptMsgs := a.agent.comp.promptWindow()
-	base := EstimateTokens(a.agent.comp.promptSystem(a.hist.SystemPrompt()))
+	promptMsgs := a.agent.Comp.PromptWindow()
+	base := tokens.EstimateTokens(a.agent.Comp.PromptSystem(a.hist.SystemPrompt()))
 	factsTok := 0
 	if facts := a.hist.Facts(); len(facts) > 0 {
-		factsTok = EstimateTokens("Факты диалога (память о договорённостях):\n" + renderFacts(facts))
+		factsTok = tokens.EstimateTokens("Факты диалога (память о договорённостях):\n" + compact.RenderFacts(facts))
 	}
 	histTok := 0
 	for _, m := range promptMsgs {
 		msg := *m
 		if msg.Role == "tool" {
-			msg.Content = truncate(msg.Content, a.maxToolChars)
+			msg.Content = config.Truncate(msg.Content, a.maxToolChars)
 		}
-		histTok += EstimateMessage(msg)
+		histTok += tokens.EstimateMessage(msg)
 	}
 	schemas := a.tools.Schemas()
 	names := make([]string, 0, len(schemas))
@@ -818,34 +826,34 @@ func (a *app) printContext() {
 	toolsTok := 0
 	if len(schemas) > 0 {
 		if b, err := json.Marshal(schemas); err == nil {
-			toolsTok = EstimateTokens(string(b))
+			toolsTok = tokens.EstimateTokens(string(b))
 		}
 	}
 
 	fmt.Printf("что уходит в модель (сессия %s, модель %s, стратегия %s):\n", a.hist.ID(), a.hist.ChatModel(), a.strategy)
 	fmt.Printf("  system prompt        ~%d ток.\n", base)
 	switch a.strategy {
-	case StrategyFacts:
+	case compact.StrategyFacts:
 		if factsTok > 0 {
 			fmt.Printf("  факты                ~%d ток. (%d ключей)\n", factsTok, len(a.hist.Facts()))
 		} else {
 			fmt.Println("  факты                нет")
 		}
 		fmt.Printf("  окно                 последние %d сообщ.\n", a.window)
-	case StrategyWindow:
+	case compact.StrategyWindow:
 		fmt.Printf("  окно                 последние %d сообщ. (без конспекта — стратегия window)\n", a.window)
 	default:
 		if a.hist.HasSummary() {
 			cov := a.hist.SummaryCovers()
-			sumTok := EstimateTokens("Конспект предыдущего диалога:\n"+a.hist.SummaryText()) + 4
+			sumTok := tokens.EstimateTokens("Конспект предыдущего диалога:\n"+a.hist.SummaryText()) + 4
 			fmt.Printf("  конспект seq %d..%d   ~%d ток.\n", cov[0], cov[1], sumTok)
 		} else {
 			fmt.Println("  конспект             нет")
 		}
 	}
-	if a.strategy != StrategySummary && a.hist.HasSummary() {
+	if a.strategy != compact.StrategySummary && a.hist.HasSummary() {
 		fmt.Printf("  конспект (старый)    ~%d ток. — не в промпте (остался от summary)\n",
-			EstimateTokens(a.hist.SummaryText()))
+			tokens.EstimateTokens(a.hist.SummaryText()))
 	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
@@ -856,12 +864,12 @@ func (a *app) printContext() {
 	fmt.Printf("  инструменты          ~%d ток. (%s)\n", toolsTok, strings.Join(names, ", "))
 	fmt.Printf("  ─────────────────────────────────────────\n")
 	fmt.Printf("  итого                ~%d ток. из %d (калибровка ×%.2f)\n",
-		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
+		a.agent.Comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.Calib.Ratio())
 
 	switch a.strategy {
-	case StrategyWindow, StrategyFacts:
+	case compact.StrategyWindow, compact.StrategyFacts:
 		fmt.Printf("  вытеснение           всё старше %d сообщений → архив (без конспекта)\n", a.window)
-	case StrategySummary:
+	case compact.StrategySummary:
 		if a.noCompact {
 			fmt.Println("  авто-сжатие отключено (-no-compact)")
 		} else {
@@ -877,15 +885,15 @@ func (a *app) printContext() {
 		}
 	}
 
-	if a.strategy == StrategySummary && a.hist.HasSummary() {
+	if a.strategy == compact.StrategySummary && a.hist.HasSummary() {
 		fmt.Println("\nконспект вместо старой истории:")
 		for _, line := range strings.Split(strings.TrimSpace(a.hist.SummaryText()), "\n") {
 			fmt.Println("  " + line)
 		}
 	}
-	if a.strategy == StrategyFacts && len(a.hist.Facts()) > 0 {
+	if a.strategy == compact.StrategyFacts && len(a.hist.Facts()) > 0 {
 		fmt.Println("\nфакты вместо старой истории:")
-		fmt.Println(indentBlock(renderFacts(a.hist.Facts()), "  "))
+		fmt.Println(indentBlock(compact.RenderFacts(a.hist.Facts()), "  "))
 	}
 }
 
@@ -908,13 +916,13 @@ func (a *app) printTokens() {
 		fmt.Printf("%s: покрывает seq %d..%d\n", s, covers[0], covers[1])
 	}
 	if facts := a.hist.Facts(); len(facts) > 0 {
-		fmt.Printf("факты: %d ключей, ~%d ток. (стратегия facts)\n", len(facts), EstimateTokens(renderFacts(facts)))
+		fmt.Printf("факты: %d ключей, ~%d ток. (стратегия facts)\n", len(facts), tokens.EstimateTokens(compact.RenderFacts(facts)))
 	}
-	if a.strategy.needsWindow() {
+	if a.strategy.NeedsWindow() {
 		fmt.Printf("стратегия %s: в промпт идут последние %d сообщений, старое вытесняется в архив без конспекта\n", a.strategy, a.window)
 	}
 	fmt.Printf("оценка промпта: ~%d ток. (бюджет %d, калибровка ×%.2f)\n",
-		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
+		a.agent.Comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.Calib.Ratio())
 	fmt.Printf("модель сжатия: %s\n", a.hist.SummaryModel())
 
 	s := a.client.Stats()
@@ -944,7 +952,7 @@ func (a *app) runScript(path string) error {
 
 // printSessionList shows all stored sessions with the current one marked.
 func (a *app) printSessionList() {
-	infos, err := SummarizeSessions(a.dataDir)
+	infos, err := history.SummarizeSessions(a.dataDir)
 	if err != nil {
 		fmt.Println("ошибка:", err)
 		return
@@ -967,7 +975,7 @@ func (a *app) printSessionList() {
 
 // forkMark renders the branch suffix of a session line: parent id and the
 // parent's seq at the fork point. Empty for ordinary (non-branch) sessions.
-func forkMark(inf SessionInfo) string {
+func forkMark(inf history.SessionInfo) string {
 	if inf.ForkOf == "" {
 		return ""
 	}
@@ -980,9 +988,9 @@ func forkMark(inf SessionInfo) string {
 
 func printModels() {
 	fmt.Println("Модели — id это имя в первом столбце:")
-	for _, m := range ModelSet {
+	for _, m := range config.ModelSet {
 		mark := " "
-		if m.ID == DefaultModel() {
+		if m.ID == config.DefaultModel() {
 			mark = "*"
 		}
 		fmt.Printf(" %s %-22s %-10s $%.4f/1M\n", mark, m.ID, m.Tier, m.RatePerM)
@@ -991,7 +999,7 @@ func printModels() {
 }
 
 func printSessions(dataDir string) {
-	infos, err := SummarizeSessions(dataDir)
+	infos, err := history.SummarizeSessions(dataDir)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -1029,7 +1037,7 @@ const helpText = `Команды:
   /recall <текст>  поиск по архиву
 
 Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
-  ./task2-06 -print-session <id|last>
+  ./agent -print-session <id|last>
 
 Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
 Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,

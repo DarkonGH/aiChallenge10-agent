@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"bufio"
@@ -91,8 +91,8 @@ type Task struct {
 	Answer    float64
 }
 
-// loadTasks reads tasks.txt lines of the form id|label|условие|answer.
-func loadTasks(path string) ([]Task, error) {
+// LoadTasks reads tasks.txt lines of the form id|label|условие|answer.
+func LoadTasks(path string) ([]Task, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -136,16 +136,16 @@ func loadTasks(path string) ([]Task, error) {
 	return tasks, sc.Err()
 }
 
-// formatAnswer renders a number without a trailing ".0" for integers.
-func formatAnswer(a float64) string {
+// FormatAnswer renders a number without a trailing ".0" for integers.
+func FormatAnswer(a float64) string {
 	if a == math.Trunc(a) && math.Abs(a) < 1e15 {
 		return strconv.FormatFloat(a, 'f', 0, 64)
 	}
 	return strconv.FormatFloat(a, 'f', -1, 64)
 }
 
-// truncate shortens s to max runes, marking the cut.
-func truncate(s string, max int) string {
+// Truncate shortens s to max runes, marking the cut.
+func Truncate(s string, max int) string {
 	if max <= 0 {
 		return s
 	}
@@ -154,4 +154,11 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "…"
+}
+
+// OneLine flattens multi-line text for a single log or trace line.
+func OneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	return Truncate(s, 160)
 }

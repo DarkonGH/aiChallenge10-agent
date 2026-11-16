@@ -1,6 +1,7 @@
-package main
+package compact
 
 import (
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"reflect"
 	"testing"
 )
@@ -14,20 +15,20 @@ func TestParseStrategy(t *testing.T) {
 	if _, err := ParseStrategy("нет"); err == nil {
 		t.Error("ожидали ошибку для неизвестной стратегии")
 	}
-	if StrategySummary.needsWindow() {
+	if StrategySummary.NeedsWindow() {
 		t.Error("summary не требует окно")
 	}
-	if !StrategyWindow.needsWindow() || !StrategyFacts.needsWindow() {
+	if !StrategyWindow.NeedsWindow() || !StrategyFacts.NeedsWindow() {
 		t.Error("window и facts требуют окно")
 	}
 }
 
 func TestParseFactsJSON(t *testing.T) {
-	got, err := parseFactsJSON(`{"цель": "переезд офиса", "срок": "15 декабря", "мест": 42}`)
+	got, err := ParseFactsJSON(`{"цель": "переезд офиса", "срок": "15 декабря", "мест": 42}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Fact{
+	want := []history.Fact{
 		{Key: "цель", Value: "переезд офиса"},
 		{Key: "срок", Value: "15 декабря"},
 		{Key: "мест", Value: "42"},
@@ -39,7 +40,7 @@ func TestParseFactsJSON(t *testing.T) {
 
 func TestParseFactsJSONToleratesFencesAndProse(t *testing.T) {
 	in := "Вот обновлённые факты:\n```json\n{\"ключ\": \"значение\"}\n```\n"
-	got, err := parseFactsJSON(in)
+	got, err := ParseFactsJSON(in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +50,7 @@ func TestParseFactsJSONToleratesFencesAndProse(t *testing.T) {
 }
 
 func TestParseFactsJSONDuplicateKeyWins(t *testing.T) {
-	got, err := parseFactsJSON(`{"срок": "20 ноября", "срок": "15 декабря"}`)
+	got, err := ParseFactsJSON(`{"срок": "20 ноября", "срок": "15 декабря"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +60,16 @@ func TestParseFactsJSONDuplicateKeyWins(t *testing.T) {
 }
 
 func TestParseFactsJSONRejectsNonObject(t *testing.T) {
-	if _, err := parseFactsJSON("[1,2,3]"); err == nil {
+	if _, err := ParseFactsJSON("[1,2,3]"); err == nil {
 		t.Error("ожидали ошибку для массива вместо объекта")
 	}
-	if _, err := parseFactsJSON("не JSON вовсе"); err == nil {
+	if _, err := ParseFactsJSON("не JSON вовсе"); err == nil {
 		t.Error("ожидали ошибку для текста без JSON")
 	}
 }
 
 func TestParseFactsJSONSkipsEmptyPairs(t *testing.T) {
-	got, err := parseFactsJSON(`{"": "x", "пусто": "", "ок": "да"}`)
+	got, err := ParseFactsJSON(`{"": "x", "пусто": "", "ок": "да"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,9 +79,9 @@ func TestParseFactsJSONSkipsEmptyPairs(t *testing.T) {
 }
 
 func TestRenderFacts(t *testing.T) {
-	got := renderFacts([]Fact{{Key: "срок", Value: "15 декабря"}, {Key: "бюджет", Value: "480 000"}})
+	got := RenderFacts([]history.Fact{{Key: "срок", Value: "15 декабря"}, {Key: "бюджет", Value: "480 000"}})
 	want := "- срок: 15 декабря\n- бюджет: 480 000"
 	if got != want {
-		t.Errorf("renderFacts = %q, want %q", got, want)
+		t.Errorf("RenderFacts = %q, want %q", got, want)
 	}
 }

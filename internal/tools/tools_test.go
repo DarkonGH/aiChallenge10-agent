@@ -1,14 +1,16 @@
-package main
+package tools
 
 import (
 	"encoding/json"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"strings"
 	"testing"
 )
 
 // call builds a tool call for tests.
-func call(name, args string) ToolCall {
-	var tc ToolCall
+func call(name, args string) llm.ToolCall {
+	var tc llm.ToolCall
 	tc.ID = "call_1"
 	tc.Type = "function"
 	tc.Function.Name = name
@@ -46,7 +48,7 @@ func TestEvalExpr(t *testing.T) {
 }
 
 func TestRegistryExecute(t *testing.T) {
-	r := NewToolRegistry([]Task{
+	r := NewToolRegistry([]config.Task{
 		{ID: 8, Label: "улитка на столбе", Condition: "Улитка ползёт вверх по столбу", Answer: 28},
 	})
 

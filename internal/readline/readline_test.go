@@ -1,4 +1,4 @@
-package main
+package readline
 
 import (
 	"fmt"
@@ -12,7 +12,7 @@ func TestLineEditorHistoryRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "history")
 
-	ed := newLineEditor(false, path)
+	ed := NewLineEditor(false, path)
 	ed.append("привет")
 	ed.append("сколько будет 17*23?")
 	ed.append("сколько будет 17*23?") // соседний дубликат — не пишется
@@ -28,7 +28,7 @@ func TestLineEditorHistoryRoundTrip(t *testing.T) {
 	}
 
 	// Новый редактор подхватывает историю.
-	ed2 := newLineEditor(true, path)
+	ed2 := NewLineEditor(true, path)
 	if len(ed2.hist) != 2 || ed2.hist[0] != "привет" || ed2.hist[1] != "сколько будет 17*23?" {
 		t.Fatalf("hist = %q", ed2.hist)
 	}

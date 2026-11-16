@@ -1,19 +1,24 @@
-package main
+package agent
 
 import (
 	"context"
 	"fmt"
-	"strings"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 )
 
 // Agent owns the whole loop: request → tool call → tool result → answer.
 // main only feeds it user text and renders the result.
 type Agent struct {
-	client             *ChatClient
-	tools              *ToolRegistry
-	hist               *History
-	comp               *Compactor
-	calib              *Calibrator
+	client             *llm.ChatClient
+	tools              *tools.ToolRegistry
+	hist               *history.History
+	Comp               *compact.Compactor
+	Calib              *tokens.Calibrator
 	maxSteps           int
 	temperature        float64
 	maxToolPromptChars int
@@ -29,32 +34,32 @@ type Agent struct {
 	onMessageDone  func()
 
 	noCompact        bool // demo mode: skip MaybeCompact, let the prompt overflow
-	strategy         Strategy
+	strategy         compact.Strategy
 	window           int // prompt window for the window/facts strategies
 	lastAnswerTokens int // completion tokens of the most recent model turn
 }
 
 // NewAgent wires a session, a tool set and a context compactor together.
-func NewAgent(client *ChatClient, tools *ToolRegistry, hist *History, budget Budget, maxSteps int, temperature float64, maxToolChars int) *Agent {
-	calib := NewCalibrator()
+func NewAgent(client *llm.ChatClient, tools *tools.ToolRegistry, hist *history.History, budget compact.Budget, maxSteps int, temperature float64, maxToolChars int) *Agent {
+	calib := tokens.NewCalibrator()
 	a := &Agent{
 		client:             client,
 		tools:              tools,
 		hist:               hist,
-		calib:              calib,
+		Calib:              calib,
 		maxSteps:           maxSteps,
 		temperature:        temperature,
 		maxToolPromptChars: maxToolChars,
 	}
-	a.comp = NewCompactor(hist, client, budget, calib, maxToolChars)
-	a.comp.trace = func(s string) { a.tracef("%s", s) }
+	a.Comp = compact.NewCompactor(hist, client, budget, calib, maxToolChars)
+	a.Comp.SetTrace(func(s string) { a.tracef("%s", s) })
 	return a
 }
 
 // SetTrace installs a callback for tool calls and compaction notices.
 func (a *Agent) SetTrace(fn func(string)) {
 	a.trace = fn
-	a.comp.trace = fn
+	a.Comp.SetTrace(fn)
 }
 
 // SetStreamUI installs the streaming callbacks. Until it is called the agent
@@ -76,22 +81,22 @@ func (a *Agent) SetReasoningUI(fn func(string)) { a.onReasoning = fn }
 func (a *Agent) SetNoCompact(v bool) { a.noCompact = v }
 
 // SetCompactEvery enables the message-count compaction trigger (0 = off).
-func (a *Agent) SetCompactEvery(n int) { a.comp.SetCompactEvery(n) }
+func (a *Agent) SetCompactEvery(n int) { a.Comp.SetCompactEvery(n) }
 
 // SetStrategy selects the context strategy (summary is the default).
-func (a *Agent) SetStrategy(s Strategy) {
+func (a *Agent) SetStrategy(s compact.Strategy) {
 	a.strategy = s
-	a.comp.SetStrategy(s)
+	a.Comp.SetStrategy(s)
 }
 
 // SetWindow sets the prompt window size for the window/facts strategies.
 func (a *Agent) SetWindow(n int) {
 	a.window = n
-	a.comp.SetWindow(n)
+	a.Comp.SetWindow(n)
 }
 
 // mode returns the active strategy, defaulting to summary.
-func (a *Agent) mode() Strategy { return a.comp.mode() }
+func (a *Agent) mode() compact.Strategy { return a.Comp.Mode() }
 
 // LastAnswerTokens reports the completion-token usage of the most recent
 // model turn (0 before the first turn).
@@ -111,11 +116,11 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	// Sticky facts: fold the new user message into the key-value store before
 	// anything else. One cheap extractor call per user turn; on failure the
 	// previous store stays (the turn proceeds with slightly older facts).
-	if a.mode() == StrategyFacts {
-		out, err := a.comp.extractFacts(ctx, a.hist.Facts(), userText)
+	if a.mode() == compact.StrategyFacts {
+		out, err := a.Comp.ExtractFacts(ctx, a.hist.Facts(), userText)
 		if err != nil {
-			a.tracef("факты: не удалось обновить (%s) — остаются прежние", oneLine(err.Error()))
-		} else if facts, perr := parseFactsJSON(out); perr != nil {
+			a.tracef("факты: не удалось обновить (%s) — остаются прежние", config.OneLine(err.Error()))
+		} else if facts, perr := compact.ParseFactsJSON(out); perr != nil {
 			a.tracef("факты: %s — остаются прежние", perr)
 		} else if len(facts) == 0 && len(a.hist.Facts()) > 0 {
 			a.tracef("факты: экстрактор вернул пустой список — остаются прежние")
@@ -128,14 +133,14 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 
 	for step := 1; step <= a.maxSteps; step++ {
 		switch a.mode() {
-		case StrategySummary:
+		case compact.StrategySummary:
 			if !a.noCompact {
-				if _, err := a.comp.MaybeCompact(ctx, a.hist.SystemPrompt()); err != nil {
+				if _, err := a.Comp.MaybeCompact(ctx, a.hist.SystemPrompt()); err != nil {
 					a.tracef("сжатие контекста: %v", err)
 				}
 			}
-		case StrategyWindow, StrategyFacts:
-			if _, err := a.comp.EnforceWindow(a.window); err != nil {
+		case compact.StrategyWindow, compact.StrategyFacts:
+			if _, err := a.Comp.EnforceWindow(a.window); err != nil {
 				a.tracef("окно: %v", err)
 			}
 		}
@@ -143,13 +148,13 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		messages := a.buildMessages()
 		estimated := 0
 		for _, m := range messages {
-			estimated += EstimateMessage(m)
+			estimated += tokens.EstimateMessage(m)
 		}
 
 		if a.onMessageStart != nil {
 			a.onMessageStart()
 		}
-		var resp *ChatResponse
+		var resp *llm.ChatResponse
 		var err error
 		if a.onContent != nil {
 			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, a.onContent, a.onReasoning)
@@ -159,7 +164,7 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		a.calib.Update(estimated, resp.Usage.PromptTokens)
+		a.Calib.Update(estimated, resp.Usage.PromptTokens)
 		a.lastAnswerTokens = resp.Usage.CompletionTokens
 
 		a.hist.AppendAssistant(resp.Content, resp.ToolCalls, a.hist.ChatModel())
@@ -173,7 +178,7 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 
 		for _, call := range resp.ToolCalls {
 			out := a.tools.Execute(call)
-			a.tracef("%s(%s) → %s", call.Function.Name, call.Function.Arguments, oneLine(out))
+			a.tracef("%s(%s) → %s", call.Function.Name, call.Function.Arguments, config.OneLine(out))
 			a.hist.AppendTool(call.ID, call.Function.Name, out)
 		}
 	}
@@ -184,22 +189,15 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 // buildMessages assembles the API request: system prompt with the strategy's
 // memory block (summary or facts), then the strategy's window. Tool outputs
 // are truncated here only — the log keeps the full result.
-func (a *Agent) buildMessages() []Message {
-	out := make([]Message, 0, len(a.hist.Active())+1)
-	out = append(out, Message{Role: "system", Content: a.comp.promptSystem(a.hist.SystemPrompt())})
-	for _, m := range a.comp.promptWindow() {
+func (a *Agent) buildMessages() []llm.Message {
+	out := make([]llm.Message, 0, len(a.hist.Active())+1)
+	out = append(out, llm.Message{Role: "system", Content: a.Comp.PromptSystem(a.hist.SystemPrompt())})
+	for _, m := range a.Comp.PromptWindow() {
 		c := *m
 		if c.Role == "tool" {
-			c.Content = truncate(c.Content, a.maxToolPromptChars)
+			c.Content = config.Truncate(c.Content, a.maxToolPromptChars)
 		}
 		out = append(out, c)
 	}
 	return out
-}
-
-// oneLine flattens a tool result for the trace line.
-func oneLine(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.Join(strings.Fields(s), " ")
-	return truncate(s, 160)
 }

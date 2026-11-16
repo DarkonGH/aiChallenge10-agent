@@ -1,9 +1,12 @@
-package main
+package compact
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"strings"
 )
 
@@ -34,13 +37,13 @@ func ParseStrategy(s string) (Strategy, error) {
 }
 
 // needsWindow reports whether the strategy requires the -window N parameter.
-func (s Strategy) needsWindow() bool {
+func (s Strategy) NeedsWindow() bool {
 	return s == StrategyWindow || s == StrategyFacts
 }
 
-// renderFacts prints the store as "ключ: значение" lines for the prompt and
+// RenderFacts prints the store as "ключ: значение" lines for the prompt and
 // the /facts command.
-func renderFacts(facts []Fact) string {
+func RenderFacts(facts []history.Fact) string {
 	var b strings.Builder
 	for _, f := range facts {
 		fmt.Fprintf(&b, "- %s: %s\n", f.Key, f.Value)
@@ -66,23 +69,23 @@ const factsSystemPrompt = "Ты ведёшь долговременную пам
 
 // factsPrompt builds the extractor input: the current store plus the message
 // being folded in.
-func factsPrompt(prev []Fact, userText string) string {
+func factsPrompt(prev []history.Fact, userText string) string {
 	var b strings.Builder
 	b.WriteString("Текущие факты:\n")
 	if len(prev) == 0 {
 		b.WriteString("(пока пусто)\n")
 	} else {
-		b.WriteString(renderFacts(prev))
+		b.WriteString(RenderFacts(prev))
 		b.WriteString("\n")
 	}
 	b.WriteString("\nНовое сообщение пользователя:\n")
-	b.WriteString(truncate(userText, 2000))
+	b.WriteString(config.Truncate(userText, 2000))
 	return b.String()
 }
 
-// parseFactsJSON reads the extractor's answer: a flat JSON object in key
+// ParseFactsJSON reads the extractor's answer: a flat JSON object in key
 // insertion order. Code fences and stray prose around the object are tolerated.
-func parseFactsJSON(s string) ([]Fact, error) {
+func ParseFactsJSON(s string) ([]history.Fact, error) {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "```") {
 		s = strings.TrimPrefix(s, "```json")
@@ -108,7 +111,7 @@ func parseFactsJSON(s string) ([]Fact, error) {
 		return nil, fmt.Errorf("факты: ожидался JSON-объект")
 	}
 
-	var facts []Fact
+	var facts []history.Fact
 	seen := make(map[string]int)
 	for dec.More() {
 		kt, err := dec.Token()
@@ -121,7 +124,7 @@ func parseFactsJSON(s string) ([]Fact, error) {
 			return nil, fmt.Errorf("факты: %w", err)
 		}
 		key = strings.TrimSpace(key)
-		value := strings.TrimSpace(truncate(fmt.Sprintf("%v", val), 500))
+		value := strings.TrimSpace(config.Truncate(fmt.Sprintf("%v", val), 500))
 		if key == "" || value == "" {
 			continue
 		}
@@ -130,7 +133,7 @@ func parseFactsJSON(s string) ([]Fact, error) {
 			continue
 		}
 		seen[key] = len(facts)
-		facts = append(facts, Fact{Key: key, Value: value})
+		facts = append(facts, history.Fact{Key: key, Value: value})
 	}
 	return facts, nil
 }
@@ -138,7 +141,7 @@ func parseFactsJSON(s string) ([]Fact, error) {
 // extractFacts is the glue used by the Compactor: one extractor request with
 // the summary-model-first / chat-model-fallback pattern of summarize. The
 // raw model answer is returned; parsing happens at the call site.
-func (c *Compactor) extractFacts(ctx context.Context, prev []Fact, userText string) (string, error) {
+func (c *Compactor) ExtractFacts(ctx context.Context, prev []history.Fact, userText string) (string, error) {
 	prompt := factsPrompt(prev, userText)
 	primary := c.hist.SummaryModel()
 
@@ -149,7 +152,7 @@ func (c *Compactor) extractFacts(ctx context.Context, prev []Fact, userText stri
 			return "", err
 		}
 		if c.trace != nil {
-			c.trace(fmt.Sprintf("факты: %s не справился (%s) — пробую %s", primary, oneLine(err.Error()), backup))
+			c.trace(fmt.Sprintf("факты: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
 		}
 		out, err2 := c.factsRequest(ctx, backup, prompt)
 		if err2 != nil {
@@ -165,7 +168,7 @@ func (c *Compactor) extractFacts(ctx context.Context, prev []Fact, userText stri
 func (c *Compactor) factsRequest(ctx context.Context, model, prompt string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
 	defer cancel()
-	resp, err := c.client.Chat(actx, model, []Message{
+	resp, err := c.client.Chat(actx, model, []llm.Message{
 		{Role: "system", Content: factsSystemPrompt},
 		{Role: "user", Content: prompt},
 	}, nil, 0)

@@ -1,8 +1,12 @@
-package main
+package compact
 
 import (
 	"context"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"strings"
 	"time"
 )
@@ -31,10 +35,10 @@ func DefaultBudget() Budget {
 // Compactor implements the context strategy: sliding window + rolling summary
 // + archive. It never deletes data: messages leave the prompt, not the log.
 type Compactor struct {
-	hist         *History
-	client       *ChatClient
+	hist         *history.History
+	client       *llm.ChatClient
 	budget       Budget
-	calib        *Calibrator
+	calib        *tokens.Calibrator
 	maxToolChars int
 	trace        func(string)
 	compactEvery int      // compact when the window holds this many messages (0 = off)
@@ -47,6 +51,9 @@ type Compactor struct {
 // the budget. n <= 0 restores the budget-only behavior.
 func (c *Compactor) SetCompactEvery(n int) { c.compactEvery = n }
 
+// SetTrace installs the callback for compaction notices.
+func (c *Compactor) SetTrace(fn func(string)) { c.trace = fn }
+
 // SetStrategy selects the context strategy (summary when never set).
 func (c *Compactor) SetStrategy(s Strategy) { c.strategy = s }
 
@@ -54,7 +61,7 @@ func (c *Compactor) SetStrategy(s Strategy) { c.strategy = s }
 func (c *Compactor) SetWindow(n int) { c.window = n }
 
 // mode returns the active strategy, defaulting to the day-9 summary behavior.
-func (c *Compactor) mode() Strategy {
+func (c *Compactor) Mode() Strategy {
 	if c.strategy == "" {
 		return StrategySummary
 	}
@@ -62,7 +69,7 @@ func (c *Compactor) mode() Strategy {
 }
 
 // NewCompactor builds a compactor for one session.
-func NewCompactor(hist *History, client *ChatClient, budget Budget, calib *Calibrator, maxToolChars int) *Compactor {
+func NewCompactor(hist *history.History, client *llm.ChatClient, budget Budget, calib *tokens.Calibrator, maxToolChars int) *Compactor {
 	return &Compactor{
 		hist:         hist,
 		client:       client,
@@ -76,13 +83,13 @@ func NewCompactor(hist *History, client *ChatClient, budget Budget, calib *Calib
 // memory block) and the window the strategy would send, with tool outputs
 // truncated exactly as buildMessages does.
 func (c *Compactor) PromptTokens(system string) int {
-	n := EstimateTokens(c.promptSystem(system))
-	for _, m := range c.promptWindow() {
+	n := tokens.EstimateTokens(c.PromptSystem(system))
+	for _, m := range c.PromptWindow() {
 		msg := *m
 		if msg.Role == "tool" {
-			msg.Content = truncate(msg.Content, c.maxToolChars)
+			msg.Content = config.Truncate(msg.Content, c.maxToolChars)
 		}
-		n += EstimateMessage(msg)
+		n += tokens.EstimateMessage(msg)
 	}
 	return c.calib.Scale(n)
 }
@@ -90,11 +97,11 @@ func (c *Compactor) PromptTokens(system string) int {
 // promptSystem assembles the system prompt with the strategy's memory block:
 // the rolling summary for the summary strategy, the sticky facts for the
 // facts strategy, nothing extra for the bare window.
-func (c *Compactor) promptSystem(system string) string {
-	switch c.mode() {
+func (c *Compactor) PromptSystem(system string) string {
+	switch c.Mode() {
 	case StrategyFacts:
 		if facts := c.hist.Facts(); len(facts) > 0 {
-			return system + "\n\nФакты диалога (память о договорённостях):\n" + renderFacts(facts)
+			return system + "\n\nФакты диалога (память о договорённостях):\n" + RenderFacts(facts)
 		}
 	case StrategySummary:
 		if s := c.hist.SummaryText(); s != "" {
@@ -107,9 +114,9 @@ func (c *Compactor) promptSystem(system string) string {
 // promptWindow returns the messages the next request will carry: the whole
 // active window for the summary strategy (compaction bounds it), the last
 // windowCut messages for window/facts.
-func (c *Compactor) promptWindow() []*Message {
+func (c *Compactor) PromptWindow() []*llm.Message {
 	msgs := c.hist.Active()
-	if c.mode() == StrategySummary {
+	if c.Mode() == StrategySummary {
 		return msgs
 	}
 	if cut := windowCut(msgs, c.window); cut > 0 {
@@ -122,7 +129,7 @@ func (c *Compactor) promptWindow() []*Message {
 // messages, so the window slides one message at a time. The cut moves forward
 // only when it lands on a tool result — a tool message cannot be sent without
 // the assistant call that produced it. 0 means "nothing to cut".
-func windowCut(msgs []*Message, n int) int {
+func windowCut(msgs []*llm.Message, n int) int {
 	if n <= 0 || len(msgs) <= n {
 		return 0
 	}
@@ -158,7 +165,7 @@ func (c *Compactor) EnforceWindow(n int) (bool, error) {
 		return false, err
 	}
 	if c.trace != nil {
-		c.trace(fmt.Sprintf("окно: сообщения seq %d..%d → архив (стратегия %s)", from, to, c.mode()))
+		c.trace(fmt.Sprintf("окно: сообщения seq %d..%d → архив (стратегия %s)", from, to, c.Mode()))
 	}
 	return true, nil
 }
@@ -249,21 +256,21 @@ func (c *Compactor) ForceCompact(ctx context.Context, system string) (bool, erro
 	}
 	if c.trace != nil {
 		c.trace(fmt.Sprintf("сжатие контекста: сообщения seq %d..%d → архив, конспект ~%d ток., промпт теперь ~%d ток.",
-			from, to, EstimateTokens(summary), c.PromptTokens(system)))
+			from, to, tokens.EstimateTokens(summary), c.PromptTokens(system)))
 	}
 	return true, nil
 }
 
 // splitIndex returns the index of the user message that starts the verbatim
 // tail. Splitting on a user boundary keeps every assistant+tool group intact.
-func (c *Compactor) splitIndex(msgs []*Message) int {
+func (c *Compactor) splitIndex(msgs []*llm.Message) int {
 	if len(msgs) < 2 {
 		return 0
 	}
 	tail := 0
 	best := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
-		tail += EstimateMessage(*msgs[i])
+		tail += tokens.EstimateMessage(*msgs[i])
 		if msgs[i].Role == "user" && tail >= c.budget.MinTailTokens {
 			best = i
 			break
@@ -283,7 +290,7 @@ func (c *Compactor) splitIndex(msgs []*Message) int {
 
 // summarizePrompt builds the summarizer input: the previous summary plus the
 // messages that are leaving the prompt.
-func (c *Compactor) summarizePrompt(prefix []*Message) string {
+func (c *Compactor) summarizePrompt(prefix []*llm.Message) string {
 	var b strings.Builder
 	if c.hist.HasSummary() {
 		b.WriteString("Предыдущий конспект:\n")
@@ -294,16 +301,16 @@ func (c *Compactor) summarizePrompt(prefix []*Message) string {
 	for _, m := range prefix {
 		switch m.Role {
 		case "user":
-			fmt.Fprintf(&b, "Пользователь: %s\n", truncate(m.Content, 1000))
+			fmt.Fprintf(&b, "Пользователь: %s\n", config.Truncate(m.Content, 1000))
 		case "assistant":
 			if m.Content != "" {
-				fmt.Fprintf(&b, "Ассистент: %s\n", truncate(m.Content, 1000))
+				fmt.Fprintf(&b, "Ассистент: %s\n", config.Truncate(m.Content, 1000))
 			}
 			for _, tc := range m.ToolCalls {
-				fmt.Fprintf(&b, "  вызов %s(%s)\n", tc.Function.Name, truncate(tc.Function.Arguments, 300))
+				fmt.Fprintf(&b, "  вызов %s(%s)\n", tc.Function.Name, config.Truncate(tc.Function.Arguments, 300))
 			}
 		case "tool":
-			fmt.Fprintf(&b, "  результат %s: %s\n", m.Name, truncate(m.Content, 400))
+			fmt.Fprintf(&b, "  результат %s: %s\n", m.Name, config.Truncate(m.Content, 400))
 		}
 	}
 	return b.String()
@@ -313,7 +320,7 @@ func (c *Compactor) summarizePrompt(prefix []*Message) string {
 // note. If the summary model fails (503, timeout, empty answer), the chat model
 // is tried once as a backup: a slightly more expensive note is much better than
 // a stub that loses the dialogue.
-func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, error) {
+func (c *Compactor) summarize(ctx context.Context, prefix []*llm.Message) (string, error) {
 	prompt := c.summarizePrompt(prefix)
 	primary := c.hist.SummaryModel()
 
@@ -327,7 +334,7 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, e
 		return "", err
 	}
 	if c.trace != nil {
-		c.trace(fmt.Sprintf("сжатие: %s не справился (%s) — пробую %s", primary, oneLine(err.Error()), backup))
+		c.trace(fmt.Sprintf("сжатие: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
 	}
 	summary, err2 := c.summarizeWith(ctx, backup, prompt)
 	if err2 != nil {
@@ -349,7 +356,7 @@ func (c *Compactor) summarizeWith(ctx context.Context, model, prompt string) (st
 
 	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
 	defer cancel()
-	resp, err := c.client.Chat(actx, model, []Message{
+	resp, err := c.client.Chat(actx, model, []llm.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: prompt},
 	}, nil, 0)

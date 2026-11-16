@@ -1,9 +1,12 @@
-package main
+package compact
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,8 +25,8 @@ func TestForceCompactArchivesOldTurns(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	client := llm.NewChatClientAt(srv.URL, "test")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +34,7 @@ func TestForceCompactArchivesOldTurns(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		h.AppendUser(fmt.Sprintf("вопрос номер %d", i))
-		h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"1+1"}`)}, "m")
+		h.AppendAssistant("", []llm.ToolCall{call("calc", `{"expr":"1+1"}`)}, "m")
 		h.AppendTool("call_1", "calc", "2")
 		h.AppendAssistant(fmt.Sprintf("ответ номер %d", i), nil, "m")
 	}
@@ -40,7 +43,7 @@ func TestForceCompactArchivesOldTurns(t *testing.T) {
 		MaxPromptTokens: 200,
 		ReserveOutput:   0,
 		MinTailTokens:   40,
-	}, NewCalibrator(), 800)
+	}, tokens.NewCalibrator(), 800)
 
 	ok, err := comp.ForceCompact(context.Background(), "sys")
 	if err != nil {
@@ -74,22 +77,22 @@ func TestForceCompactArchivesOldTurns(t *testing.T) {
 }
 
 func TestSplitIndexNeverBreaksToolGroup(t *testing.T) {
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 
 	h.AppendUser("вопрос 1")
-	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"1+1"}`)}, "m")
+	h.AppendAssistant("", []llm.ToolCall{call("calc", `{"expr":"1+1"}`)}, "m")
 	h.AppendTool("call_1", "calc", "2")
 	h.AppendAssistant("ответ 1", nil, "m")
 	h.AppendUser("вопрос 2")
-	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"2+2"}`)}, "m")
+	h.AppendAssistant("", []llm.ToolCall{call("calc", `{"expr":"2+2"}`)}, "m")
 	h.AppendTool("call_1", "calc", "4")
 	h.AppendAssistant("ответ 2", nil, "m")
 
-	comp := NewCompactor(h, nil, Budget{MinTailTokens: 1}, NewCalibrator(), 800)
+	comp := NewCompactor(h, nil, Budget{MinTailTokens: 1}, tokens.NewCalibrator(), 800)
 	split := comp.splitIndex(h.Active())
 	if split <= 0 || split >= len(h.Active()) {
 		t.Fatalf("split = %d", split)
@@ -102,7 +105,7 @@ func TestSplitIndexNeverBreaksToolGroup(t *testing.T) {
 
 // assertNoOrphanTools verifies that every tool message is preceded by an
 // assistant message that requested it.
-func assertNoOrphanTools(t *testing.T, msgs []*Message) {
+func assertNoOrphanTools(t *testing.T, msgs []*llm.Message) {
 	t.Helper()
 	open := map[string]bool{}
 	for _, m := range msgs {
@@ -121,7 +124,7 @@ func assertNoOrphanTools(t *testing.T, msgs []*Message) {
 }
 
 // seedTurns appends n user/assistant turns so there is something to compact.
-func seedTurns(t *testing.T, h *History, n int) {
+func seedTurns(t *testing.T, h *history.History, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		h.AppendUser(fmt.Sprintf("вопрос номер %d", i))
@@ -132,7 +135,7 @@ func seedTurns(t *testing.T, h *History, n int) {
 func TestCompactFallsBackToChatModel(t *testing.T) {
 	var models []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req chatRequest
+		var req llm.ChatRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		models = append(models, req.Model)
 		if req.Model == "sum-model" {
@@ -149,14 +152,14 @@ func TestCompactFallsBackToChatModel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, err := OpenHistory(t.TempDir(), "s", "chat-model", "sum-model", "sys")
+	h, err := history.OpenHistory(t.TempDir(), "s", "chat-model", "sum-model", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 	seedTurns(t, h, 6)
 
-	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, NewCalibrator(), 800)
+	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, tokens.NewCalibrator(), 800)
 	var traces []string
 	comp.trace = func(s string) { traces = append(traces, s) }
 
@@ -188,7 +191,7 @@ func TestCompactFallsBackOnSummaryTimeout(t *testing.T) {
 	defer func() { summaryAttemptTimeout = old }()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req chatRequest
+		var req llm.ChatRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Model == "slow-model" {
 			<-r.Context().Done() // hang until the per-attempt timeout fires
@@ -203,14 +206,14 @@ func TestCompactFallsBackOnSummaryTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, err := OpenHistory(t.TempDir(), "s", "fast-model", "slow-model", "sys")
+	h, err := history.OpenHistory(t.TempDir(), "s", "fast-model", "slow-model", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 	seedTurns(t, h, 6)
 
-	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, NewCalibrator(), 800)
+	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, tokens.NewCalibrator(), 800)
 	ok, err := comp.ForceCompact(context.Background(), "sys")
 	if err != nil {
 		t.Fatalf("compact: %v", err)
@@ -230,14 +233,14 @@ func TestCompactStubNamesBothModels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, err := OpenHistory(t.TempDir(), "s", "chat-model", "sum-model", "sys")
+	h, err := history.OpenHistory(t.TempDir(), "s", "chat-model", "sum-model", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
 	seedTurns(t, h, 6)
 
-	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, NewCalibrator(), 800)
+	comp := NewCompactor(h, newTestClient(srv), Budget{MaxPromptTokens: 120, ReserveOutput: 0, MinTailTokens: 20}, tokens.NewCalibrator(), 800)
 	ok, err := comp.ForceCompact(context.Background(), "sys")
 	if err != nil {
 		t.Fatalf("compact should degrade, not fail: %v", err)
@@ -268,8 +271,8 @@ func TestMaybeCompactEveryMessageCount(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
-	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	client := llm.NewChatClientAt(srv.URL, "test")
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +282,7 @@ func TestMaybeCompactEveryMessageCount(t *testing.T) {
 	// trigger can fire.
 	seedTurns(t, h, 5)
 
-	comp := NewCompactor(h, client, DefaultBudget(), NewCalibrator(), 800)
+	comp := NewCompactor(h, client, DefaultBudget(), tokens.NewCalibrator(), 800)
 	comp.SetCompactEvery(12)
 	ok, err := comp.MaybeCompact(context.Background(), "sys")
 	if err != nil {
@@ -332,9 +335,9 @@ func TestCompactEveryCountsOnlyNewMessages(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
+	client := llm.NewChatClientAt(srv.URL, "test")
 	dir := t.TempDir()
-	h, err := OpenHistory(dir, "s", "m", "m", "sys")
+	h, err := history.OpenHistory(dir, "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +347,7 @@ func TestCompactEveryCountsOnlyNewMessages(t *testing.T) {
 
 	// A tiny tail budget keeps ~6 messages verbatim — more than N below.
 	budget := Budget{MaxPromptTokens: 100000, ReserveOutput: 0, MinTailTokens: 20}
-	comp := NewCompactor(h, client, budget, NewCalibrator(), 800)
+	comp := NewCompactor(h, client, budget, tokens.NewCalibrator(), 800)
 	comp.SetCompactEvery(4)
 
 	ok, err := comp.MaybeCompact(context.Background(), "sys")
@@ -386,14 +389,29 @@ func TestCompactEveryCountsOnlyNewMessages(t *testing.T) {
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
 	}
-	h2, err := OpenHistory(dir, "s", "m", "m", "sys")
+	h2, err := history.OpenHistory(dir, "s", "m", "m", "sys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h2.Close()
-	comp2 := NewCompactor(h2, client, budget, NewCalibrator(), 800)
+	comp2 := NewCompactor(h2, client, budget, tokens.NewCalibrator(), 800)
 	comp2.SetCompactEvery(4)
 	if n := comp2.pendingCount(); n != 0 {
 		t.Errorf("pending after reload = %d, want 0", n)
 	}
+}
+
+// call builds a tool call for tests.
+func call(name, args string) llm.ToolCall {
+	var tc llm.ToolCall
+	tc.ID = "call_1"
+	tc.Type = "function"
+	tc.Function.Name = name
+	tc.Function.Arguments = args
+	return tc
+}
+
+// newTestClient points a chat client at the stub server.
+func newTestClient(srv *httptest.Server) *llm.ChatClient {
+	return llm.NewChatClientAt(srv.URL, "test")
 }

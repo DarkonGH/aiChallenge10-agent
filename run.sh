@@ -13,5 +13,5 @@ if [ -z "${LLM_BASE_URL:-}" ] || [ -z "${OPENAI_API_KEY:-}" ]; then
   fi
 fi
 
-go build -o task2-06 .
-exec ./task2-06 "$@"
+go build -o agent .
+exec ./agent "$@"

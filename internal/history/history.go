@@ -1,4 +1,4 @@
-package main
+package history
 
 import (
 	"bufio"
@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,13 +36,13 @@ type Event struct {
 	System       string     `json:"system,omitempty"`
 	Created      *time.Time `json:"created,omitempty"`
 
-	Message *Message `json:"message,omitempty"`
-	Covers  []int64  `json:"covers,omitempty"`
-	Summary string   `json:"summary,omitempty"`
-	Model   string   `json:"model,omitempty"`
-	Role    string   `json:"role,omitempty"`  // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
-	Facts   []Fact   `json:"facts,omitempty"` // facts: полный снимок памяти ключ-значение
-	Fork    string   `json:"fork,omitempty"`  // fork: id сессии-родителя
+	Message *llm.Message `json:"message,omitempty"`
+	Covers  []int64      `json:"covers,omitempty"`
+	Summary string       `json:"summary,omitempty"`
+	Model   string       `json:"model,omitempty"`
+	Role    string       `json:"role,omitempty"`  // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
+	Facts   []Fact       `json:"facts,omitempty"` // facts: полный снимок памяти ключ-значение
+	Fork    string       `json:"fork,omitempty"`  // fork: id сессии-родителя
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -54,8 +57,8 @@ type History struct {
 	system       string
 
 	seq      int64
-	msgs     []*Message // active window, in prompt order (without system)
-	archived []*Message // messages moved out of the prompt, kept on disk
+	msgs     []*llm.Message // active window, in prompt order (without system)
+	archived []*llm.Message // messages moved out of the prompt, kept on disk
 
 	summaryText   string
 	summaryCovers [2]int64
@@ -117,13 +120,13 @@ func OpenHistory(dataDir, id, requestedChat, requestedSummary, system string) (*
 		h.chatModel = requestedChat
 	}
 	if h.chatModel == "" {
-		h.chatModel = DefaultModel()
+		h.chatModel = config.DefaultModel()
 	}
 	if requestedSummary != "" {
 		h.summaryModel = requestedSummary
 	}
 	if h.summaryModel == "" {
-		h.summaryModel = DefaultSummaryModel()
+		h.summaryModel = config.DefaultSummaryModel()
 	}
 
 	f, err := os.OpenFile(h.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -223,7 +226,7 @@ func (h *History) apply(ev *Event) {
 }
 
 func (h *History) applyCompact(covers [2]int64, summary string) {
-	keep := make([]*Message, 0, len(h.msgs))
+	keep := make([]*llm.Message, 0, len(h.msgs))
 	for _, m := range h.msgs {
 		if m.Seq >= covers[0] && m.Seq <= covers[1] {
 			h.archived = append(h.archived, m)
@@ -242,7 +245,7 @@ func (h *History) applyCompact(covers [2]int64, summary string) {
 // the summary alone — the sliding-window strategy drops the text, nothing
 // replaces it.
 func (h *History) applyEvict(from, to int64) {
-	keep := make([]*Message, 0, len(h.msgs))
+	keep := make([]*llm.Message, 0, len(h.msgs))
 	for _, m := range h.msgs {
 		if m.Seq >= from && m.Seq <= to {
 			h.archived = append(h.archived, m)
@@ -269,29 +272,29 @@ func (h *History) writeEvent(ev Event) error {
 	return nil
 }
 
-func (h *History) appendMsg(m *Message) *Message {
+func (h *History) appendMsg(m *llm.Message) *llm.Message {
 	h.seq++
 	m.Seq = h.seq
 	m.TS = time.Now()
-	m.Tokens = EstimateMessage(*m)
+	m.Tokens = tokens.EstimateMessage(*m)
 	h.msgs = append(h.msgs, m)
 	_ = h.writeEvent(Event{Type: "message", Message: m})
 	return m
 }
 
 // AppendUser records a user turn.
-func (h *History) AppendUser(content string) *Message {
-	return h.appendMsg(&Message{Role: "user", Content: content})
+func (h *History) AppendUser(content string) *llm.Message {
+	return h.appendMsg(&llm.Message{Role: "user", Content: content})
 }
 
 // AppendAssistant records an assistant turn verbatim, including tool calls.
-func (h *History) AppendAssistant(content string, calls []ToolCall, model string) *Message {
-	return h.appendMsg(&Message{Role: "assistant", Content: content, ToolCalls: calls, Model: model})
+func (h *History) AppendAssistant(content string, calls []llm.ToolCall, model string) *llm.Message {
+	return h.appendMsg(&llm.Message{Role: "assistant", Content: content, ToolCalls: calls, Model: model})
 }
 
 // AppendTool records one tool result.
-func (h *History) AppendTool(callID, name, content string) *Message {
-	return h.appendMsg(&Message{Role: "tool", ToolCallID: callID, Name: name, Content: content})
+func (h *History) AppendTool(callID, name, content string) *llm.Message {
+	return h.appendMsg(&llm.Message{Role: "tool", ToolCallID: callID, Name: name, Content: content})
 }
 
 // Compact moves messages with seq in [from,to] out of the prompt and replaces
@@ -362,10 +365,10 @@ func (h *History) SetSummaryModel(model string) {
 }
 
 // Active returns the prompt window, excluding the system prompt.
-func (h *History) Active() []*Message { return h.msgs }
+func (h *History) Active() []*llm.Message { return h.msgs }
 
 // Archived returns messages moved out of the prompt.
-func (h *History) Archived() []*Message { return h.archived }
+func (h *History) Archived() []*llm.Message { return h.archived }
 
 // SummaryText returns the rolling summary (empty when nothing was compacted).
 func (h *History) SummaryText() string { return h.summaryText }
@@ -411,12 +414,12 @@ func (h *History) Stats() (activeMsgs, activeTokens, archivedMsgs, archivedToken
 }
 
 // SearchArchived returns archived messages containing q (case-insensitive).
-func (h *History) SearchArchived(q string) []*Message {
+func (h *History) SearchArchived(q string) []*llm.Message {
 	q = strings.ToLower(strings.TrimSpace(q))
 	if q == "" {
 		return nil
 	}
-	var out []*Message
+	var out []*llm.Message
 	for _, m := range h.archived {
 		if strings.Contains(strings.ToLower(m.Content), q) {
 			out = append(out, m)
@@ -692,7 +695,7 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 		case "compact":
 			if len(ev.Covers) == 2 {
 				fmt.Fprintf(w, "       — сжатие: seq %d..%d → архив, конспект ~%d ток.\n",
-					ev.Covers[0], ev.Covers[1], EstimateTokens(ev.Summary))
+					ev.Covers[0], ev.Covers[1], tokens.EstimateTokens(ev.Summary))
 			}
 		case "evict":
 			if len(ev.Covers) == 2 {
@@ -720,12 +723,12 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 }
 
 // printLogMessage renders one stored message without truncating its text.
-func printLogMessage(w io.Writer, m *Message) {
+func printLogMessage(w io.Writer, m *llm.Message) {
 	text := strings.TrimRight(m.Content, "\n")
 	switch {
 	case len(m.ToolCalls) > 0:
 		for _, tc := range m.ToolCalls {
-			fmt.Fprintf(w, "[%3d] %-9s → %s(%s)\n", m.Seq, m.Role, tc.Function.Name, oneLine(tc.Function.Arguments))
+			fmt.Fprintf(w, "[%3d] %-9s → %s(%s)\n", m.Seq, m.Role, tc.Function.Name, config.OneLine(tc.Function.Arguments))
 		}
 	case m.Role == "tool":
 		name := m.Name
