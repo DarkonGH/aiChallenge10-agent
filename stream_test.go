@@ -48,10 +48,12 @@ func TestChatStreamContentAndUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var got []string
+	var got, gotReason []string
 	client := newTestClient(srv)
 	resp, err := client.ChatStream(context.Background(), "m",
-		[]Message{{Role: "user", Content: "привет"}}, nil, 0, func(s string) { got = append(got, s) })
+		[]Message{{Role: "user", Content: "привет"}}, nil, 0,
+		func(s string) { got = append(got, s) },
+		func(s string) { gotReason = append(gotReason, s) })
 	if err != nil {
 		t.Fatalf("chat stream: %v", err)
 	}
@@ -59,7 +61,10 @@ func TestChatStreamContentAndUsage(t *testing.T) {
 		t.Errorf("content = %q, want привет", resp.Content)
 	}
 	if len(got) != 2 || got[0] != "при" || got[1] != "вет" {
-		t.Errorf("deltas = %q, want [при вет] (reasoning must not be streamed)", got)
+		t.Errorf("deltas = %q, want [при вет] (reasoning must not be streamed as answer)", got)
+	}
+	if len(gotReason) != 1 || gotReason[0] != "думаю" {
+		t.Errorf("reasoning deltas = %q, want [думаю]", gotReason)
 	}
 	if resp.FinishReason != "stop" {
 		t.Errorf("finish_reason = %q", resp.FinishReason)
@@ -96,7 +101,7 @@ func TestChatStreamToolCallFragments(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := newTestClient(srv).ChatStream(context.Background(), "m",
-		[]Message{{Role: "user", Content: "считай"}}, nil, 0, nil)
+		[]Message{{Role: "user", Content: "считай"}}, nil, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("chat stream: %v", err)
 	}
@@ -135,7 +140,7 @@ func TestChatStreamFallsBackToPlainRequest(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := newTestClient(srv).ChatStream(context.Background(), "m",
-		[]Message{{Role: "user", Content: "тест"}}, nil, 0, nil)
+		[]Message{{Role: "user", Content: "тест"}}, nil, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("chat stream: %v", err)
 	}
