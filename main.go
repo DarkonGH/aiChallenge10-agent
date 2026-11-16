@@ -45,6 +45,13 @@ type ui struct {
 	spinning  bool
 	streamed  bool // a streamed answer fragment is on screen, line not closed
 	sawStream bool // any answer text was streamed during the current ask turn
+
+	// The reasoning block: the model's hidden thinking is printed line by line
+	// in grey under the prompt and erased before anything else is printed, so
+	// the thinking neither stays on screen nor scrolls the console.
+	reasonOpen bool
+	reasonUp   int // screen lines the cursor moved down since the block start
+	reasonCol  int // cells used on the last printed screen line
 }
 
 const spinLine = "  / "
@@ -93,20 +100,94 @@ func (u *ui) rearm() {
 		return
 	}
 	u.mu.Lock()
+	u.closeReasoningLocked()
 	u.spinning = true
 	u.mu.Unlock()
+}
+
+// reasoning prints a chunk of the model's hidden thinking in grey under the
+// prompt, wrapping at the terminal width. The block is erased by
+// closeReasoningLocked as soon as anything else must be printed.
+func (u *ui) reasoning(s string) {
+	if s == "" {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.tty {
+		return
+	}
+	if u.spinning {
+		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
+		u.spinning = false
+	}
+	width := terminalWidth()
+	if width < 24 {
+		width = 24
+	}
+	u.reasonOpen = true
+	text, col, down := wrapReason(u.reasonCol, width, s)
+	u.reasonCol = col
+	u.reasonUp += down
+	fmt.Print("\x1b[90m" + text + "\x1b[0m")
+}
+
+// wrapReason inserts hard line breaks at the terminal width and reports the
+// resulting column and how many screen lines the chunk moved the cursor down.
+// The console must never wrap on its own: the erase logic counts exactly these
+// breaks and nothing else.
+func wrapReason(col, width int, s string) (string, int, int) {
+	var b strings.Builder
+	down := 0
+	for _, r := range s {
+		switch r {
+		case '\r':
+			continue
+		case '\n':
+			b.WriteByte('\n')
+			down++
+			col = 0
+			continue
+		case '\t':
+			r = ' '
+		}
+		if col >= width {
+			b.WriteByte('\n')
+			down++
+			col = 0
+		}
+		b.WriteRune(r)
+		col++
+	}
+	return b.String(), col, down
+}
+
+// closeReasoningLocked erases the reasoning block and returns the cursor to
+// the line under the prompt. The caller holds u.mu.
+func (u *ui) closeReasoningLocked() {
+	if !u.reasonOpen {
+		return
+	}
+	if u.reasonUp > 0 {
+		fmt.Printf("\x1b[%dA", u.reasonUp)
+	}
+	fmt.Print("\r\x1b[J")
+	u.reasonOpen = false
+	u.reasonUp = 0
+	u.reasonCol = 0
 }
 
 // beginTurn marks the start of one ask() turn: nothing streamed yet.
 func (u *ui) beginTurn() {
 	u.mu.Lock()
+	u.closeReasoningLocked()
 	u.streamed = false
 	u.sawStream = false
 	u.mu.Unlock()
 }
 
 // content prints a streamed piece of the assistant answer, stopping the
-// spinner on the first visible token.
+// spinner on the first visible token and wiping the reasoning block.
 func (u *ui) content(s string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -114,6 +195,7 @@ func (u *ui) content(s string) {
 		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
 		u.spinning = false
 	}
+	u.closeReasoningLocked()
 	u.streamed = true
 	u.sawStream = true
 	fmt.Print(s)
@@ -123,6 +205,7 @@ func (u *ui) content(s string) {
 func (u *ui) endLine() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.closeReasoningLocked()
 	if u.streamed {
 		fmt.Println()
 		u.streamed = false
@@ -145,6 +228,7 @@ func (u *ui) trace(s string) {
 	if u.spinning {
 		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
 	}
+	u.closeReasoningLocked()
 	if u.streamed {
 		fmt.Println()
 		u.streamed = false
@@ -285,6 +369,7 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent = NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
+	a.agent.SetReasoningUI(a.ui.reasoning)
 	a.agent.SetNoCompact(a.noCompact)
 	a.agent.SetCompactEvery(a.compactEvery)
 	a.agent.SetStrategy(a.strategy)

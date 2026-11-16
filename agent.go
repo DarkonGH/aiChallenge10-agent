@@ -21,9 +21,11 @@ type Agent struct {
 
 	// Streaming callbacks (nil = plain non-stream requests): onMessageStart
 	// before each model request, onContent per streamed delta of the answer,
-	// onMessageDone after each assistant message is complete.
+	// onReasoning per streamed delta of the hidden reasoning, onMessageDone
+	// after each assistant message is complete.
 	onMessageStart func()
 	onContent      func(string)
+	onReasoning    func(string)
 	onMessageDone  func()
 
 	noCompact        bool // demo mode: skip MaybeCompact, let the prompt overflow
@@ -62,6 +64,11 @@ func (a *Agent) SetStreamUI(onStart func(), onContent func(string), onDone func(
 	a.onContent = onContent
 	a.onMessageDone = onDone
 }
+
+// SetReasoningUI installs the callback for streamed reasoning deltas. It is
+// separate from SetStreamUI on purpose: reasoning is display-only, and the
+// agent must still use streaming when only the answer is printed.
+func (a *Agent) SetReasoningUI(fn func(string)) { a.onReasoning = fn }
 
 // SetNoCompact disables automatic context compaction. Demo mode for day 8:
 // the prompt is allowed to grow past the budget so the overflow behavior
@@ -145,7 +152,7 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		var resp *ChatResponse
 		var err error
 		if a.onContent != nil {
-			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, a.onContent)
+			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, a.onContent, a.onReasoning)
 		} else {
 			resp, err = a.client.Chat(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature)
 		}

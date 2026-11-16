@@ -337,10 +337,12 @@ const (
 
 // ChatStream is Chat with server-sent events: content deltas are forwarded to
 // onDelta as they arrive (a nil callback is allowed), so the console can print
-// the answer while the model is still generating. Reasoning deltas are
-// swallowed — only the final content is streamed. A plain (non-stream) request
-// is used as fallback when the endpoint refuses or ignores streaming.
-func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Message, tools []ToolSchema, temperature float64, onDelta func(string)) (*ChatResponse, error) {
+// the answer while the model is still generating. Reasoning deltas go to a
+// separate onReason callback (also nil-able): they are never mixed into the
+// answer, but the console may show them while the model thinks. A plain
+// (non-stream) request is used as fallback when the endpoint refuses or
+// ignores streaming.
+func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Message, tools []ToolSchema, temperature float64, onDelta func(string), onReason func(string)) (*ChatResponse, error) {
 	wire := make([]wireMessage, len(messages))
 	for i, m := range messages {
 		wire[i] = toWire(m)
@@ -373,7 +375,7 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 			case <-time.After(time.Duration(attempt-1) * time.Second):
 			}
 		}
-		resp, emitted, fail, err := c.streamOnce(ctx, model, payload, onDelta)
+		resp, emitted, fail, err := c.streamOnce(ctx, model, payload, onDelta, onReason)
 		if err == nil {
 			resp.Elapsed = time.Since(start)
 			return resp, nil
@@ -414,7 +416,7 @@ func (c *ChatClient) sendStream(ctx context.Context, payload []byte) (*http.Resp
 // streamOnce runs one streaming request. It returns the accumulated response,
 // whether anything was already handed to onDelta, and how the caller should
 // treat a failure.
-func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byte, onDelta func(string)) (*ChatResponse, bool, streamFail, error) {
+func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byte, onDelta func(string), onReason func(string)) (*ChatResponse, bool, streamFail, error) {
 	httpResp, err := c.sendStream(ctx, payload)
 	if err != nil {
 		return nil, false, failRetry, err
@@ -469,8 +471,12 @@ func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byt
 		}
 		for _, ch := range chunk.Choices {
 			d := ch.Delta
-			reasoning.WriteString(d.Reasoning)
-			reasoning.WriteString(d.ReasoningContent)
+			if r := d.Reasoning + d.ReasoningContent; r != "" {
+				reasoning.WriteString(r)
+				if onReason != nil {
+					onReason(r)
+				}
+			}
 			if d.Content != "" {
 				content.WriteString(d.Content)
 				emitted = true
