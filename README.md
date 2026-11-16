@@ -1,4 +1,4 @@
-# task2-06 — первый CLI-агент с инструментами
+# agent — первый CLI-агент с инструментами
 
 Интерактивный чат-агент на Go. Пользователь пишет запрос в консоль, агент
 отправляет его в LLM, сам решает, какой инструмент вызвать, получает результат
@@ -18,11 +18,11 @@ export OPENAI_API_KEY="..."
 
 ./run.sh                 # интерактивный чат
 ./run.sh -script testdata/checks.txt   # три проверки из задания
-./task2-06 -list-models
-./task2-06 -list-sessions
-./task2-06 -continue     # продолжить последнюю сессию
-./task2-06 -print-session 20261111-204115-1820   # весь лог сессии, офлайн
-./task2-06 -print-session last                   # то же для последней
+./agent -list-models
+./agent -list-sessions
+./agent -continue     # продолжить последнюю сессию
+./agent -print-session 20261111-204115-1820   # весь лог сессии, офлайн
+./agent -print-session last                   # то же для последней
 ```
 
 `-print-session` читает только `session.jsonl` с диска: ни сети, ни ключей,
