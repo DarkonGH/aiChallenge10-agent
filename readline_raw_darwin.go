@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -39,6 +40,18 @@ func makeRaw(fd uintptr) (*rawState, error) {
 func (s *rawState) restore() error {
 	rawSetActive(nil)
 	return ioctlTermios(s.fd, syscall.TIOCSETA, &s.saved)
+}
+
+// terminalWidth возвращает ширину терминала в колонках (TIOCGWINSZ); при
+// неудаче или нулевом ответе — 80.
+func terminalWidth() int {
+	var ws struct{ Row, Col, X, Y uint16 }
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(),
+		uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 || ws.Col == 0 {
+		return 80
+	}
+	return int(ws.Col)
 }
 
 func ioctlTermios(fd uintptr, req uint, t *syscall.Termios) error {

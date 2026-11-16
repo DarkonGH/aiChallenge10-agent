@@ -86,3 +86,28 @@ func TestRuneBuf(t *testing.T) {
 		t.Fatalf("после сброса: %q %v", r, ok)
 	}
 }
+
+func TestWrapLayout(t *testing.T) {
+	cases := []struct {
+		name           string
+		total, idx     int
+		cols           int
+		rows, row, col int
+	}{
+		{"пустой ввод", 0, 0, 80, 1, 0, 0},
+		{"одна строка, курсор в середине", 7, 3, 80, 1, 0, 3},
+		{"одна строка, курсор в конце", 7, 7, 80, 1, 0, 7},
+		{"перенос, курсор на второй строке", 100, 50, 30, 4, 1, 20},
+		{"курсор в начале перенесённой строки", 60, 30, 30, 2, 1, 0},
+		{"текст занял строку целиком (pending-wrap)", 60, 60, 30, 2, 1, 29},
+		{"последняя строка неполная", 61, 61, 30, 3, 2, 1},
+		{"вырожденная ширина", 5, 2, 0, 5, 2, 0},
+	}
+	for _, tc := range cases {
+		rows, row, col := wrapLayout(tc.total, tc.idx, tc.cols)
+		if rows != tc.rows || row != tc.row || col != tc.col {
+			t.Errorf("%s: wrapLayout(%d,%d,%d) = (%d,%d,%d), хотим (%d,%d,%d)",
+				tc.name, tc.total, tc.idx, tc.cols, rows, row, col, tc.rows, tc.row, tc.col)
+		}
+	}
+}

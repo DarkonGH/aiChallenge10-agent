@@ -37,13 +37,29 @@ type Compactor struct {
 	calib        *Calibrator
 	maxToolChars int
 	trace        func(string)
-	compactEvery int // compact when the window holds this many messages (0 = off)
+	compactEvery int      // compact when the window holds this many messages (0 = off)
+	strategy     Strategy // summary (default) | window | facts
+	window       int      // prompt window size for the window/facts strategies
 }
 
 // SetCompactEvery enables the message-count trigger: the history is compacted
 // once the active window grows to n messages, even if the prompt still fits
 // the budget. n <= 0 restores the budget-only behavior.
 func (c *Compactor) SetCompactEvery(n int) { c.compactEvery = n }
+
+// SetStrategy selects the context strategy (summary when never set).
+func (c *Compactor) SetStrategy(s Strategy) { c.strategy = s }
+
+// SetWindow sets the prompt window size for the window/facts strategies.
+func (c *Compactor) SetWindow(n int) { c.window = n }
+
+// mode returns the active strategy, defaulting to the day-9 summary behavior.
+func (c *Compactor) mode() Strategy {
+	if c.strategy == "" {
+		return StrategySummary
+	}
+	return c.strategy
+}
 
 // NewCompactor builds a compactor for one session.
 func NewCompactor(hist *History, client *ChatClient, budget Budget, calib *Calibrator, maxToolChars int) *Compactor {
@@ -56,14 +72,12 @@ func NewCompactor(hist *History, client *ChatClient, budget Budget, calib *Calib
 	}
 }
 
-// PromptTokens estimates the next request size: system + summary + active
-// window, with tool outputs truncated exactly as buildMessages does.
+// PromptTokens estimates the next request size: system (+ the strategy's
+// memory block) and the window the strategy would send, with tool outputs
+// truncated exactly as buildMessages does.
 func (c *Compactor) PromptTokens(system string) int {
-	n := EstimateTokens(system)
-	if s := c.hist.SummaryText(); s != "" {
-		n += EstimateTokens("Конспект предыдущего диалога:\n"+s) + 4
-	}
-	for _, m := range c.hist.Active() {
+	n := EstimateTokens(c.promptSystem(system))
+	for _, m := range c.promptWindow() {
 		msg := *m
 		if msg.Role == "tool" {
 			msg.Content = truncate(msg.Content, c.maxToolChars)
@@ -71,6 +85,82 @@ func (c *Compactor) PromptTokens(system string) int {
 		n += EstimateMessage(msg)
 	}
 	return c.calib.Scale(n)
+}
+
+// promptSystem assembles the system prompt with the strategy's memory block:
+// the rolling summary for the summary strategy, the sticky facts for the
+// facts strategy, nothing extra for the bare window.
+func (c *Compactor) promptSystem(system string) string {
+	switch c.mode() {
+	case StrategyFacts:
+		if facts := c.hist.Facts(); len(facts) > 0 {
+			return system + "\n\nФакты диалога (память о договорённостях):\n" + renderFacts(facts)
+		}
+	case StrategySummary:
+		if s := c.hist.SummaryText(); s != "" {
+			return system + "\n\nКонспект предыдущего диалога:\n" + s
+		}
+	}
+	return system
+}
+
+// promptWindow returns the messages the next request will carry: the whole
+// active window for the summary strategy (compaction bounds it), the last
+// windowCut messages for window/facts.
+func (c *Compactor) promptWindow() []*Message {
+	msgs := c.hist.Active()
+	if c.mode() == StrategySummary {
+		return msgs
+	}
+	if cut := windowCut(msgs, c.window); cut > 0 {
+		return msgs[cut:]
+	}
+	return msgs
+}
+
+// windowCut returns the index where the kept tail starts: exactly the last n
+// messages, so the window slides one message at a time. The cut moves forward
+// only when it lands on a tool result — a tool message cannot be sent without
+// the assistant call that produced it. 0 means "nothing to cut".
+func windowCut(msgs []*Message, n int) int {
+	if n <= 0 || len(msgs) <= n {
+		return 0
+	}
+	cut := len(msgs) - n
+	for cut < len(msgs) && msgs[cut].Role == "tool" {
+		cut++
+	}
+	if cut >= len(msgs) {
+		// The window is too small to hold even one complete turn: keep the
+		// last turn anyway, so eviction still makes progress.
+		for i := len(msgs) - 1; i > 0; i-- {
+			if msgs[i].Role == "user" {
+				return i
+			}
+		}
+		return 0
+	}
+	return cut
+}
+
+// EnforceWindow archives the oldest messages until at most n remain in the
+// prompt. Unlike ForceCompact nothing replaces the evicted text — that is the
+// honest "drop it" behavior of the sliding window (the raw messages stay in
+// the log and /recall).
+func (c *Compactor) EnforceWindow(n int) (bool, error) {
+	msgs := c.hist.Active()
+	cut := windowCut(msgs, n)
+	if cut <= 0 {
+		return false, nil
+	}
+	from, to := msgs[0].Seq, msgs[cut-1].Seq
+	if err := c.hist.Evict(from, to); err != nil {
+		return false, err
+	}
+	if c.trace != nil {
+		c.trace(fmt.Sprintf("окно: сообщения seq %d..%d → архив (стратегия %s)", from, to, c.mode()))
+	}
+	return true, nil
 }
 
 // pendingCount counts the messages added since the last compaction. The
