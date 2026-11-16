@@ -1,15 +1,15 @@
 //go:build !darwin
 
-package main
+package readline
 
 // Заглушка сырого режима для платформ, отличных от macOS: lineEditor
 // деградирует до обычного построчного ввода без стрелок.
 
 import "fmt"
 
-// terminalWidth — заглушка для платформ без сырого режима: редактор там
+// TerminalWidth — заглушка для платформ без сырого режима: редактор там
 // деградирует до построчного ввода и ширину терминала не использует.
-func terminalWidth() int { return 80 }
+func TerminalWidth() int { return 80 }
 
 type rawState struct{}
 

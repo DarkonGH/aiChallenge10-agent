@@ -1,4 +1,4 @@
-package main
+package readline
 
 // lineEditor — минимальный readline для интерактивного REPL: история по
 // стрелкам ↑/↓ (с сохранением в файл между запусками), курсор ←/→, правка
@@ -37,7 +37,7 @@ type lineEditor struct {
 	sc *bufio.Scanner // не-tty: построчное чтение
 }
 
-func newLineEditor(tty bool, histPath string) *lineEditor {
+func NewLineEditor(tty bool, histPath string) *lineEditor {
 	ed := &lineEditor{tty: tty, histPath: histPath}
 	if tty {
 		ed.hist = loadHistoryFile(histPath)
@@ -49,7 +49,7 @@ func newLineEditor(tty bool, histPath string) *lineEditor {
 // read возвращает одну строку ввода. В tty-режиме рисует промпт и обрабатывает
 // клавиши; вне tty просто читает строку из stdin. Ошибка io.EOF — конец ввода
 // (Ctrl-D на пустой строке или закрытый stdin).
-func (ed *lineEditor) read(prompt string) (string, error) {
+func (ed *lineEditor) Read(prompt string) (string, error) {
 	if !ed.tty {
 		return ed.readPlain()
 	}
@@ -68,11 +68,11 @@ func (ed *lineEditor) read(prompt string) (string, error) {
 	line := make([]rune, 0, 64)
 	cur := 0 // позиция курсора в рунах
 	promptLen := len([]rune(prompt))
-	cols := terminalWidth() // ширина экрана; обновляется при каждой отрисовке
+	cols := TerminalWidth() // ширина экрана; обновляется при каждой отрисовке
 	prevRows := 1           // сколько экранных строк заняла прошлая отрисовка
 	curRow := 0             // строка экрана, на которой курсор оставлен
 	draw := func() {
-		cols = terminalWidth()
+		cols = TerminalWidth()
 		all := promptLen + len(line)
 		rows, tRow, tCol := wrapLayout(all, promptLen+cur, cols)
 

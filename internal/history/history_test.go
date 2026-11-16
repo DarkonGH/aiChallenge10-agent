@@ -1,6 +1,7 @@
-package main
+package history
 
 import (
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"strings"
 	"testing"
 )
@@ -15,7 +16,7 @@ func TestHistoryPersistAndCompact(t *testing.T) {
 	h.AppendUser("привет")
 	h.AppendAssistant("здравствуйте", nil, "model-a")
 	h.AppendUser("2+2?")
-	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"2+2"}`)}, "model-a")
+	h.AppendAssistant("", []llm.ToolCall{call("calc", `{"expr":"2+2"}`)}, "model-a")
 	h.AppendTool("call_1", "calc", "4")
 	h.AppendAssistant("4", nil, "model-a")
 	if err := h.Close(); err != nil {
@@ -167,7 +168,7 @@ func TestPrintSessionLogOffline(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	h.AppendUser("привет")
-	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"2+2"}`)}, "chat-m")
+	h.AppendAssistant("", []llm.ToolCall{call("calc", `{"expr":"2+2"}`)}, "chat-m")
 	h.AppendTool("call_1", "calc", "4")
 	h.AppendAssistant("ответ\nвторая строка", nil, "chat-m")
 	h.SetSummaryModel("sum-m2")
@@ -199,4 +200,14 @@ func TestPrintSessionLogOffline(t *testing.T) {
 	if err := PrintSessionLog(dir, "no-such", &b); err == nil {
 		t.Error("expected an error for a missing session")
 	}
+}
+
+// call builds a tool call for tests.
+func call(name, args string) llm.ToolCall {
+	var tc llm.ToolCall
+	tc.ID = "call_1"
+	tc.Type = "function"
+	tc.Function.Name = name
+	tc.Function.Arguments = args
+	return tc
 }

@@ -1,6 +1,7 @@
-package main
+package tokens
 
 import (
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"math"
 	"unicode/utf8"
 )
@@ -24,7 +25,7 @@ func EstimateTokens(s string) int {
 
 // EstimateMessage estimates the prompt cost of one message, including the
 // per-message overhead and tool call metadata.
-func EstimateMessage(m Message) int {
+func EstimateMessage(m llm.Message) int {
 	n := EstimateTokens(m.Content) + 4
 	for _, tc := range m.ToolCalls {
 		n += EstimateTokens(tc.Function.Name) + EstimateTokens(tc.Function.Arguments) + 4
