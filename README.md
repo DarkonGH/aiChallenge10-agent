@@ -17,7 +17,7 @@ export LLM_BASE_URL="https://..."
 export OPENAI_API_KEY="..."
 
 ./run.sh                 # интерактивный чат
-./run.sh -script checks.txt   # три проверки из задания
+./run.sh -script testdata/checks.txt   # три проверки из задания
 ./task2-06 -list-models
 ./task2-06 -list-sessions
 ./task2-06 -continue     # продолжить последнюю сессию
