@@ -7,8 +7,10 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
+	"strings"
 )
 
 // Agent owns the whole loop: request → tool call → tool result → answer.
@@ -37,6 +39,10 @@ type Agent struct {
 	strategy         compact.Strategy
 	window           int // prompt window for the window/facts strategies
 	lastAnswerTokens int // completion tokens of the most recent model turn
+
+	// mem is the explicit memory model (day 11). Nil = memory disabled: the
+	// prompt carries only the short-term strategy block.
+	mem *memory.Store
 }
 
 // NewAgent wires a session, a tool set and a context compactor together.
@@ -95,6 +101,17 @@ func (a *Agent) SetWindow(n int) {
 	a.Comp.SetWindow(n)
 }
 
+// SetMemory attaches the layered memory. Every turn then folds the new user
+// message into the layers before the request is built, and the prompt carries
+// the layers that the model's rules allow.
+func (a *Agent) SetMemory(m *memory.Store) {
+	a.mem = m
+	a.Comp.SetMemory(m)
+}
+
+// Memory returns the attached memory model (nil when memory is off).
+func (a *Agent) Memory() *memory.Store { return a.mem }
+
 // mode returns the active strategy, defaulting to summary.
 func (a *Agent) mode() compact.Strategy { return a.Comp.Mode() }
 
@@ -112,6 +129,16 @@ func (a *Agent) tracef(format string, args ...any) {
 // and returns the final text once the model stops requesting tools.
 func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	a.hist.AppendUser(userText)
+	// The question drives knowledge relevance, so it is recorded before any
+	// prompt is assembled.
+	a.Comp.SetQuestion(userText)
+
+	// Explicit memory model: one extractor call per turn routes the durable
+	// part of the message into working/long-term layers. On failure the layers
+	// stay as they were and the turn proceeds.
+	if a.mem != nil {
+		a.updateMemory(ctx, userText)
+	}
 
 	// Sticky facts: fold the new user message into the key-value store before
 	// anything else. One cheap extractor call per user turn; on failure the
@@ -184,6 +211,46 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	}
 
 	return "", fmt.Errorf("агент: превышен лимит шагов (%d), модель продолжает вызывать инструменты", a.maxSteps)
+}
+
+// updateMemory folds the new user message into the layered memory: extract a
+// diff, merge it, persist the files and journal the diff into the session log.
+func (a *Agent) updateMemory(ctx context.Context, userText string) {
+	out, err := a.Comp.ExtractMemory(ctx, a.mem, userText)
+	if err != nil {
+		a.tracef("память: не удалось обновить (%s) — остаётся прежняя", config.OneLine(err.Error()))
+		return
+	}
+	upd, perr := compact.ParseMemoryJSON(out)
+	if perr != nil {
+		a.tracef("память: %s — остаётся прежняя", perr)
+		return
+	}
+	if upd.Empty() {
+		return // nothing durable in this message
+	}
+	a.mem.Apply(upd)
+	if err := a.mem.Save(); err != nil {
+		a.tracef("память: сохранить не удалось: %v", err)
+	}
+	if err := a.hist.AppendMemory(upd); err != nil {
+		a.tracef("память: журнал: %v", err)
+	}
+	a.tracef("память: %s; всего %d", describeUpdate(upd), a.mem.Total())
+}
+
+// describeUpdate summarizes a memory diff for the trace line.
+func describeUpdate(u memory.Update) string {
+	var parts []string
+	for _, l := range memory.Layers {
+		if n := len(u.Layer(l)); n > 0 {
+			parts = append(parts, fmt.Sprintf("%s +%d", l, n))
+		}
+	}
+	if len(parts) == 0 {
+		return "без изменений"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // buildMessages assembles the API request: system prompt with the strategy's

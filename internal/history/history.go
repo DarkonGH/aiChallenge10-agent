@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"io"
 	"os"
@@ -43,6 +44,10 @@ type Event struct {
 	Role    string       `json:"role,omitempty"`  // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
 	Facts   []Fact       `json:"facts,omitempty"` // facts: полный снимок памяти ключ-значение
 	Fork    string       `json:"fork,omitempty"`  // fork: id сессии-родителя
+	// Memory is the day-11 journal of a layered-memory change: only the new or
+	// changed records. The files under <session>/memory are the source of
+	// truth; the event lets a copied log rebuild them.
+	Memory *memory.Update `json:"memory,omitempty"`
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -69,6 +74,11 @@ type History struct {
 	compactMark int64
 
 	facts []Fact // sticky facts (strategy "facts"), replayed from the log
+
+	// memUpdates is the replay of "memory" events, in order. It is not the
+	// live memory: the store files are. It exists so a session whose memory
+	// directory is missing can be rebuilt from its log.
+	memUpdates []memory.Update
 
 	forkOf  string // parent session id, when this session is a branch
 	forkSeq int64  // seq of the parent's log at the fork point
@@ -213,6 +223,10 @@ func (h *History) apply(ev *Event) {
 		}
 	case "facts":
 		h.facts = ev.Facts
+	case "memory":
+		if ev.Memory != nil {
+			h.memUpdates = append(h.memUpdates, *ev.Memory)
+		}
 	case "evict":
 		if len(ev.Covers) == 2 {
 			h.applyEvict(ev.Covers[0], ev.Covers[1])
@@ -337,6 +351,20 @@ func (h *History) SetFacts(facts []Fact) error {
 // Facts returns the sticky-facts store (empty when the strategy never wrote
 // any).
 func (h *History) Facts() []Fact { return h.facts }
+
+// AppendMemory journals one layered-memory change. The update is a diff: only
+// the records the extractor added or changed.
+func (h *History) AppendMemory(u memory.Update) error {
+	if err := h.writeEvent(Event{Type: "memory", Memory: &u}); err != nil {
+		return err
+	}
+	h.memUpdates = append(h.memUpdates, u)
+	return nil
+}
+
+// MemoryUpdates returns the replayed memory diffs in order, so a store can be
+// rebuilt from the log alone.
+func (h *History) MemoryUpdates() []memory.Update { return h.memUpdates }
 
 // ForkOf returns the parent session id when this session is a branch.
 func (h *History) ForkOf() string { return h.forkOf }
@@ -704,6 +732,10 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 			}
 		case "facts":
 			fmt.Fprintf(w, "       — факты: %d ключей\n", len(ev.Facts))
+		case "memory":
+			if ev.Memory != nil {
+				fmt.Fprintf(w, "       — память: %s\n", describeMemoryUpdate(*ev.Memory))
+			}
 		case "fork":
 			point := ""
 			if len(ev.Covers) == 2 && ev.Covers[1] > 0 {
@@ -741,4 +773,19 @@ func printLogMessage(w io.Writer, m *llm.Message) {
 	default:
 		fmt.Fprintf(w, "[%3d] %-9s %s\n", m.Seq, m.Role, text)
 	}
+}
+
+// describeMemoryUpdate renders one memory event for -print-session: which
+// layers the extractor touched and how many entries it added or changed.
+func describeMemoryUpdate(u memory.Update) string {
+	parts := make([]string, 0, len(memory.Layers))
+	for _, l := range memory.Layers {
+		if n := len(u.Layer(l)); n > 0 {
+			parts = append(parts, fmt.Sprintf("%s +%d", l, n))
+		}
+	}
+	if len(parts) == 0 {
+		return "без изменений"
+	}
+	return strings.Join(parts, ", ")
 }

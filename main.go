@@ -11,6 +11,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
@@ -39,6 +40,7 @@ type app struct {
 
 	hist  *history.History
 	agent *agent.Agent
+	mem   *memory.Store
 	ui    *ui
 }
 
@@ -268,6 +270,8 @@ func main() {
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
+	memoryReport := flag.String("memory-report", "", "показать слои памяти сессии и токены по слоям (офлайн)")
+	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -301,6 +305,25 @@ func main() {
 			}
 		}
 		if err := history.PrintSessionLog(dataDir, id, os.Stdout); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+	if *memoryReport != "" {
+		id := *memoryReport
+		if id == "last" {
+			var err error
+			if id, err = history.LatestSession(dataDir); err != nil {
+				fatalf("%v", err)
+			}
+		}
+		if err := memoryReportCmd(dataDir, id); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+	if *importMemory != "" {
+		if err := importMemoryCmd(dataDir, *importMemory, *sessionFlag); err != nil {
 			fatalf("%v", err)
 		}
 		return
@@ -374,7 +397,17 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 		return err
 	}
 	a.hist = h
+	// Working and long-term memory live next to the session log but in their
+	// own files: readable JSON, one file per layer group. The profile is shared
+	// by every session of this data dir, so a future second agent sees the same
+	// user without any extra plumbing.
+	mem, err := memory.Open(filepath.Join(a.dataDir, h.ID(), "memory"), filepath.Join(a.dataDir, "shared"))
+	if err != nil {
+		return err
+	}
+	a.mem = mem
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
+	a.agent.SetMemory(mem)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	a.agent.SetReasoningUI(a.ui.reasoning)
@@ -654,6 +687,9 @@ func (a *app) command(line string) (bool, error) {
 		fmt.Printf("факты (%d ключей, ~%d ток.):\n", len(facts), tokens.EstimateTokens(compact.RenderFacts(facts)))
 		fmt.Println(compact.RenderFacts(facts))
 
+	case "/memory":
+		return false, a.memoryCommand(arg)
+
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
@@ -805,7 +841,8 @@ func (a *app) printHistory() {
 // token estimate per block. It is the "what did compression do" view.
 func (a *app) printContext() {
 	promptMsgs := a.agent.Comp.PromptWindow()
-	base := tokens.EstimateTokens(a.agent.Comp.PromptSystem(a.hist.SystemPrompt()))
+	base := tokens.EstimateTokens(a.agent.Comp.ShortSystem(a.hist.SystemPrompt()))
+	memTok := a.agent.Comp.MemoryTokens()
 	factsTok := 0
 	if facts := a.hist.Facts(); len(facts) > 0 {
 		factsTok = tokens.EstimateTokens("Факты диалога (память о договорённостях):\n" + compact.RenderFacts(facts))
@@ -854,6 +891,21 @@ func (a *app) printContext() {
 	if a.strategy != compact.StrategySummary && a.hist.HasSummary() {
 		fmt.Printf("  конспект (старый)    ~%d ток. — не в промпте (остался от summary)\n",
 			tokens.EstimateTokens(a.hist.SummaryText()))
+	}
+	if a.mem != nil && a.mem.Total() > 0 {
+		fmt.Println("  память по слоям:")
+		for _, l := range memory.Layers {
+			n := a.mem.Len(l)
+			if n == 0 {
+				fmt.Printf("    %-12s         нет\n", string(l))
+				continue
+			}
+			note := "всегда"
+			if l == memory.LayerKnowledge {
+				note = fmt.Sprintf("%d из %d по вопросу", selectedKnowledge(a.mem, a.lastUserText()), n)
+			}
+			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
+		}
 	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
@@ -1025,6 +1077,10 @@ const helpText = `Команды:
                    N сообщений), facts (ключ-значение + последние N); без
                    аргумента — текущая; N — размер окна для window/facts
   /facts           память «ключ-значение» стратегии facts
+  /memory [clear <слой> | add <слой> ключ=значение]
+                   слои памяти: рабочая, профиль, решения, знания; без
+                   аргумента — что в каждом слое и сколько токенов он добавляет
+                   к запросу; clear — очистить слой; add — добавить запись
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

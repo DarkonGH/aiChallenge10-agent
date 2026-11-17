@@ -1,0 +1,220 @@
+package compact
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
+)
+
+// memorySystemPrompt teaches the extractor the routing rules: which fact goes
+// to which layer and what is not stored at all. The layer caps are enforced in
+// code (memory.Caps), never by the model.
+const memorySystemPrompt = "Ты раскладываешь сведения из диалога по слоям памяти агента. " +
+	"Слои и правила: " +
+	"working — данные текущей задачи: цель, ограничения, требования, числа, сроки, бюджет, открытые вопросы, следующий шаг. " +
+	"profile — кто пользователь: имя, роль, город, устойчивые предпочтения и стиль работы. " +
+	"decisions — то, что уже решили, выбрали или утвердили (суть решения, без хода обсуждения). " +
+	"knowledge — внешние проверяемые сведения: адреса, контакты, цены, характеристики площадок и услуг. " +
+	"НЕ сохраняй никуда: вопросы пользователя, эмоции и сиюминутные состояния, стиль общения, ход обсуждения, " +
+	"то, что уже неактуально. " +
+	"Если сведение уже есть в памяти и не изменилось — не возвращай его. " +
+	"Ключ — короткий (1-4 слова), значение — конкретное, до 200 символов. " +
+	"Ответ — только JSON без пояснений и markdown."
+
+// memoryPrompt builds the extractor input: the current layers plus the new
+// user message. Only a diff is expected back, so the store is shown for
+// deduplication, not for rewriting.
+func memoryPrompt(store *memory.Store, userText string) string {
+	var b strings.Builder
+	b.WriteString("Текущая память:\n")
+	for _, l := range memory.Layers {
+		b.WriteString(string(l))
+		b.WriteString(":\n")
+		entries := store.Section(l)
+		if len(entries) == 0 {
+			b.WriteString("(пусто)\n")
+			continue
+		}
+		b.WriteString(memory.Render(entries))
+		b.WriteString("\n")
+	}
+	b.WriteString("\nНовое сообщение пользователя:\n")
+	b.WriteString(config.Truncate(userText, 2000))
+	b.WriteString("\n\nВерни только новые или изменённые записи, разложенные по слоям, одним JSON-объектом: " +
+		"{\"working\": {\"ключ\": \"значение\"}, \"profile\": {...}, \"decisions\": {...}, \"knowledge\": {...}}. " +
+		"Если сохранять нечего — верни {}.")
+	return b.String()
+}
+
+// ParseMemoryJSON reads the extractor's answer into a layered update. Objects
+// are decoded in insertion order, so new records keep the order the model
+// produced. A flat object without layer keys is accepted as working memory.
+func ParseMemoryJSON(s string) (memory.Update, error) {
+	var upd memory.Update
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return upd, fmt.Errorf("память: пустой ответ")
+	}
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		if i := strings.LastIndex(s, "```"); i >= 0 {
+			s = s[:i]
+		}
+		s = strings.TrimSpace(s)
+	}
+	if i := strings.Index(s, "{"); i > 0 {
+		s = s[i:]
+	}
+	if j := strings.LastIndex(s, "}"); j >= 0 && j < len(s)-1 {
+		s = s[:j+1]
+	}
+
+	dec := json.NewDecoder(strings.NewReader(s))
+	tok, err := dec.Token()
+	if err != nil {
+		return upd, fmt.Errorf("память: ответ не JSON: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return upd, fmt.Errorf("память: ожидался JSON-объект")
+	}
+
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return upd, fmt.Errorf("память: %w", err)
+		}
+		key, _ := kt.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return upd, fmt.Errorf("память: %w", err)
+		}
+		layer := memory.Layer(strings.ToLower(strings.TrimSpace(key)))
+		if !knownLayer(layer) {
+			// Flat answer: the whole object is one working-memory record.
+			val := strings.TrimSpace(strings.Trim(string(raw), `"`))
+			if e := newEntry(key, val); e.Key != "" {
+				upd.Working = append(upd.Working, e)
+			}
+			continue
+		}
+		entries, perr := orderedEntries(raw)
+		if perr != nil {
+			return upd, fmt.Errorf("память: слой %s: %w", layer, perr)
+		}
+		switch layer {
+		case memory.LayerWorking:
+			upd.Working = append(upd.Working, entries...)
+		case memory.LayerProfile:
+			upd.Profile = append(upd.Profile, entries...)
+		case memory.LayerDecisions:
+			upd.Decisions = append(upd.Decisions, entries...)
+		case memory.LayerKnowledge:
+			upd.Knowledge = append(upd.Knowledge, entries...)
+		}
+	}
+	return upd, nil
+}
+
+// knownLayer reports whether s names a layer this package stores.
+func knownLayer(l memory.Layer) bool {
+	for _, x := range memory.Layers {
+		if x == l {
+			return true
+		}
+	}
+	return false
+}
+
+// orderedEntries decodes one JSON object into entries, keeping key order.
+func orderedEntries(raw json.RawMessage) ([]memory.Entry, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("ожидался объект «ключ: значение»")
+	}
+	var out []memory.Entry
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := kt.(string)
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, err
+		}
+		if e := newEntry(key, fmt.Sprintf("%v", v)); e.Key != "" {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// newEntry normalizes one record and drops empty pairs.
+func newEntry(key, value string) memory.Entry {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" || value == "<nil>" {
+		return memory.Entry{}
+	}
+	return memory.Entry{
+		Key:   config.Truncate(key, 60),
+		Value: config.Truncate(value, 200),
+	}
+}
+
+// ExtractMemory is the glue used by the agent: one extractor request with the
+// summary-model-first / chat-model-fallback pattern of the summarizer.
+func (c *Compactor) ExtractMemory(ctx context.Context, store *memory.Store, userText string) (string, error) {
+	prompt := memoryPrompt(store, userText)
+	primary := c.hist.SummaryModel()
+
+	out, err := c.jsonRequest(ctx, primary, memorySystemPrompt, prompt)
+	if err != nil {
+		backup := c.hist.ChatModel()
+		if backup == "" || backup == primary || ctx.Err() != nil {
+			return "", err
+		}
+		if c.trace != nil {
+			c.trace(fmt.Sprintf("память: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
+		}
+		out2, err2 := c.jsonRequest(ctx, backup, memorySystemPrompt, prompt)
+		if err2 != nil {
+			return "", fmt.Errorf("%s: %v; запасная %s: %v", primary, err, backup, err2)
+		}
+		return out2, nil
+	}
+	return out, nil
+}
+
+// jsonRequest runs one extractor request under the summarizer's per-attempt
+// timeout and returns the raw answer.
+func (c *Compactor) jsonRequest(ctx context.Context, model, system, prompt string) (string, error) {
+	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
+	defer cancel()
+	resp, err := c.client.Chat(actx, model, []llm.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: prompt},
+	}, nil, 0)
+	if err != nil {
+		if actx.Err() != nil && ctx.Err() == nil {
+			return "", fmt.Errorf("%s: таймаут %s", model, summaryAttemptTimeout)
+		}
+		return "", err
+	}
+	out := strings.TrimSpace(resp.Content)
+	if out == "" {
+		return "", fmt.Errorf("%s: пустой ответ", model)
+	}
+	return out, nil
+}
