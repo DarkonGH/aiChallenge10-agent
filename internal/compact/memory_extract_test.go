@@ -1,9 +1,15 @@
 package compact
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 )
 
@@ -89,5 +95,69 @@ func TestMemoryPromptListsLayers(t *testing.T) {
 		if !strings.Contains(p, want) {
 			t.Errorf("в промпте экстрактора нет %q:\n%s", want, p)
 		}
+	}
+}
+
+// TestImportFactsRoutesThroughModel checks the day-10 migration path: the whole
+// facts store goes to the model with the same routing prompt as a live turn,
+// and the answer is parsed back into layers. No keyword rules are involved.
+func TestImportFactsRoutesThroughModel(t *testing.T) {
+	var seenSystem, seenUser string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		for _, m := range req.Messages {
+			if m.Content == nil {
+				continue
+			}
+			switch m.Role {
+			case "system":
+				seenSystem = *m.Content
+			case "user":
+				seenUser = *m.Content
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": `{"working": {"бюджет": "3 млн"}, "profile": {"город": "Санкт-Петербург"}, "decisions": {"двигатель": "дизель"}, "knowledge": {"рынок": "новых дизелей в РФ нет"}}`},
+			}},
+			"usage": map[string]any{"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130},
+		})
+	}))
+	defer srv.Close()
+
+	facts := []history.Fact{
+		{Key: "бюджет_общий", Value: "3 млн рублей"},
+		{Key: "город", Value: "Санкт-Петербург"},
+		{Key: "тип_двигателя", Value: "дизель"},
+		{Key: "вывод_о_рынке", Value: "новых дизелей в РФ нет"},
+	}
+	u, err := ImportFacts(context.Background(), newTestClient(srv), "m", facts)
+	if err != nil {
+		t.Fatalf("ImportFacts: %v", err)
+	}
+	if len(u.Working) != 1 || len(u.Profile) != 1 || len(u.Decisions) != 1 || len(u.Knowledge) != 1 {
+		t.Fatalf("слои разложены неверно: %+v", u)
+	}
+	if u.Profile[0].Value != "Санкт-Петербург" {
+		t.Errorf("город попал не в profile: %+v", u.Profile)
+	}
+	// The model must see the routing rules and every fact, not a keyword list.
+	for _, want := range []string{"раскладываешь", "working", "profile", "decisions", "knowledge"} {
+		if !strings.Contains(seenSystem, want) {
+			t.Errorf("в системном промпте нет %q", want)
+		}
+	}
+	for _, f := range facts {
+		if !strings.Contains(seenUser, f.Key) {
+			t.Errorf("факт %q не попал в промпт импорта", f.Key)
+		}
+	}
+}
+
+// TestImportFactsRejectsEmptyStore keeps the offline error path honest.
+func TestImportFactsRejectsEmptyStore(t *testing.T) {
+	if _, err := ImportFacts(context.Background(), nil, "m", nil); err == nil {
+		t.Error("пустой набор фактов принят без ошибки")
 	}
 }

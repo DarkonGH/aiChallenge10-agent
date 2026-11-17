@@ -183,3 +183,28 @@ func TestRelevantScoresAndLimits(t *testing.T) {
 		t.Errorf("на нерелевантный вопрос выбрано %d записей", len(empty))
 	}
 }
+
+// TestEvictionIsCounted checks that a bulk update over the cap reports how many
+// records the limit dropped — the day-10 import prints this instead of claiming
+// everything was stored.
+func TestEvictionIsCounted(t *testing.T) {
+	s := openTemp(t)
+	var many []Entry
+	for i := 0; i < Caps[LayerWorking]+4; i++ {
+		many = append(many, Entry{Key: string(rune('a' + i)), Value: "x"})
+	}
+	s.Apply(Update{Working: many})
+
+	if got := s.Len(LayerWorking); got != Caps[LayerWorking] {
+		t.Fatalf("записей %d, ожидался потолок %d", got, Caps[LayerWorking])
+	}
+	if got := s.Evicted(LayerWorking); got != 4 {
+		t.Errorf("вытеснено %d, ожидалось 4", got)
+	}
+	if got := s.EvictedTotal(); got != 4 {
+		t.Errorf("всего вытеснено %d, ожидалось 4", got)
+	}
+	if got := s.Evicted(LayerProfile); got != 0 {
+		t.Errorf("в profile вытеснено %d, ожидалось 0", got)
+	}
+}

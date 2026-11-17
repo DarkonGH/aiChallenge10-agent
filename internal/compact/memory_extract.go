@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 )
@@ -200,15 +202,21 @@ func (c *Compactor) ExtractMemory(ctx context.Context, store *memory.Store, user
 // jsonRequest runs one extractor request under the summarizer's per-attempt
 // timeout and returns the raw answer.
 func (c *Compactor) jsonRequest(ctx context.Context, model, system, prompt string) (string, error) {
-	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
+	return jsonChat(ctx, c.client, model, system, prompt, summaryAttemptTimeout)
+}
+
+// jsonChat is the transport of both extractor paths: one system+user request
+// without tools, bounded by its own timeout, answer trimmed and non-empty.
+func jsonChat(ctx context.Context, client *llm.ChatClient, model, system, prompt string, timeout time.Duration) (string, error) {
+	actx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	resp, err := c.client.Chat(actx, model, []llm.Message{
+	resp, err := client.Chat(actx, model, []llm.Message{
 		{Role: "system", Content: system},
 		{Role: "user", Content: prompt},
 	}, nil, 0)
 	if err != nil {
 		if actx.Err() != nil && ctx.Err() == nil {
-			return "", fmt.Errorf("%s: таймаут %s", model, summaryAttemptTimeout)
+			return "", fmt.Errorf("%s: таймаут %s", model, timeout)
 		}
 		return "", err
 	}
@@ -217,4 +225,53 @@ func (c *Compactor) jsonRequest(ctx context.Context, model, system, prompt strin
 		return "", fmt.Errorf("%s: пустой ответ", model)
 	}
 	return out, nil
+}
+
+// importAttemptTimeout bounds the one-shot import of a day-10 facts store: the
+// list is bigger than one dialogue turn, so it gets more room than the
+// per-turn extractor.
+const importAttemptTimeout = 3 * time.Minute
+
+// importPrompt renders the whole day-10 facts store as extractor input. Unlike
+// memoryPrompt it shows no current layers — an import starts from a flat list
+// with no tags at all — and asks explicitly not to drop anything.
+func importPrompt(facts []history.Fact) string {
+	var b strings.Builder
+	b.WriteString("Ниже — все факты, накопленные за прошлый диалог, в виде «ключ: значение».\n")
+	b.WriteString("Разложи их по слоям памяти: каждый факт должен попасть ровно в один слой, ничего не пропускай.\n")
+	b.WriteString("Факты, которые не подходят ни одному слою, тоже не выбрасывай — положи в working.\n\n")
+	b.WriteString("Факты:\n")
+	for _, f := range facts {
+		b.WriteString("- ")
+		b.WriteString(f.Key)
+		b.WriteString(": ")
+		b.WriteString(config.Truncate(f.Value, 400))
+		b.WriteByte('\n')
+	}
+	// The caps are enforced in code anyway; telling the model about them lets it
+	// choose what matters instead of losing whatever happens to be oldest.
+	fmt.Fprintf(&b, "\nЛимиты слоёв: working — %d записей, profile — %d, decisions — %d, knowledge — %d.\n",
+		memory.Caps[memory.LayerWorking], memory.Caps[memory.LayerProfile],
+		memory.Caps[memory.LayerDecisions], memory.Caps[memory.LayerKnowledge])
+	b.WriteString("Если сведений больше лимита, оставь самые важные для дальнейшей работы.\n")
+	b.WriteString("\nВерни одним JSON-объектом только записи, разложенные по слоям: " +
+		"{\"working\": {\"ключ\": \"значение\"}, \"profile\": {...}, \"decisions\": {...}, \"knowledge\": {...}}.")
+	return b.String()
+}
+
+// ImportFacts routes a flat day-10 facts store into the memory layers with one
+// model call: the same system prompt and JSON contract as the per-turn
+// extractor, only the input is the whole store instead of one message. The
+// day-10 facts carry no layer tags, so the layer descriptions — not a keyword
+// list — decide where each one goes.
+func ImportFacts(ctx context.Context, client *llm.ChatClient, model string, facts []history.Fact) (memory.Update, error) {
+	var upd memory.Update
+	if len(facts) == 0 {
+		return upd, fmt.Errorf("импорт: нечего раскладывать")
+	}
+	out, err := jsonChat(ctx, client, model, memorySystemPrompt, importPrompt(facts), importAttemptTimeout)
+	if err != nil {
+		return upd, err
+	}
+	return ParseMemoryJSON(out)
 }

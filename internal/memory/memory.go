@@ -96,6 +96,10 @@ type Store struct {
 	decisions []Entry
 	knowledge []Entry
 
+	// evicted counts the records the layer caps dropped since Open. The import
+	// report uses it to show what the limits cost on a big store.
+	evicted map[Layer]int
+
 	warnf func(format string, args ...any)
 }
 
@@ -110,7 +114,7 @@ type longFile struct {
 // valid starting point. sessionDir holds working/decisions/knowledge,
 // sharedDir holds the cross-session profile.
 func Open(sessionDir, sharedDir string) (*Store, error) {
-	s := &Store{sessionDir: sessionDir, sharedDir: sharedDir}
+	s := &Store{sessionDir: sessionDir, sharedDir: sharedDir, evicted: make(map[Layer]int)}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -141,10 +145,10 @@ func (s *Store) load() error {
 
 	// A hand-edited file may exceed the caps; trim on load so the prompt is
 	// never larger than the declared budget.
-	s.working = capEntries(s.working, Caps[LayerWorking])
-	s.profile = capEntries(s.profile, Caps[LayerProfile])
-	s.decisions = capEntries(s.decisions, Caps[LayerDecisions])
-	s.knowledge = capEntries(s.knowledge, Caps[LayerKnowledge])
+	s.working, _ = capEntries(s.working, Caps[LayerWorking])
+	s.profile, _ = capEntries(s.profile, Caps[LayerProfile])
+	s.decisions, _ = capEntries(s.decisions, Caps[LayerDecisions])
+	s.knowledge, _ = capEntries(s.knowledge, Caps[LayerKnowledge])
 	return nil
 }
 
@@ -221,7 +225,14 @@ func (s *Store) Section(l Layer) []Entry {
 // SetSection replaces one layer wholesale (used by the day-10 importer and by
 // /memory clear).
 func (s *Store) SetSection(l Layer, entries []Entry) {
-	entries = capEntries(entries, Caps[l])
+	var dropped int
+	entries, dropped = capEntries(entries, Caps[l])
+	if dropped > 0 {
+		if s.evicted == nil {
+			s.evicted = make(map[Layer]int)
+		}
+		s.evicted[l] += dropped
+	}
 	switch l {
 	case LayerWorking:
 		s.working = entries
@@ -232,6 +243,20 @@ func (s *Store) SetSection(l Layer, entries []Entry) {
 	case LayerKnowledge:
 		s.knowledge = entries
 	}
+}
+
+// Evicted reports how many records the layer cap dropped since the store was
+// opened. The day-10 import prints it so a big store does not look complete
+// when half of it was cut by the limit.
+func (s *Store) Evicted(l Layer) int { return s.evicted[l] }
+
+// EvictedTotal sums the evictions across all layers.
+func (s *Store) EvictedTotal() int {
+	n := 0
+	for _, l := range Layers {
+		n += s.evicted[l]
+	}
+	return n
 }
 
 // Apply merges the extractor's update: an existing key is updated in place, a
@@ -298,11 +323,13 @@ func mergeEntry(entries []Entry, e Entry) []Entry {
 }
 
 // capEntries keeps the newest n records: the front of the slice is the oldest.
-func capEntries(entries []Entry, n int) []Entry {
+// It also reports how many records were dropped, so the caller can count the
+// evictions.
+func capEntries(entries []Entry, n int) ([]Entry, int) {
 	if n <= 0 || len(entries) <= n {
-		return entries
+		return entries, 0
 	}
-	return entries[len(entries)-n:]
+	return entries[len(entries)-n:], len(entries) - n
 }
 
 // Date returns today's date in the form used for decisions.

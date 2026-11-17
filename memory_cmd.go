@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 )
 
@@ -170,18 +173,25 @@ func memoryReportCmd(dataDir, id string) error {
 		fmt.Printf("  %-10s %2d/%-2d  ~%4d ток.\n", l, mem.Len(l), memory.Caps[l], toks[l])
 	}
 	fmt.Printf("  %-10s       ~%4d ток.\n", "итого", total)
+	// The report is an analysis view: it prints every stored record, not only
+	// what the current question would pull in. Knowledge is relevance-filtered
+	// in the prompt, and an imported session may have no question at all.
 	for _, l := range memory.Layers {
-		if b := mem.Block(l, q); b != "" {
-			fmt.Printf("\n%s\n", b)
+		entries := mem.Section(l)
+		if len(entries) == 0 {
+			continue
 		}
+		fmt.Printf("\n%s\n%s\n", memory.Header(l), memory.Render(entries))
 	}
 	return nil
 }
 
-// importMemory migrates a day-10 facts store into the layered memory of another
-// session. The split is a documented heuristic, not a model call: the day-10
-// facts have no layer tags, so the key and value wording decides.
-func importMemoryCmd(dataDir, srcID, dstID string) error {
+// importMemoryCmd migrates a day-10 facts store into the layered memory of a
+// session. The routing is done by the model, not by code: the day-10 facts
+// carry no layer tags, and a keyword list only works for the vocabulary it was
+// written for — the real «подбор автомобиля» session sent all 34 facts to
+// working, and the cap then silently dropped 22 of them.
+func importMemoryCmd(ctx context.Context, client *llm.ChatClient, model, dataDir, srcID, dstID string) error {
 	if dstID == "" {
 		return fmt.Errorf("-import-memory переносит факты в сессию: укажите -session <id> (новая или существующая)")
 	}
@@ -194,54 +204,54 @@ func importMemoryCmd(dataDir, srcID, dstID string) error {
 	if len(facts) == 0 {
 		return fmt.Errorf("в сессии %s нет снимков facts — переносить нечего", srcID)
 	}
+	fmt.Printf("импорт фактов %s → сессия %s · %d фактов · модель %s\n", srcID, dstID, len(facts), model)
+
+	upd, err := compact.ImportFacts(ctx, client, model, facts)
+	if err != nil {
+		return fmt.Errorf("импорт: модель не разложила факты: %w", err)
+	}
+	if upd.Empty() {
+		return fmt.Errorf("импорт: модель вернула пустой ответ — память не тронута")
+	}
+
 	mem, err := memory.Open(filepath.Join(dataDir, dstID, "memory"), filepath.Join(dataDir, "shared"))
 	if err != nil {
 		return err
 	}
-	counts := map[memory.Layer]int{}
-	for _, f := range facts {
-		layer := classifyFact(f.Key, f.Value)
-		if err := mem.Add(layer, f.Key, f.Value); err != nil {
-			return err
-		}
-		counts[layer]++
-	}
+	mem.Apply(upd)
 	if err := mem.Save(); err != nil {
 		return err
 	}
-	fmt.Printf("перенос фактов %s → сессия %s: %d записей\n", srcID, dstID, len(facts))
+
+	// Journal the diff into the destination session, exactly like a live turn.
+	dst, err := history.OpenHistory(dataDir, dstID, "", "", "")
+	if err != nil {
+		return err
+	}
+	if err := dst.AppendMemory(upd); err != nil {
+		dst.Close()
+		return err
+	}
+	dst.Close()
+
+	returned := 0
 	for _, l := range memory.Layers {
-		if counts[l] > 0 {
-			fmt.Printf("  %-10s %d\n", l, counts[l])
+		returned += len(upd.Layer(l))
+		n := mem.Len(l)
+		line := fmt.Sprintf("  %-10s %2d/%-2d", l, n, memory.Caps[l])
+		if ev := mem.Evicted(l); ev > 0 {
+			line += fmt.Sprintf("  вытеснено %d (лимит слоя)", ev)
 		}
+		fmt.Println(line)
+	}
+	fmt.Printf("  модель вернула %d записей на %d фактов\n", returned, len(facts))
+	if ev := mem.EvictedTotal(); ev > 0 {
+		fmt.Printf("  внимание: лимиты слоёв вытеснили %d записей — в промпт они не попадут\n", ev)
+	}
+	if returned < len(facts) {
+		fmt.Printf("  внимание: записей меньше, чем фактов — часть сведений модель объединила или не сохранила\n")
 	}
 	return nil
-}
-
-// classifyFact routes one day-10 fact by wording. Constraints, numbers and
-// task details stay in working memory; accepted choices go to decisions;
-// external contact/price facts go to knowledge; the user's own identity and
-// preferences go to the shared profile.
-func classifyFact(key, value string) memory.Layer {
-	s := strings.ToLower(key + " " + value)
-	switch {
-	case containsAny(s, "решили", "решение", "выбрали", "утвердили", "вариант ", "договорились"):
-		return memory.LayerDecisions
-	case containsAny(s, "адрес", "контакт", "телефон", "почта", "e-mail", "сайт", "цена", "стоимость", "график работы"):
-		return memory.LayerKnowledge
-	case containsAny(s, "пользовател", "меня зовут", "моё имя", "мое имя", "предпоч", "стиль общения"):
-		return memory.LayerProfile
-	}
-	return memory.LayerWorking
-}
-
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
 }
 
 // selectedKnowledge counts the knowledge entries the current question pulls

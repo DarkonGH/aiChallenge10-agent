@@ -323,7 +323,18 @@ func main() {
 		return
 	}
 	if *importMemory != "" {
-		if err := importMemoryCmd(dataDir, *importMemory, *sessionFlag); err != nil {
+		// The import is model-based, so this offline branch needs a client of
+		// its own: it runs before the interactive app is built.
+		model := *summaryFlag
+		if model == "" {
+			model = *modelFlag
+		}
+		if model == "" {
+			model = config.DefaultSummaryModel()
+		}
+		client := llm.NewChatClient()
+		client.SetMaxTokens(*maxTokens)
+		if err := importMemoryCmd(context.Background(), client, model, dataDir, *importMemory, *sessionFlag); err != nil {
 			fatalf("%v", err)
 		}
 		return
