@@ -54,7 +54,9 @@ internal/tokens/      оценка токенов и калибровка (EMA �
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt)
-scripts/              render_cast.py — сборка демо-видео из asciinema-каста
+scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
+                      cascade.sh — каскадная проверка памяти,
+                      check_memory.py — проверка ответов по журналу
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 ANALYSIS.md           отчёт дня 10: сравнение стратегий

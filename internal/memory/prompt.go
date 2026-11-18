@@ -106,7 +106,7 @@ func Relevant(entries []Entry, question string, limit int) []Entry {
 		text := strings.ToLower(e.Key + " " + e.Value)
 		score := 0
 		for w := range words {
-			if strings.Contains(text, w) {
+			if wordHit(text, w) {
 				score++
 			}
 		}
@@ -128,6 +128,42 @@ func Relevant(entries []Entry, question string, limit int) []Entry {
 		out[i] = h.e
 	}
 	return out
+}
+
+// wordHit reports whether the question word occurs in the record text. Russian
+// words change their endings («коворкинга» in the question, «коворкинг» in the
+// record), so a shared prefix of four runes counts as a hit. A plain substring
+// check is not enough: in the cascade run the record «коворкинг_Пресня» never
+// reached the prompt because the question asked about «коворкинга».
+func wordHit(text, w string) bool {
+	if strings.Contains(text, w) {
+		return true
+	}
+	for _, t := range splitWords(text) {
+		if commonPrefix(w, t) >= prefixLen {
+			return true
+		}
+	}
+	return false
+}
+
+// prefixLen is the shortest shared prefix that still means "the same word" for
+// Russian nouns and adjectives.
+const prefixLen = 4
+
+func splitWords(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func commonPrefix(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	n := 0
+	for n < len(ra) && n < len(rb) && ra[n] == rb[n] {
+		n++
+	}
+	return n
 }
 
 // stopWords are ignored when matching knowledge to a question.

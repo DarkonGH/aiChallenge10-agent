@@ -248,3 +248,20 @@ func TestUpdateWithOnlyRemovalsIsNotEmpty(t *testing.T) {
 		t.Errorf("Removed: %v", got)
 	}
 }
+
+// TestRelevantMatchesInflectedWord is the cascade defect in a test: the record
+// said «коворкинг_Пресня», the question asked about «коворкинга», and the
+// address never reached the prompt although it was stored.
+func TestRelevantMatchesInflectedWord(t *testing.T) {
+	entries := []Entry{
+		{Key: "коворкинг_Пресня", Value: "Пресненская набережная, 12; координатор Марина Соколова: +7 916 000-00-00"},
+		{Key: "штрафы_договор", Value: "пеня 0,1% за день просрочки"},
+	}
+	got := Relevant(entries, "Какой адрес у коворкинга?", KnowledgeLimit)
+	if len(got) != 1 || got[0].Key != "коворкинг_Пресня" {
+		t.Fatalf("запись про коворкинг не выбрана: %+v", got)
+	}
+	if got := Relevant(entries, "Какие штрафы за просрочку оплаты?", KnowledgeLimit); len(got) != 1 || got[0].Key != "штрафы_договор" {
+		t.Fatalf("запись про штрафы не выбрана: %+v", got)
+	}
+}
