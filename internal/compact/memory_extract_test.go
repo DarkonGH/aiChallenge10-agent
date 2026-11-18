@@ -172,3 +172,24 @@ func TestSystemPromptTellsToUpdateExistingKey(t *testing.T) {
 		}
 	}
 }
+
+// TestParseMemoryJSONRemoval checks the null contract: a null value deletes the
+// record, so one diff can move a fact from working to decisions.
+func TestParseMemoryJSONRemoval(t *testing.T) {
+	u, err := ParseMemoryJSON(`{"working": {"открытый вопрос": null, "срок": "15 декабря"}, "decisions": {"выбор": "вариант B"}}`)
+	if err != nil {
+		t.Fatalf("ParseMemoryJSON: %v", err)
+	}
+	if got := u.Removed(memory.LayerWorking); len(got) != 1 || got[0] != "открытый вопрос" {
+		t.Fatalf("удаление не разобрано: %v", got)
+	}
+	if len(u.Working) != 1 || u.Working[0].Key != "срок" {
+		t.Errorf("working: %+v", u.Working)
+	}
+	if len(u.Decisions) != 1 || u.Decisions[0].Key != "выбор" {
+		t.Errorf("decisions: %+v", u.Decisions)
+	}
+	if u.Empty() {
+		t.Error("дифф с удалением и записью считается пустым")
+	}
+}

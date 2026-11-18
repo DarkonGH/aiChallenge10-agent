@@ -780,8 +780,14 @@ func printLogMessage(w io.Writer, m *llm.Message) {
 func describeMemoryUpdate(u memory.Update) string {
 	parts := make([]string, 0, len(memory.Layers))
 	for _, l := range memory.Layers {
-		if n := len(u.Layer(l)); n > 0 {
-			parts = append(parts, fmt.Sprintf("%s +%d", l, n))
+		added, removed := len(u.Layer(l)), len(u.Removed(l))
+		switch {
+		case added > 0 && removed > 0:
+			parts = append(parts, fmt.Sprintf("%s +%d −%d", l, added, removed))
+		case added > 0:
+			parts = append(parts, fmt.Sprintf("%s +%d", l, added))
+		case removed > 0:
+			parts = append(parts, fmt.Sprintf("%s −%d", l, removed))
 		}
 	}
 	if len(parts) == 0 {

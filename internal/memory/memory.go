@@ -61,13 +61,28 @@ type Update struct {
 	Profile   []Entry `json:"profile,omitempty"`
 	Decisions []Entry `json:"decisions,omitempty"`
 	Knowledge []Entry `json:"knowledge,omitempty"`
+
+	// Remove lists keys to delete from a layer. The extractor uses it to move
+	// a fact between layers (add to the new one, delete from the old one) and
+	// to drop what stopped being true.
+	Remove map[Layer][]string `json:"remove,omitempty"`
 }
 
 // Empty reports whether the update carries nothing.
 func (u Update) Empty() bool {
-	return len(u.Working) == 0 && len(u.Profile) == 0 &&
-		len(u.Decisions) == 0 && len(u.Knowledge) == 0
+	if len(u.Working) > 0 || len(u.Profile) > 0 || len(u.Decisions) > 0 || len(u.Knowledge) > 0 {
+		return false
+	}
+	for _, keys := range u.Remove {
+		if len(keys) > 0 {
+			return false
+		}
+	}
+	return true
 }
+
+// Removed returns the keys the update deletes from one layer.
+func (u Update) Removed(l Layer) []string { return u.Remove[l] }
 
 // Layer returns the entries of one layer inside the update.
 func (u Update) Layer(l Layer) []Entry {
@@ -259,15 +274,17 @@ func (s *Store) EvictedTotal() int {
 	return n
 }
 
-// Apply merges the extractor's update: an existing key is updated in place, a
-// new key is appended. Layer caps evict the oldest records first.
+// Apply merges the extractor's update: removals go first, then an existing key
+// is updated in place and a new key is appended. Layer caps evict the oldest
+// records first.
 func (s *Store) Apply(u Update) {
 	for _, l := range Layers {
 		entries := u.Layer(l)
-		if len(entries) == 0 {
+		removed := u.Removed(l)
+		if len(entries) == 0 && len(removed) == 0 {
 			continue
 		}
-		cur := s.Section(l)
+		cur := removeEntries(s.Section(l), removed)
 		for _, e := range entries {
 			// Decisions are dated when they are first stored; a later
 			// re-statement keeps the original date (mergeEntry does that).
@@ -278,6 +295,28 @@ func (s *Store) Apply(u Update) {
 		}
 		s.SetSection(l, cur)
 	}
+}
+
+// removeEntries drops the records whose key matches one of keys, ignoring
+// case. It returns a fresh slice so the caller's array is not mutated.
+func removeEntries(entries []Entry, keys []string) []Entry {
+	if len(keys) == 0 {
+		return entries
+	}
+	out := make([]Entry, 0, len(entries))
+	for _, e := range entries {
+		drop := false
+		for _, k := range keys {
+			if strings.EqualFold(e.Key, strings.TrimSpace(k)) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Add inserts or updates one record (the /memory add command).

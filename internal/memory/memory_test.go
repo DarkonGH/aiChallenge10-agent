@@ -208,3 +208,43 @@ func TestEvictionIsCounted(t *testing.T) {
 		t.Errorf("в profile вытеснено %d, ожидалось 0", got)
 	}
 }
+
+// TestApplyRemovesKeys checks the deletion half of the diff: the extractor can
+// drop a record that moved to another layer or stopped being true.
+func TestApplyRemovesKeys(t *testing.T) {
+	s := openTemp(t)
+	s.Apply(Update{Working: []Entry{
+		{Key: "открытый вопрос", Value: "вариант A или B"},
+		{Key: "срок", Value: "15 декабря"},
+	}})
+
+	// Case-insensitive key match, like mergeEntry.
+	s.Apply(Update{
+		Working:   []Entry{{Key: "срок", Value: "20 декабря"}},
+		Decisions: []Entry{{Key: "выбор", Value: "вариант B"}},
+		Remove:    map[Layer][]string{LayerWorking: {"Открытый Вопрос"}},
+	})
+
+	working := s.Section(LayerWorking)
+	if len(working) != 1 || working[0].Key != "срок" || working[0].Value != "20 декабря" {
+		t.Fatalf("working после удаления: %+v", working)
+	}
+	if got := s.Section(LayerDecisions); len(got) != 1 || got[0].Key != "выбор" {
+		t.Fatalf("decisions: %+v", got)
+	}
+	if s.EvictedTotal() != 0 {
+		t.Errorf("удаление не должно считаться вытеснением: %d", s.EvictedTotal())
+	}
+}
+
+// TestUpdateWithOnlyRemovalsIsNotEmpty keeps the journal honest: a diff that
+// only deletes records still has to be applied and written to the log.
+func TestUpdateWithOnlyRemovalsIsNotEmpty(t *testing.T) {
+	u := Update{Remove: map[Layer][]string{LayerWorking: {"ключ"}}}
+	if u.Empty() {
+		t.Error("дифф только с удалением считается пустым")
+	}
+	if got := u.Removed(LayerWorking); len(got) != 1 || got[0] != "ключ" {
+		t.Errorf("Removed: %v", got)
+	}
+}

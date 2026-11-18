@@ -28,6 +28,10 @@ const memorySystemPrompt = "Ты раскладываешь сведения и�
 	"Если сведение уже есть в памяти и не изменилось — не возвращай его. " +
 	"Если новое сообщение дополняет существующую запись (тот же человек, объект или тема) — " +
 	"верни её под тем же ключом с объединённым значением, а не создавай вторую запись с другим ключом. " +
+	"Смена статуса — это изменение: открытый вопрос, который стал решением, верни в decisions, даже если формулировка совпадает. " +
+	"Переноси сведение между слоями явно: добавь его в новый слой и удали из старого. " +
+	"Удаление — это null вместо значения: {\"working\": {\"ключ\": null}}. Удаляй только то, что переехало или стало неверным; " +
+	"сведения, которые всё ещё верны, не удаляй. " +
 	"Ключ — короткий (1-4 слова), значение — конкретное, до 200 символов. " +
 	"Ответ — только JSON без пояснений и markdown."
 
@@ -52,6 +56,7 @@ func memoryPrompt(store *memory.Store, userText string) string {
 	b.WriteString(config.Truncate(userText, 2000))
 	b.WriteString("\n\nВерни только новые или изменённые записи, разложенные по слоям, одним JSON-объектом: " +
 		"{\"working\": {\"ключ\": \"значение\"}, \"profile\": {...}, \"decisions\": {...}, \"knowledge\": {...}}. " +
+		"Чтобы удалить запись, верни null вместо значения: {\"working\": {\"ключ\": null}}. " +
 		"Если сохранять нечего — верни {}.")
 	return b.String()
 }
@@ -102,16 +107,21 @@ func ParseMemoryJSON(s string) (memory.Update, error) {
 		layer := memory.Layer(strings.ToLower(strings.TrimSpace(key)))
 		if !knownLayer(layer) {
 			// Flat answer: the whole object is one working-memory record.
+			if string(bytes.TrimSpace(raw)) == "null" {
+				addRemoved(&upd, memory.LayerWorking, []string{key})
+				continue
+			}
 			val := strings.TrimSpace(strings.Trim(string(raw), `"`))
 			if e := newEntry(key, val); e.Key != "" {
 				upd.Working = append(upd.Working, e)
 			}
 			continue
 		}
-		entries, perr := orderedEntries(raw)
+		entries, removed, perr := orderedEntries(raw)
 		if perr != nil {
 			return upd, fmt.Errorf("память: слой %s: %w", layer, perr)
 		}
+		addRemoved(&upd, layer, removed)
 		switch layer {
 		case memory.LayerWorking:
 			upd.Working = append(upd.Working, entries...)
@@ -136,32 +146,51 @@ func knownLayer(l memory.Layer) bool {
 	return false
 }
 
-// orderedEntries decodes one JSON object into entries, keeping key order.
-func orderedEntries(raw json.RawMessage) ([]memory.Entry, error) {
+// orderedEntries decodes one JSON object into entries, keeping key order. A
+// null value is a deletion: the key goes to removed instead of out.
+func orderedEntries(raw json.RawMessage) ([]memory.Entry, []string, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("ожидался объект «ключ: значение»")
+		return nil, nil, fmt.Errorf("ожидался объект «ключ: значение»")
 	}
 	var out []memory.Entry
+	var removed []string
 	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		key, _ := kt.(string)
 		var v any
 		if err := dec.Decode(&v); err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		if v == nil {
+			if k := strings.TrimSpace(key); k != "" {
+				removed = append(removed, k)
+			}
+			continue
 		}
 		if e := newEntry(key, fmt.Sprintf("%v", v)); e.Key != "" {
 			out = append(out, e)
 		}
 	}
-	return out, nil
+	return out, removed, nil
+}
+
+// addRemoved records the keys an update deletes from a layer.
+func addRemoved(upd *memory.Update, l memory.Layer, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	if upd.Remove == nil {
+		upd.Remove = make(map[memory.Layer][]string)
+	}
+	upd.Remove[l] = append(upd.Remove[l], keys...)
 }
 
 // newEntry normalizes one record and drops empty pairs.
