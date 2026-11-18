@@ -58,14 +58,14 @@ func TestRegistryExecute(t *testing.T) {
 	if out := r.Execute(call("calc", `{"expr":"1/0"}`)); !strings.Contains(out, "деление на ноль") {
 		t.Errorf("calc error = %q", out)
 	}
-	if out := r.Execute(call("find_task", `{"query":"улитка"}`)); !strings.Contains(out, "улитка на столбе") || !strings.Contains(out, "28") {
-		t.Errorf("find_task = %q", out)
+	if out := r.Execute(call("find_riddle", `{"query":"улитка"}`)); !strings.Contains(out, "улитка на столбе") || !strings.Contains(out, "28") {
+		t.Errorf("find_riddle = %q", out)
 	}
-	if out := r.Execute(call("find_task", `{"query":"дракон"}`)); !strings.Contains(out, "ничего не найдено") {
-		t.Errorf("find_task miss = %q", out)
+	if out := r.Execute(call("find_riddle", `{"query":"дракон"}`)); !strings.Contains(out, "ничего не найдено") {
+		t.Errorf("find_riddle miss = %q", out)
 	}
-	if out := r.Execute(call("find_task", `{}`)); !strings.Contains(out, "8. улитка на столбе") {
-		t.Errorf("find_task empty query should list all = %q", out)
+	if out := r.Execute(call("find_riddle", `{}`)); !strings.Contains(out, "8. улитка на столбе") {
+		t.Errorf("find_riddle empty query should list all = %q", out)
 	}
 	if out := r.Execute(call("nope", `{}`)); !strings.Contains(out, "неизвестный инструмент") {
 		t.Errorf("unknown tool = %q", out)

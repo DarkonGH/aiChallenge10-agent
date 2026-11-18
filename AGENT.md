@@ -49,7 +49,7 @@ internal/memory/      модель памяти: Store, слои, Relevant, ре
 internal/history/     event-sourced session.jsonl: события message/compact/
                       evict/facts/memory/fork, реплей при загрузке
 internal/llm/         HTTP-клиент OpenAI-совместимого API, SSE-стрим, reasoning
-internal/tools/       реестр инструментов: now, calc, find_task (tasks.txt)
+internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt)
 internal/tokens/      оценка токенов и калибровка (EMA по факту ответа)
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI

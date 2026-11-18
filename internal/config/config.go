@@ -83,7 +83,7 @@ const DefaultSystemPrompt = `Ты — CLI-агент. Отвечай по-рус
 5. Когда инструменты больше не нужны — дай финальный ответ обычным текстом, без JSON и без описания своих рассуждений.`
 
 // Task is one reasoning puzzle from tasks.txt, exposed to the model through
-// the find_task tool.
+// the find_riddle tool.
 type Task struct {
 	ID        int
 	Label     string

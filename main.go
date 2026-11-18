@@ -253,7 +253,7 @@ func main() {
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
 	dataFlag := flag.String("data", "", "каталог сессий")
-	tasksFlag := flag.String("tasks", "tasks.txt", "список задач для find_task")
+	tasksFlag := flag.String("tasks", "tasks.txt", "список загадок для find_riddle")
 	maxSteps := flag.Int("max-steps", 8, "максимум шагов с инструментами на один запрос")
 	maxPrompt := flag.Int("max-prompt-tokens", 6000, "бюджет токенов промпта")
 	reserve := flag.Int("reserve-output", 1024, "токены, зарезервированные под ответ")
@@ -351,7 +351,7 @@ func main() {
 
 	tasks, err := config.LoadTasks(*tasksFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "предупреждение: список задач не загружен (%v); find_task будет пустым\n", err)
+		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
 	}
 
 	client := llm.NewChatClient()

@@ -26,7 +26,7 @@ type ToolRegistry struct {
 }
 
 // NewToolRegistry builds the agent's tool set. tasks is the in-memory list from
-// tasks.txt, exposed through find_task.
+// tasks.txt, exposed through find_riddle.
 func NewToolRegistry(tasks []config.Task) *ToolRegistry {
 	r := &ToolRegistry{tools: map[string]*Tool{}, maxResult: 8000}
 
@@ -59,14 +59,14 @@ func NewToolRegistry(tasks []config.Task) *ToolRegistry {
 	})
 
 	r.add(&Tool{
-		Name:        "find_task",
-		Description: "Ищет задачу в списке задач по названию или условию. Возвращает номер, название и ответ. Если пользователь спрашивает, какие задачи есть (список/перечень), или по ключевым словам ничего не нашлось — вызови с пустым query: вернётся весь список.",
+		Name:        "find_riddle",
+		Description: "Ищет загадку в списке загадок по ключевым словам. В списке только загадки и головоломки — это не задачи пользователя, не дела и не поручения. Возвращает номер, название и ответ. Пустой query возвращает весь список загадок.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Ключевые слова, например улитка или поезд; пусто — показать все задачи",
+					"description": "Ключевые слова, например улитка или поезд; пусто — показать все загадки",
 				},
 			},
 			"additionalProperties": false,
@@ -192,7 +192,7 @@ func runFindTask(tasks []config.Task) func(json.RawMessage) (string, error) {
 			}
 		}
 		if len(hits) == 0 {
-			return "ничего не найдено; полный список задач — find_task с пустым query", nil
+			return fmt.Sprintf("ничего не найдено по запросу «%s»", strings.TrimSpace(a.Query)), nil
 		}
 
 		var b strings.Builder
