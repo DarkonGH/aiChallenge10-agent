@@ -37,6 +37,7 @@ type app struct {
 	compactEvery int
 	strategy     compact.Strategy
 	window       int
+	noReasoning  bool
 
 	hist  *history.History
 	agent *agent.Agent
@@ -265,8 +266,9 @@ func main() {
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
 	strategyFlag := flag.String("strategy", string(compact.StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
 	windowFlag := flag.Int("window", 0, "размер окна для стратегий window и facts (обязателен для них)")
+	noReasoning := flag.Bool("no-reasoning", false, "не печатать блок рассуждений модели (для записи демо)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
-	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
+	scriptFlag := flag.String("script", "", "проиграть запросы и команды (/memory и др.) из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
@@ -371,6 +373,7 @@ func main() {
 		maxToolChars: *maxToolChars,
 		noCompact:    *noCompact,
 		compactEvery: *compactEvery,
+		noReasoning:  *noReasoning,
 		strategy:     strategy,
 		window:       window,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
@@ -421,7 +424,9 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetMemory(mem)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
-	a.agent.SetReasoningUI(a.ui.reasoning)
+	if !a.noReasoning {
+		a.agent.SetReasoningUI(a.ui.reasoning)
+	}
 	a.agent.SetNoCompact(a.noCompact)
 	a.agent.SetCompactEvery(a.compactEvery)
 	a.agent.SetStrategy(a.strategy)
@@ -1008,6 +1013,19 @@ func (a *app) runScript(path string) error {
 			continue
 		}
 		fmt.Printf("agent> %s\n", line)
+		// Lines starting with "/" are chat commands, not prompts. Handling them
+		// here is what makes a demo reproducible: /memory and /memory clear can
+		// run between the dialogue turns instead of being typed by hand.
+		if strings.HasPrefix(line, "/") {
+			exit, err := a.command(line)
+			if err != nil {
+				fmt.Println("ошибка:", err)
+			}
+			if exit {
+				break
+			}
+			continue
+		}
 		a.ask(line)
 	}
 	return sc.Err()

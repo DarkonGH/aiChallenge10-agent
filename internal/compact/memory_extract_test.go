@@ -161,3 +161,14 @@ func TestImportFactsRejectsEmptyStore(t *testing.T) {
 		t.Error("пустой набор фактов принят без ошибки")
 	}
 }
+
+// TestSystemPromptTellsToUpdateExistingKey pins the dedup rule: the store
+// merges records by key, so the model must reuse the key when it supplements
+// an existing fact — otherwise the same person becomes two records.
+func TestSystemPromptTellsToUpdateExistingKey(t *testing.T) {
+	for _, want := range []string{"под тем же ключом", "не создавай вторую запись"} {
+		if !strings.Contains(memorySystemPrompt, want) {
+			t.Errorf("в системном промпте нет %q", want)
+		}
+	}
+}

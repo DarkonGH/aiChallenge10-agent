@@ -54,6 +54,7 @@ internal/tokens/      оценка токенов и калибровка (EMA �
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt)
+scripts/              render_cast.py — сборка демо-видео из asciinema-каста
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
@@ -117,6 +118,11 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 - Коммиты — короткая строка на русском, префикс дня для фич: `DAY11:
   реализация памяти и слоев`, рефакторинги — `refactor: …`.
 - Демо-видео: имена по дням (`память-день-11.mp4`), без аудиодорожки и
-  без метаданных поворота, 1348x982, 5 fps; `video/` в .gitignore.
+  без метаданных поворота, 1352x970, 8 fps; `video/` в .gitignore.
+  Сборка воспроизводимая: `asciinema rec --overwrite -f asciicast-v2
+  --window-size 148x50 -c "./agent -data /tmp/day11-video -session demo
+  -strategy window -window 2 -model glm-5.3-flash -summary-model glm-5.3-flash
+  -no-reasoning -script testdata/day11-demo.txt" /tmp/day11-demo.cast`, затем
+  `python3 scripts/render_cast.py --cast /tmp/day11-demo.cast --out video/…`.
 - Прогоны сценариев лежат в `/tmp/day11*/` — в репозиторий попадают только
   сценарии (`testdata/`) и вывод, если он нужен отчёту.
