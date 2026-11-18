@@ -11,6 +11,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
@@ -36,9 +37,11 @@ type app struct {
 	compactEvery int
 	strategy     compact.Strategy
 	window       int
+	noReasoning  bool
 
 	hist  *history.History
 	agent *agent.Agent
+	mem   *memory.Store
 	ui    *ui
 }
 
@@ -251,7 +254,7 @@ func main() {
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
 	dataFlag := flag.String("data", "", "каталог сессий")
-	tasksFlag := flag.String("tasks", "tasks.txt", "список задач для find_task")
+	tasksFlag := flag.String("tasks", "tasks.txt", "список загадок для find_riddle")
 	maxSteps := flag.Int("max-steps", 8, "максимум шагов с инструментами на один запрос")
 	maxPrompt := flag.Int("max-prompt-tokens", 6000, "бюджет токенов промпта")
 	reserve := flag.Int("reserve-output", 1024, "токены, зарезервированные под ответ")
@@ -263,11 +266,14 @@ func main() {
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
 	strategyFlag := flag.String("strategy", string(compact.StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
 	windowFlag := flag.Int("window", 0, "размер окна для стратегий window и facts (обязателен для них)")
+	noReasoning := flag.Bool("no-reasoning", false, "не печатать блок рассуждений модели (для записи демо)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
-	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
+	scriptFlag := flag.String("script", "", "проиграть запросы и команды (/memory и др.) из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
+	memoryReport := flag.String("memory-report", "", "показать слои памяти сессии и токены по слоям (офлайн)")
+	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -305,6 +311,36 @@ func main() {
 		}
 		return
 	}
+	if *memoryReport != "" {
+		id := *memoryReport
+		if id == "last" {
+			var err error
+			if id, err = history.LatestSession(dataDir); err != nil {
+				fatalf("%v", err)
+			}
+		}
+		if err := memoryReportCmd(dataDir, id); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+	if *importMemory != "" {
+		// The import is model-based, so this offline branch needs a client of
+		// its own: it runs before the interactive app is built.
+		model := *summaryFlag
+		if model == "" {
+			model = *modelFlag
+		}
+		if model == "" {
+			model = config.DefaultSummaryModel()
+		}
+		client := llm.NewChatClient()
+		client.SetMaxTokens(*maxTokens)
+		if err := importMemoryCmd(context.Background(), client, model, dataDir, *importMemory, *sessionFlag); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 
 	system := config.DefaultSystemPrompt
 	if *systemFlag != "" {
@@ -317,7 +353,7 @@ func main() {
 
 	tasks, err := config.LoadTasks(*tasksFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "предупреждение: список задач не загружен (%v); find_task будет пустым\n", err)
+		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
 	}
 
 	client := llm.NewChatClient()
@@ -337,6 +373,7 @@ func main() {
 		maxToolChars: *maxToolChars,
 		noCompact:    *noCompact,
 		compactEvery: *compactEvery,
+		noReasoning:  *noReasoning,
 		strategy:     strategy,
 		window:       window,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
@@ -374,10 +411,22 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 		return err
 	}
 	a.hist = h
+	// Working and long-term memory live next to the session log but in their
+	// own files: readable JSON, one file per layer group. The profile is shared
+	// by every session of this data dir, so a future second agent sees the same
+	// user without any extra plumbing.
+	mem, err := memory.Open(filepath.Join(a.dataDir, h.ID(), "memory"), filepath.Join(a.dataDir, "shared"))
+	if err != nil {
+		return err
+	}
+	a.mem = mem
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
+	a.agent.SetMemory(mem)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
-	a.agent.SetReasoningUI(a.ui.reasoning)
+	if !a.noReasoning {
+		a.agent.SetReasoningUI(a.ui.reasoning)
+	}
 	a.agent.SetNoCompact(a.noCompact)
 	a.agent.SetCompactEvery(a.compactEvery)
 	a.agent.SetStrategy(a.strategy)
@@ -654,6 +703,9 @@ func (a *app) command(line string) (bool, error) {
 		fmt.Printf("факты (%d ключей, ~%d ток.):\n", len(facts), tokens.EstimateTokens(compact.RenderFacts(facts)))
 		fmt.Println(compact.RenderFacts(facts))
 
+	case "/memory":
+		return false, a.memoryCommand(arg)
+
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
@@ -805,7 +857,8 @@ func (a *app) printHistory() {
 // token estimate per block. It is the "what did compression do" view.
 func (a *app) printContext() {
 	promptMsgs := a.agent.Comp.PromptWindow()
-	base := tokens.EstimateTokens(a.agent.Comp.PromptSystem(a.hist.SystemPrompt()))
+	base := tokens.EstimateTokens(a.agent.Comp.ShortSystem(a.hist.SystemPrompt()))
+	memTok := a.agent.Comp.MemoryTokens()
 	factsTok := 0
 	if facts := a.hist.Facts(); len(facts) > 0 {
 		factsTok = tokens.EstimateTokens("Факты диалога (память о договорённостях):\n" + compact.RenderFacts(facts))
@@ -854,6 +907,21 @@ func (a *app) printContext() {
 	if a.strategy != compact.StrategySummary && a.hist.HasSummary() {
 		fmt.Printf("  конспект (старый)    ~%d ток. — не в промпте (остался от summary)\n",
 			tokens.EstimateTokens(a.hist.SummaryText()))
+	}
+	if a.mem != nil && a.mem.Total() > 0 {
+		fmt.Println("  память по слоям:")
+		for _, l := range memory.Layers {
+			n := a.mem.Len(l)
+			if n == 0 {
+				fmt.Printf("    %-12s         нет\n", string(l))
+				continue
+			}
+			note := "всегда"
+			if l == memory.LayerKnowledge {
+				note = fmt.Sprintf("%d из %d по вопросу", selectedKnowledge(a.mem, a.lastUserText()), n)
+			}
+			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
+		}
 	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
@@ -945,6 +1013,19 @@ func (a *app) runScript(path string) error {
 			continue
 		}
 		fmt.Printf("agent> %s\n", line)
+		// Lines starting with "/" are chat commands, not prompts. Handling them
+		// here is what makes a demo reproducible: /memory and /memory clear can
+		// run between the dialogue turns instead of being typed by hand.
+		if strings.HasPrefix(line, "/") {
+			exit, err := a.command(line)
+			if err != nil {
+				fmt.Println("ошибка:", err)
+			}
+			if exit {
+				break
+			}
+			continue
+		}
 		a.ask(line)
 	}
 	return sc.Err()
@@ -1025,6 +1106,10 @@ const helpText = `Команды:
                    N сообщений), facts (ключ-значение + последние N); без
                    аргумента — текущая; N — размер окна для window/facts
   /facts           память «ключ-значение» стратегии facts
+  /memory [clear <слой> | add <слой> ключ=значение]
+                   слои памяти: рабочая, профиль, решения, знания; без
+                   аргумента — что в каждом слое и сколько токенов он добавляет
+                   к запросу; clear — очистить слой; add — добавить запись
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

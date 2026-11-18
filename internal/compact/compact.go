@@ -6,6 +6,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"strings"
 	"time"
@@ -44,6 +45,12 @@ type Compactor struct {
 	compactEvery int      // compact when the window holds this many messages (0 = off)
 	strategy     Strategy // summary (default) | window | facts
 	window       int      // prompt window size for the window/facts strategies
+
+	// mem is the explicit memory model (day 11): working + long-term layers,
+	// independent of the short-term strategy. question is the user text of the
+	// current turn — it decides which knowledge records enter the prompt.
+	mem      *memory.Store
+	question string
 }
 
 // SetCompactEvery enables the message-count trigger: the history is compacted
@@ -59,6 +66,38 @@ func (c *Compactor) SetStrategy(s Strategy) { c.strategy = s }
 
 // SetWindow sets the prompt window size for the window/facts strategies.
 func (c *Compactor) SetWindow(n int) { c.window = n }
+
+// SetMemory attaches the explicit memory model. Nil disables the memory block.
+func (c *Compactor) SetMemory(m *memory.Store) { c.mem = m }
+
+// SetQuestion records the user text of the current turn. Knowledge records are
+// filtered by relevance to it, so the prompt must be built after this call.
+func (c *Compactor) SetQuestion(q string) { c.question = q }
+
+// Memory returns the attached memory model (nil when memory is off).
+func (c *Compactor) Memory() *memory.Store { return c.mem }
+
+// MemoryBlock renders the layers that belong in the prompt for the current
+// question: working, profile and decisions always, knowledge by relevance.
+func (c *Compactor) MemoryBlock() string {
+	if c.mem == nil {
+		return ""
+	}
+	return c.mem.Prompt(c.question)
+}
+
+// MemoryTokens estimates each layer's contribution to the current prompt.
+func (c *Compactor) MemoryTokens() map[memory.Layer]int {
+	if c.mem == nil {
+		return nil
+	}
+	return c.mem.LayerTokens(c.question)
+}
+
+// ShortSystem returns the system prompt with only the short-term block (the
+// summary or the day-10 facts). /context prints the memory layers separately,
+// so it must not count them twice.
+func (c *Compactor) ShortSystem(system string) string { return c.shortBlock(system) }
 
 // mode returns the active strategy, defaulting to the day-9 summary behavior.
 func (c *Compactor) Mode() Strategy {
@@ -98,6 +137,16 @@ func (c *Compactor) PromptTokens(system string) int {
 // the rolling summary for the summary strategy, the sticky facts for the
 // facts strategy, nothing extra for the bare window.
 func (c *Compactor) PromptSystem(system string) string {
+	base := c.shortBlock(system)
+	if block := c.MemoryBlock(); block != "" {
+		return base + "\n\n" + block
+	}
+	return base
+}
+
+// shortBlock is the short-term part of the system prompt: the strategy's
+// memory block (summary or sticky facts), nothing extra for the bare window.
+func (c *Compactor) shortBlock(system string) string {
 	switch c.Mode() {
 	case StrategyFacts:
 		if facts := c.hist.Facts(); len(facts) > 0 {
