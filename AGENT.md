@@ -62,7 +62,9 @@ scripts/              render_cast.py — сборка демо-видео из a
                       profile_experiment.sh / profile_stability.sh — матрица
                       персонализации и десять вопросов подряд,
                       check_profile.py — длина/код/обращение по журналу,
-                      day12-demo.sh — подготовка данных для демо дня 12
+                      day12-demo.sh — подготовка данных для демо дня 12,
+                      day12-onboard-demo.py — запись онбординга в pty
+                      (пустой профиль → диалог → правка в диалоге)
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
@@ -161,6 +163,8 @@ stdin и `-script` не спрашивают и без флага. Провер�
   -c "scripts/day12-demo.sh /tmp/day12-video" /tmp/day12-demo.cast`, затем
   `python3 scripts/render_cast.py --cast /tmp/day12-demo.cast --out
   video/персонализация-день-12.mp4 --cards testdata/day12-cards.json`.
+  Онбординг-вариант: `python3 scripts/day12-onboard-demo.py /tmp/day12-onboard.cast`
+  (сам ведёт диалог в pty), затем `render_cast.py` с тем же `--cards`.
   Карточки результатов по умолчанию — дня 11; новый день передаёт свой
   `--cards` (JSON: `[{seconds, lines: [[текст, размер, accent|fg|dim, отступ]]}]`).
 - Прогоны сценариев лежат в `/tmp/day11*/` — в репозиторий попадают только
