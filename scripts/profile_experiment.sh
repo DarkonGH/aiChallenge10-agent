@@ -19,7 +19,7 @@ for name in кратко подробно смешанный; do
   cp "testdata/day12-profiles/$name/profile.json" "$root/profiles/$name/profile.json"
   printf '%s\n/exit\n' "$question" > "$root/script.txt"
   ./agent -data "$root" -session run -profile "$name" \
-    -model "$model" -summary-model "$model" -no-reasoning -script "$root/script.txt" \
+    -model "$model" -summary-model "$model" -no-reasoning -skip-profile -script "$root/script.txt" \
     > "$root/run.log" 2>&1
 done
 

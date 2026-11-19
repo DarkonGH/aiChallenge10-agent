@@ -33,7 +33,7 @@ export OPENAI_API_KEY="..."
 Флаги: `-model`, `-summary-model`, `-session`, `-continue`, `-data`,
 `-max-steps`, `-max-prompt-tokens`, `-reserve-output`, `-min-tail-tokens`,
 `-max-tool-chars`, `-temperature`, `-max-tokens`, `-system`, `-script`,
-`-no-reasoning`, `-profile`, `-print-session`.
+`-no-reasoning`, `-profile`, `-skip-profile`, `-print-session`.
 Модели по умолчанию берутся из `LLM_MODEL` / `LLM_SUMMARY_MODEL`.
 `run.sh` сам подхватывает `~/.env`, если переменные не экспортированы.
 
@@ -242,7 +242,11 @@ summary-фазы, в `window`/`facts` хранится в журнале, но �
   промпт он уходит последним блоком, поэтому предпочтения читаются после
   фактов; пополняется сам из реплик («пиши кратко», «без кода», «на ты» —
   ключи `стиль`, `формат`, `обращение`, `ограничения`), правится через
-  `/profile`. Проверки и цифры — в [PROFILE.md](PROFILE.md).
+  `/profile`. Активный профиль печатается при старте — унаследованный из
+  прошлой задачи не применяется молча. Если профиль пуст, при интерактивном
+  старте агент задаёт три вопроса и пополняет профиль из ответов; для прогонов
+  диалог отключается `-skip-profile`. Проверки и цифры — в
+  [PROFILE.md](PROFILE.md).
 
 `/memory` показывает слои, заполнение и токены, `/memory clear <слой>` очищает
 слой, `/memory add <слой> ключ=значение` добавляет запись руками.

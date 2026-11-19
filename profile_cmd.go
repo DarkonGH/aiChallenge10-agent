@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 )
@@ -56,6 +60,132 @@ func (a *app) profileCommand(arg string) error {
 		return fmt.Errorf("неизвестная подкоманда %q; /profile | /profile list | /profile use <имя> | /profile set ключ=значение | /profile clear", fields[0])
 	}
 	return nil
+}
+
+// promptReader is what onboarding needs from the readline editor; the editor
+// type itself is unexported, so the dialogue depends on the method, not the type.
+type promptReader interface {
+	Read(prompt string) (string, error)
+}
+
+// onboardProfile is the day-12 dialogue at an interactive start: the agent
+// asks about the user and folds the answers into the profile with the same
+// extractor that routes the dialogue. A profile left from a previous task is
+// shown first and can be replaced — that is how the day-11 «Дмитрий» stops
+// shaping answers nobody asked for.
+//
+// Scripts and non-interactive runs skip it: -skip-profile, -script and a
+// non-TTY stdin all go straight to the usual startup line.
+func (a *app) onboardProfile(ed promptReader) {
+	a.printProfileLine()
+	if a.skipProfile || !isTerminal(os.Stdin) {
+		return
+	}
+	cleared := false
+	if a.mem.Len(memory.LayerProfile) > 0 {
+		ans, err := ed.Read("использовать этот профиль? [Y/n]: ")
+		if err != nil {
+			return
+		}
+		if !isNo(ans) {
+			return
+		}
+		// The user rejected the old profile: clear it on disk right away, so a
+		// failed model call cannot quietly bring the old persona back.
+		if err := a.mem.Clear(memory.LayerProfile); err != nil {
+			fmt.Println("ошибка:", err)
+			return
+		}
+		if err := a.mem.Save(); err != nil {
+			fmt.Println("ошибка:", err)
+			return
+		}
+		fmt.Println("старый профиль очищен")
+		cleared = true
+	}
+	a.interviewProfile(ed, cleared)
+}
+
+// interviewProfile asks three short questions and lets the extractor decide
+// what is a profile record. The answers are not written by code: the same
+// model that routes the dialogue chooses the keys and the layer.
+func (a *app) interviewProfile(ed promptReader, cleared bool) {
+	fmt.Println("Заполним профиль из диалога: три вопроса, Enter — пропустить.")
+	questions := []struct{ label, text string }{
+		{"как обращаться", "Как к вам обращаться и кем вы работаете? "},
+		{"стиль и формат", "Как отвечать: кратко или подробно, с кодом или без? "},
+		{"ограничения", "Чего не делать в ответах? "},
+	}
+	var b strings.Builder
+	for _, q := range questions {
+		ans, err := ed.Read(q.text)
+		if err != nil {
+			return
+		}
+		if ans = strings.TrimSpace(ans); ans == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "%s: %s\n", q.label, ans)
+	}
+	if b.Len() == 0 {
+		if cleared {
+			fmt.Println("старый профиль очищен, новый не задан")
+		} else {
+			fmt.Println("профиль не изменён")
+		}
+		return
+	}
+
+	fmt.Println("разбираю ответы…")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	out, err := a.agent.Comp.ExtractMemory(ctx, a.mem, b.String())
+	if err != nil {
+		fmt.Printf("профиль: модель не ответила (%s) — профиль остался как был\n", config.OneLine(err.Error()))
+		return
+	}
+	upd, perr := compact.ParseMemoryJSON(out)
+	if perr != nil {
+		fmt.Printf("профиль: %s — профиль остался как был\n", perr)
+		return
+	}
+	a.mem.Apply(upd)
+	if err := a.mem.Save(); err != nil {
+		fmt.Println("профиль: сохранить не удалось:", err)
+		return
+	}
+	if err := a.hist.AppendMemory(upd); err != nil {
+		fmt.Println("профиль: журнал:", err)
+	}
+	if n := len(upd.Profile); n > 0 {
+		keys := make([]string, 0, n)
+		for _, e := range upd.Profile {
+			keys = append(keys, e.Key)
+		}
+		fmt.Printf("профиль пополнен из диалога: %s\n", strings.Join(keys, ", "))
+	} else {
+		fmt.Println("модель не нашла устойчивых предпочтений — профиль прежний")
+	}
+	a.printProfile()
+}
+
+// printProfileLine is the startup reminder: which persona is applied to every
+// request. Without it the profile is invisible until /profile, and a shared
+// profile left from a previous task silently shapes the answers.
+func (a *app) printProfileLine() {
+	entries := a.mem.Section(memory.LayerProfile)
+	if len(entries) == 0 {
+		fmt.Printf("профиль «%s» пуст: скажите, как отвечать («пиши кратко», «без кода», «на ты»), или /profile set стиль=кратко\n", a.profileLabel())
+		return
+	}
+	hint := ""
+	if e := entries[0]; e.Key != "" {
+		hint = fmt.Sprintf(" · %s: %s", e.Key, config.Truncate(e.Value, 40))
+	}
+	fmt.Printf("профиль «%s»: %d %s%s\n", a.profileLabel(), len(entries), recordsWord(len(entries)), hint)
+	if a.profile == "" {
+		fmt.Println("  это общий профиль из прошлых задач: /profile — посмотреть, /profile clear — очистить, /profile use <имя> — другой")
+	}
 }
 
 // printProfile is the teaching view of day 12: the preferences that go into
@@ -158,6 +288,31 @@ func (a *app) profileLabel() string {
 		return "общий"
 	}
 	return a.profile
+}
+
+// isNo reads a negative answer in both languages: the confirmation defaults to
+// "yes", so only an explicit "no" throws the old profile away.
+func isNo(ans string) bool {
+	switch strings.ToLower(strings.TrimSpace(ans)) {
+	case "n", "no", "н", "нет", "не":
+		return true
+	}
+	return false
+}
+
+// recordsWord picks the Russian plural for "запись" after a count: 1 запись,
+// 2 записи, 5 записей.
+func recordsWord(n int) string {
+	if n%100 >= 11 && n%100 <= 14 {
+		return "записей"
+	}
+	switch n % 10 {
+	case 1:
+		return "запись"
+	case 2, 3, 4:
+		return "записи"
+	}
+	return "записей"
 }
 
 // validProfileName keeps a profile inside <data>/profiles: no separators and no

@@ -18,7 +18,7 @@ cp testdata/day12-profiles/кратко/profile.json "$root/profiles/кратк�
 { grep -v '^#' testdata/day12-stability.txt | sed '/^[[:space:]]*$/d'; echo '/exit'; } > "$root/script.txt"
 
 ./agent -data "$root" -session run -profile кратко \
-  -model "$model" -summary-model "$model" -no-reasoning -script "$root/script.txt" \
+  -model "$model" -summary-model "$model" -no-reasoning -skip-profile -script "$root/script.txt" \
   > "$root/run.log" 2>&1
 
 python3 scripts/check_profile.py --data "$data" --profiles кратко --stability

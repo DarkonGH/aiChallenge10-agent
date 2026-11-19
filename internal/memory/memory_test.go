@@ -314,3 +314,33 @@ func TestLoadProfileSwitchesFile(t *testing.T) {
 		t.Errorf("ProfileDir = %q, ожидался %q", s.ProfileDir(), brief)
 	}
 }
+
+// TestSaveEmptyProfileIsArray keeps a cleared profile readable: the file is
+// [] rather than null.
+func TestSaveEmptyProfileIsArray(t *testing.T) {
+	shared := t.TempDir()
+	s, err := Open(t.TempDir(), shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Apply(Update{Profile: []Entry{{Key: "имя", Value: "Дмитрий"}}})
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Clear(LayerProfile); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(shared, "profile.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(b)); got != "[]" {
+		t.Fatalf("пустой профиль записан как %q", got)
+	}
+	if entries, err := ReadProfile(filepath.Join(shared, "profile.json")); err != nil || len(entries) != 0 {
+		t.Fatalf("пустой профиль не читается: %v, %v", entries, err)
+	}
+}

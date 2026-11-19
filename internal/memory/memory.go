@@ -230,7 +230,13 @@ func (s *Store) Save() error {
 		if err := os.MkdirAll(s.sharedDir, 0o755); err != nil {
 			return err
 		}
-		if err := writeJSON(filepath.Join(s.sharedDir, "profile.json"), s.profile); err != nil {
+		// An emptied profile is an empty list, not null: the file is read by
+		// people and by /profile list, and "null" looks like a broken file.
+		profile := s.profile
+		if profile == nil {
+			profile = []Entry{}
+		}
+		if err := writeJSON(filepath.Join(s.sharedDir, "profile.json"), profile); err != nil {
 			return err
 		}
 	}

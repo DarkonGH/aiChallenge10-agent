@@ -39,6 +39,7 @@ type app struct {
 	window       int
 	noReasoning  bool
 	profile      string // active named profile; "" is the shared default
+	skipProfile  bool   // no onboarding dialogue at startup (scripts, runs)
 
 	hist  *history.History
 	agent *agent.Agent
@@ -276,6 +277,7 @@ func main() {
 	memoryReport := flag.String("memory-report", "", "показать слои памяти сессии и токены по слоям (офлайн)")
 	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
 	profileFlag := flag.String("profile", "", "профиль пользователя: имя каталога в <data>/profiles (пусто — общий <data>/shared)")
+	skipProfile := flag.Bool("skip-profile", false, "не спрашивать профиль при старте (сценарии и прогоны)")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -379,6 +381,7 @@ func main() {
 		strategy:     strategy,
 		window:       window,
 		profile:      *profileFlag,
+		skipProfile:  *skipProfile,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
@@ -460,8 +463,9 @@ func (a *app) repl() {
 		fmt.Printf("внимание: сессия сохранена с моделью %s, а LLM_MODEL=%s; переключить: /model %s\n",
 			a.hist.ChatModel(), envModel, envModel)
 	}
-
 	ed := readline.NewLineEditor(isTerminal(os.Stdin), filepath.Join(a.dataDir, "history"))
+	a.onboardProfile(ed)
+
 	for {
 		line, err := ed.Read("agent> ")
 		if err != nil {
