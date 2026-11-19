@@ -42,6 +42,7 @@ LLM_BASE_URL=http://localhost:11434/v1 OPENAI_API_KEY=ollama \
 ```
 main.go               CLI: флаги, REPL, команды, printContext, офлайн-ветки
 memory_cmd.go         /memory, -memory-report, -import-memory
+profile_cmd.go        /profile: именованные профили, переключение, правка
 internal/agent/       цикл агента: Chat, стриминг, вызовы инструментов
 internal/compact/     стратегии контекста (summary/window/facts) + экстрактор
                       памяти (memory_extract.go: memorySystemPrompt, ImportFacts)
@@ -53,12 +54,20 @@ internal/tools/       реестр инструментов: now, calc, find_rid
 internal/tokens/      оценка токенов и калибровка (EMA по факту ответа)
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI
-testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt)
+testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt,
+                      day12-*: профили, вопрос, устойчивость, демо, карточки)
 scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
                       cascade.sh — каскадная проверка памяти,
-                      check_memory.py — проверка ответов по журналу
+                      check_memory.py — проверка ответов по журналу,
+                      profile_experiment.sh / profile_stability.sh — матрица
+                      персонализации и десять вопросов подряд,
+                      check_profile.py — длина/код/обращение по журналу,
+                      day12-demo.sh — подготовка данных для демо дня 12,
+                      day12-onboard-demo.py — запись онбординга в pty
+                      (пустой профиль → диалог → правка в диалоге)
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
+PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
 ```
 
@@ -70,7 +79,7 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 |---|---|---|---|
 | short | `data/<сессия>/session.jsonl` | последние N сообщений (+конспект в summary) | `-window` |
 | working | `data/<сессия>/memory/working.json` | всегда | 12 |
-| profile | `data/shared/profile.json` (общий) | всегда | 8 |
+| profile | `data/shared/profile.json` или `data/profiles/<имя>/profile.json` (`-profile`) | всегда, последним блоком | 8 |
 | decisions | `data/<сессия>/memory/long.json` | всегда, с датой | 12 |
 | knowledge | `data/<сессия>/memory/long.json` | только релевантные вопросу, до 6 | 20 |
 
@@ -80,6 +89,28 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 она отправляла 34/34 факта в один слой. Импорт фактов дня 10
 (`-import-memory`) — тот же принцип: один вызов модели с тем же
 `memorySystemPrompt`, лимиты слоёв названы в промпте.
+
+## Персонализация (день 12)
+
+Профиль — не слой сессии, а отдельный файл на пользователя: `-profile <имя>`
+берёт `data/profiles/<имя>/profile.json`, без флага — прежний
+`data/shared/profile.json`. В системном промпте блок профиля идёт **последним**
+(`memory.promptOrder`): предпочтение — это инструкция, а не факт, и ближайший к
+диалогу блок должен быть ей.
+
+Предпочтения хранятся под стабильными ключами `стиль`, `формат`, `обращение`,
+`ограничения` — их заполняет тот же экстрактор, что раскладывает память:
+«пиши кратко», «без кода», «на ты» попадают в `profile`, случайный тон одной
+реплики — нет. Переключение (`/profile use`) ничего не перезаписывает; правка —
+`/profile set`, очистка — `/profile clear`. При интерактивном старте
+печатается активный профиль (`printProfileLine`): общий профиль из прошлой
+задачи не должен применяться молча. Если профиль пуст, `onboardProfile` задаёт
+три вопроса (обращение и роль, стиль и формат, ограничения) и отдаёт ответы
+тому же экстрактору — код ключи не придумывает. Существующий профиль сначала
+показывается с вопросом «использовать? [Y/n]»; «n» очищает его до интервью.
+`-skip-profile` отключает диалог для сценариев, замеров и записи видео; не-TTY
+stdin и `-script` не спрашивают и без флага. Проверки — `scripts/profile_*.sh`,
+цифры — в [PROFILE.md](PROFILE.md).
 
 ## Инварианты
 
@@ -104,12 +135,14 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 ## Команды чата и флаги (шпаргалка)
 
 `/help /exit /new /session /model /summary /strategy /facts /memory
-/memory clear <слой> /memory add <слой> ключ=значение /branch /system
-/tools /history /context /tokens /compact /recall`
+/memory clear <слой> /memory add <слой> ключ=значение
+/profile /profile list /profile use <имя> /profile set ключ=значение
+/profile clear /branch /system /tools /history /context /tokens /compact
+/recall`
 
 Флаги офлайна (без сети): `-print-session <id|last>`, `-memory-report
 <id|last>`, `-list-sessions`, `-list-models`, `-import-memory <сессия>
--session <новая>`.
+-session <новая>`. Профиль: `-profile <имя>`.
 
 ## Соглашения по коммитам и артефактам
 
@@ -126,5 +159,13 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
   -strategy window -window 2 -model glm-5.3-flash -summary-model glm-5.3-flash
   -no-reasoning -script testdata/day11-demo.txt" /tmp/day11-demo.cast`, затем
   `python3 scripts/render_cast.py --cast /tmp/day11-demo.cast --out video/…`.
+  День 12: `asciinema rec --overwrite -f asciicast-v2 --window-size 148x50
+  -c "scripts/day12-demo.sh /tmp/day12-video" /tmp/day12-demo.cast`, затем
+  `python3 scripts/render_cast.py --cast /tmp/day12-demo.cast --out
+  video/персонализация-день-12.mp4 --cards testdata/day12-cards.json`.
+  Онбординг-вариант: `python3 scripts/day12-onboard-demo.py /tmp/day12-onboard.cast`
+  (сам ведёт диалог в pty), затем `render_cast.py` с тем же `--cards`.
+  Карточки результатов по умолчанию — дня 11; новый день передаёт свой
+  `--cards` (JSON: `[{seconds, lines: [[текст, размер, accent|fg|dim, отступ]]}]`).
 - Прогоны сценариев лежат в `/tmp/day11*/` — в репозиторий попадают только
   сценарии (`testdata/`) и вывод, если он нужен отчёту.

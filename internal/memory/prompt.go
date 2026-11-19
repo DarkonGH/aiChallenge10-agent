@@ -17,7 +17,7 @@ const KnowledgeLimit = 6
 // report can attribute a block to its layer.
 const (
 	headerWorking   = "Рабочая память задачи:"
-	headerProfile   = "Профиль пользователя:"
+	headerProfile   = "Профиль пользователя (соблюдай в каждом ответе):"
 	headerDecisions = "Принятые решения:"
 	headerKnowledge = "Знания по теме вопроса:"
 )
@@ -66,11 +66,19 @@ func (s *Store) Block(l Layer, question string) string {
 	return Header(l) + "\n" + Render(entries)
 }
 
-// Prompt assembles the memory block for the system prompt: working, profile
-// and decisions always, knowledge only when it matches the question.
+// promptOrder is the order of the memory blocks in the system prompt. The
+// profile goes last on purpose: preferences are instructions, and the block
+// closest to the dialogue wins when a fact and a preference disagree. Storage
+// order (Layers) stays separate: the files and the /memory listing keep theirs.
+var promptOrder = []Layer{LayerWorking, LayerDecisions, LayerKnowledge, LayerProfile}
+
+// Prompt assembles the memory block for the system prompt: working, decisions
+// and profile always, knowledge only when it matches the question. The profile
+// closes the block, so the last thing the model reads before the dialogue is
+// how this user wants to be answered.
 func (s *Store) Prompt(question string) string {
 	var parts []string
-	for _, l := range Layers {
+	for _, l := range promptOrder {
 		if b := s.Block(l, question); b != "" {
 			parts = append(parts, b)
 		}
@@ -82,7 +90,7 @@ func (s *Store) Prompt(question string) string {
 // is what the question would actually pull in, not the whole layer.
 func (s *Store) LayerTokens(question string) map[Layer]int {
 	out := make(map[Layer]int, len(Layers))
-	for _, l := range Layers {
+	for _, l := range promptOrder {
 		out[l] = tokens.EstimateTokens(s.Block(l, question))
 	}
 	return out

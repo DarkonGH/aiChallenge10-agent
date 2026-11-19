@@ -83,7 +83,7 @@ func (a *app) printMemory() {
 		note := "всегда в промпте"
 		switch layer {
 		case memory.LayerProfile:
-			note = "всегда; общий профиль для всех сессий"
+			note = fmt.Sprintf("всегда; профиль «%s»", a.profileLabel())
 		case memory.LayerKnowledge:
 			note = fmt.Sprintf("в промпте %d из %d — только релевантные вопросу", len(memory.Relevant(entries, q, memory.KnowledgeLimit)), len(entries))
 		}
@@ -146,13 +146,13 @@ func parseLayer(s string) (memory.Layer, error) {
 
 // memoryReport is the offline view for a saved session: layers, token cost per
 // layer and the journal of memory events.
-func memoryReportCmd(dataDir, id string) error {
+func memoryReportCmd(dataDir, id, profileDir string) error {
 	h, err := history.OpenHistory(dataDir, id, "", "", "")
 	if err != nil {
 		return err
 	}
 	defer h.Close()
-	mem, err := memory.Open(filepath.Join(dataDir, h.ID(), "memory"), filepath.Join(dataDir, "shared"))
+	mem, err := memory.Open(filepath.Join(dataDir, h.ID(), "memory"), profileDir)
 	if err != nil {
 		return err
 	}
@@ -191,7 +191,7 @@ func memoryReportCmd(dataDir, id string) error {
 // carry no layer tags, and a keyword list only works for the vocabulary it was
 // written for — the real «подбор автомобиля» session sent all 34 facts to
 // working, and the cap then silently dropped 22 of them.
-func importMemoryCmd(ctx context.Context, client *llm.ChatClient, model, dataDir, srcID, dstID string) error {
+func importMemoryCmd(ctx context.Context, client *llm.ChatClient, model, dataDir, srcID, dstID, profileDir string) error {
 	if dstID == "" {
 		return fmt.Errorf("-import-memory переносит факты в сессию: укажите -session <id> (новая или существующая)")
 	}
@@ -214,7 +214,7 @@ func importMemoryCmd(ctx context.Context, client *llm.ChatClient, model, dataDir
 		return fmt.Errorf("импорт: модель вернула пустой ответ — память не тронута")
 	}
 
-	mem, err := memory.Open(filepath.Join(dataDir, dstID, "memory"), filepath.Join(dataDir, "shared"))
+	mem, err := memory.Open(filepath.Join(dataDir, dstID, "memory"), profileDir)
 	if err != nil {
 		return err
 	}
