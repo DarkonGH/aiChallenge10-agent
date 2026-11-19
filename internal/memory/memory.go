@@ -100,11 +100,12 @@ func (u Update) Layer(l Layer) []Entry {
 }
 
 // Store is the working + long-term memory of one session. Profile is shared by
-// all sessions of the agent (a person is the same person in every task), the
-// rest is scoped to the session directory.
+// all sessions of the agent (a person is the same person in every task, and a
+// named profile is one person or one test persona), the rest is scoped to the
+// session directory.
 type Store struct {
 	sessionDir string // <data>/<session>/memory
-	sharedDir  string // <data>/shared
+	sharedDir  string // <data>/shared or <data>/profiles/<name>
 
 	working   []Entry
 	profile   []Entry
@@ -136,6 +137,37 @@ func Open(sessionDir, sharedDir string) (*Store, error) {
 	return s, nil
 }
 
+// LoadProfile switches the shared profile to the one stored in dir and reloads
+// it. An empty dir disables the profile block. Nothing is written here: a
+// switch never modifies the profile that was active before, so /profile use is
+// safe to try and undo.
+func (s *Store) LoadProfile(dir string) error {
+	var profile []Entry
+	if dir != "" {
+		if err := readJSON(filepath.Join(dir, "profile.json"), &profile); err != nil {
+			return fmt.Errorf("память: profile.json: %w", err)
+		}
+	}
+	// A hand-edited profile may exceed the cap; trim on load like the others.
+	profile, _ = capEntries(profile, Caps[LayerProfile])
+	s.sharedDir = dir
+	s.profile = profile
+	return nil
+}
+
+// ProfileDir is the directory profile.json is read from and written to.
+func (s *Store) ProfileDir() string { return s.sharedDir }
+
+// ReadProfile loads a profile file without opening a store: the /profile list
+// view needs the record count of profiles that are not active right now.
+func ReadProfile(path string) ([]Entry, error) {
+	var entries []Entry
+	if err := readJSON(path, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 func (s *Store) load() error {
 	var working []Entry
 	if err := readJSON(filepath.Join(s.sessionDir, "working.json"), &working); err != nil {
@@ -150,13 +182,9 @@ func (s *Store) load() error {
 	s.decisions = long.Decisions
 	s.knowledge = long.Knowledge
 
-	var profile []Entry
-	if s.sharedDir != "" {
-		if err := readJSON(filepath.Join(s.sharedDir, "profile.json"), &profile); err != nil {
-			return fmt.Errorf("память: profile.json: %w", err)
-		}
+	if err := s.LoadProfile(s.sharedDir); err != nil {
+		return err
 	}
-	s.profile = profile
 
 	// A hand-edited file may exceed the caps; trim on load so the prompt is
 	// never larger than the declared budget.

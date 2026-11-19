@@ -38,6 +38,7 @@ type app struct {
 	strategy     compact.Strategy
 	window       int
 	noReasoning  bool
+	profile      string // active named profile; "" is the shared default
 
 	hist  *history.History
 	agent *agent.Agent
@@ -274,6 +275,7 @@ func main() {
 	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
 	memoryReport := flag.String("memory-report", "", "показать слои памяти сессии и токены по слоям (офлайн)")
 	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
+	profileFlag := flag.String("profile", "", "профиль пользователя: имя каталога в <data>/profiles (пусто — общий <data>/shared)")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -319,7 +321,7 @@ func main() {
 				fatalf("%v", err)
 			}
 		}
-		if err := memoryReportCmd(dataDir, id); err != nil {
+		if err := memoryReportCmd(dataDir, id, profileDirFor(dataDir, *profileFlag)); err != nil {
 			fatalf("%v", err)
 		}
 		return
@@ -336,7 +338,7 @@ func main() {
 		}
 		client := llm.NewChatClient()
 		client.SetMaxTokens(*maxTokens)
-		if err := importMemoryCmd(context.Background(), client, model, dataDir, *importMemory, *sessionFlag); err != nil {
+		if err := importMemoryCmd(context.Background(), client, model, dataDir, *importMemory, *sessionFlag, profileDirFor(dataDir, *profileFlag)); err != nil {
 			fatalf("%v", err)
 		}
 		return
@@ -376,6 +378,7 @@ func main() {
 		noReasoning:  *noReasoning,
 		strategy:     strategy,
 		window:       window,
+		profile:      *profileFlag,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
@@ -413,9 +416,9 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.hist = h
 	// Working and long-term memory live next to the session log but in their
 	// own files: readable JSON, one file per layer group. The profile is shared
-	// by every session of this data dir, so a future second agent sees the same
-	// user without any extra plumbing.
-	mem, err := memory.Open(filepath.Join(a.dataDir, h.ID(), "memory"), filepath.Join(a.dataDir, "shared"))
+	// by every session that uses the same profile name, so a second task sees
+	// the same user without any extra plumbing; -profile picks the file.
+	mem, err := memory.Open(filepath.Join(a.dataDir, h.ID(), "memory"), a.profileDir())
 	if err != nil {
 		return err
 	}
@@ -433,6 +436,18 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetWindow(a.window)
 	return nil
 }
+
+// profileDirFor maps a profile name to its directory: the day-11 shared
+// profile keeps its place, a named profile gets its own folder under profiles.
+func profileDirFor(dataDir, profile string) string {
+	if profile == "" {
+		return filepath.Join(dataDir, "shared")
+	}
+	return filepath.Join(dataDir, "profiles", profile)
+}
+
+// profileDir is profileDirFor for the running app.
+func (a *app) profileDir() string { return profileDirFor(a.dataDir, a.profile) }
 
 func (a *app) repl() {
 	mode := fmt.Sprintf(" · стратегия %s", a.strategy)
@@ -706,6 +721,9 @@ func (a *app) command(line string) (bool, error) {
 	case "/memory":
 		return false, a.memoryCommand(arg)
 
+	case "/profile":
+		return false, a.profileCommand(arg)
+
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
@@ -917,7 +935,10 @@ func (a *app) printContext() {
 				continue
 			}
 			note := "всегда"
-			if l == memory.LayerKnowledge {
+			switch l {
+			case memory.LayerProfile:
+				note = fmt.Sprintf("всегда, профиль «%s»", a.profileLabel())
+			case memory.LayerKnowledge:
 				note = fmt.Sprintf("%d из %d по вопросу", selectedKnowledge(a.mem, a.lastUserText()), n)
 			}
 			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
@@ -1110,6 +1131,10 @@ const helpText = `Команды:
                    слои памяти: рабочая, профиль, решения, знания; без
                    аргумента — что в каждом слое и сколько токенов он добавляет
                    к запросу; clear — очистить слой; add — добавить запись
+  /profile [list | use <имя> | set ключ=значение | clear]
+                   профиль пользователя: стиль, формат, обращение, ограничения;
+                   уходит в каждый запрос последним блоком и пополняется из
+                   диалога сам; list — какие есть, use — переключить
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

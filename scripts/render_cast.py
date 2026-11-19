@@ -191,6 +191,27 @@ def card_frames(seconds, fps=8):
     return int(seconds * fps)
 
 
+CARD_COLORS = {"accent": ACCENT, "fg": FG, "dim": DIM}
+
+
+def load_cards(path):
+    """Читает карточки результатов: [{seconds, lines: [[text, size, color, gap]]}].
+
+    Цвета — имена accent/fg/dim. Встроенные карточки дня 11 остаются по
+    умолчанию: пересборка старого видео не зависит от внешнего файла, а новый
+    день передаёт свой --cards.
+    """
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    out = []
+    for c in raw:
+        lines = []
+        for text, size, color, gap in c["lines"]:
+            lines.append((text, int(size), CARD_COLORS[color], int(gap)))
+        out.append((float(c.get("seconds", 6)), lines))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cast", required=True)
@@ -200,6 +221,7 @@ def main():
     ap.add_argument("--subtitle",
                     default="слои, которые попадают в промпт по разным правилам")
     ap.add_argument("--no-cards", action="store_true")
+    ap.add_argument("--cards", default="", help="JSON с карточками результатов вместо стандартных дня 11")
     args = ap.parse_args()
 
     header, snaps = snapshots(args.cast)
@@ -242,30 +264,36 @@ def main():
             emit(cur)
 
     if not args.no_cards:
-        abl = card([
-            ("Проверка: 8 вопросов в каждом состоянии памяти", 26, ACCENT, 26),
-            ("всё на месте            8/8", 22, FG, 10),
-            ("без knowledge           6/8", 22, FG, 10),
-            ("без decisions           6/8", 22, FG, 10),
-            ("без working             8/8", 22, FG, 10),
-            ("без short               8/8", 22, FG, 10),
-            ("", 10, FG, 0),
-            ("вопросы, которые ломаются, — про адрес и про решение", 18, DIM, 0),
-        ], size=(width, height))
-        for _ in range(card_frames(6, fps)):
-            emit(abl)
-        tok = card([
-            ("Что уходит в модель: ~3208 из 6000 токенов", 26, ACCENT, 26),
-            ("short (окно + конспект)    ~2681", 22, FG, 10),
-            ("tools                       ~388", 22, FG, 10),
-            ("system                      ~256", 22, FG, 10),
-            ("working                     ~180", 22, FG, 10),
-            ("decisions                    ~47", 22, FG, 10),
-            ("profile                      ~43", 22, FG, 10),
-            ("knowledge                    ~26   ← только релевантные вопросу", 22, FG, 0),
-        ], size=(width, height))
-        for _ in range(card_frames(6, fps)):
-            emit(tok)
+        if args.cards:
+            for seconds, lines in load_cards(args.cards):
+                c = card(lines, size=(width, height))
+                for _ in range(card_frames(seconds, fps)):
+                    emit(c)
+        else:
+            abl = card([
+                ("Проверка: 8 вопросов в каждом состоянии памяти", 26, ACCENT, 26),
+                ("всё на месте            8/8", 22, FG, 10),
+                ("без knowledge           6/8", 22, FG, 10),
+                ("без decisions           6/8", 22, FG, 10),
+                ("без working             8/8", 22, FG, 10),
+                ("без short               8/8", 22, FG, 10),
+                ("", 10, FG, 0),
+                ("вопросы, которые ломаются, — про адрес и про решение", 18, DIM, 0),
+            ], size=(width, height))
+            for _ in range(card_frames(6, fps)):
+                emit(abl)
+            tok = card([
+                ("Что уходит в модель: ~3208 из 6000 токенов", 26, ACCENT, 26),
+                ("short (окно + конспект)    ~2681", 22, FG, 10),
+                ("tools                       ~388", 22, FG, 10),
+                ("system                      ~256", 22, FG, 10),
+                ("working                     ~180", 22, FG, 10),
+                ("decisions                    ~47", 22, FG, 10),
+                ("profile                      ~43", 22, FG, 10),
+                ("knowledge                    ~26   ← только релевантные вопросу", 22, FG, 0),
+            ], size=(width, height))
+            for _ in range(card_frames(6, fps)):
+                emit(tok)
 
     proc.stdin.close()
     proc.wait()

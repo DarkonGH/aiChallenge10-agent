@@ -115,7 +115,7 @@ func TestPromptOrderAndKnowledgeFilter(t *testing.T) {
 	})
 
 	block := s.Prompt("какой адрес у коворкинга?")
-	for _, want := range []string{"Рабочая память задачи:", "срок", "Профиль пользователя:", "Принятые решения:", "2026-11-17 · площадка", "Знания по теме вопроса:", "адрес"} {
+	for _, want := range []string{"Рабочая память задачи:", "срок", "Профиль пользователя (соблюдай", "Принятые решения:", "2026-11-17 · площадка", "Знания по теме вопроса:", "адрес"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("в блоке нет %q:\n%s", want, block)
 		}
@@ -124,13 +124,14 @@ func TestPromptOrderAndKnowledgeFilter(t *testing.T) {
 		t.Errorf("нерелевантное знание попало в промпт:\n%s", block)
 	}
 
-	// Order: working → profile → decisions → knowledge.
+	// Order: working → decisions → knowledge → profile. The profile closes the
+	// block, so the preferences are the last thing before the dialogue.
 	iWork := strings.Index(block, "Рабочая память")
-	iProf := strings.Index(block, "Профиль пользователя")
 	iDec := strings.Index(block, "Принятые решения")
 	iKnow := strings.Index(block, "Знания по теме")
-	if !(iWork < iProf && iProf < iDec && iDec < iKnow) {
-		t.Errorf("порядок слоёв нарушен: %d %d %d %d", iWork, iProf, iDec, iKnow)
+	iProf := strings.Index(block, "Профиль пользователя")
+	if !(iWork < iDec && iDec < iKnow && iKnow < iProf) {
+		t.Errorf("порядок слоёв нарушен: %d %d %d %d", iWork, iDec, iKnow, iProf)
 	}
 
 	tok := s.LayerTokens("какой адрес у коворкинга?")
@@ -263,5 +264,53 @@ func TestRelevantMatchesInflectedWord(t *testing.T) {
 	}
 	if got := Relevant(entries, "Какие штрафы за просрочку оплаты?", KnowledgeLimit); len(got) != 1 || got[0].Key != "штрафы_договор" {
 		t.Fatalf("запись про штрафы не выбрана: %+v", got)
+	}
+}
+
+// TestLoadProfileSwitchesFile is the /profile use contract: switching reloads
+// the other profile and leaves the previous file exactly as it was.
+func TestLoadProfileSwitchesFile(t *testing.T) {
+	dir := t.TempDir()
+	brief := filepath.Join(dir, "profiles", "кратко")
+	detailed := filepath.Join(dir, "profiles", "подробно")
+
+	s, err := Open(filepath.Join(dir, "s", "memory"), brief)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	s.Add(LayerProfile, "стиль", "кратко")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := s.LoadProfile(detailed); err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if n := s.Len(LayerProfile); n != 0 {
+		t.Fatalf("в новом профиле %d записей, ожидалось 0", n)
+	}
+	s.Add(LayerProfile, "стиль", "подробно")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// The first profile must not have been overwritten by the second.
+	got, err := ReadProfile(filepath.Join(brief, "profile.json"))
+	if err != nil {
+		t.Fatalf("ReadProfile: %v", err)
+	}
+	if len(got) != 1 || got[0].Value != "кратко" {
+		t.Fatalf("профиль «кратко» изменён: %+v", got)
+	}
+
+	// Switching back restores it.
+	if err := s.LoadProfile(brief); err != nil {
+		t.Fatalf("LoadProfile назад: %v", err)
+	}
+	if got := s.Section(LayerProfile); len(got) != 1 || got[0].Value != "кратко" {
+		t.Fatalf("возврат к профилю не сработал: %+v", got)
+	}
+	if s.ProfileDir() != brief {
+		t.Errorf("ProfileDir = %q, ожидался %q", s.ProfileDir(), brief)
 	}
 }

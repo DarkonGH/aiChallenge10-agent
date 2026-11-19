@@ -173,6 +173,19 @@ func TestSystemPromptTellsToUpdateExistingKey(t *testing.T) {
 	}
 }
 
+// TestSystemPromptKeepsPreferences pins the day-12 rule: stable preferences are
+// profile records under fixed keys, and a passing tone is not a preference.
+func TestSystemPromptKeepsPreferences(t *testing.T) {
+	for _, want := range []string{"стиль", "формат", "обращение", "устойчивое предпочтение"} {
+		if !strings.Contains(memorySystemPrompt, want) {
+			t.Errorf("в системном промпте нет %q", want)
+		}
+	}
+	if !strings.Contains(memorySystemPrompt, "случайный тон одной реплики") {
+		t.Error("промпт не отличает предпочтение от случайного тона")
+	}
+}
+
 // TestParseMemoryJSONRemoval checks the null contract: a null value deletes the
 // record, so one diff can move a fact from working to decisions.
 func TestParseMemoryJSONRemoval(t *testing.T) {
