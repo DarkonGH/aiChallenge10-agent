@@ -19,7 +19,7 @@ type Model struct {
 // ModelSet is the roster inherited from task1-05. The same provider serves all
 // three ids, so switching models mid-session needs no extra configuration.
 var ModelSet = []Model{
-	{ID: "deepseek-v4.1-flash", Tier: "маленькая", RatePerM: 0.311270},
+	{ID: "deepseek-v4-flash", Tier: "маленькая", RatePerM: 0.311270},
 	{ID: "glm-5.3-flash", Tier: "средняя", RatePerM: 0.788471},
 	{ID: "qwen3.8-27b", Tier: "флагман", RatePerM: 0.303003},
 }

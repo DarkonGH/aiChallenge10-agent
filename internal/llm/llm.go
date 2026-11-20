@@ -183,7 +183,7 @@ func NewChatClientAt(baseURL, apiKey string) *ChatClient {
 	return &ChatClient{
 		baseURL:   baseURL,
 		apiKey:    apiKey,
-		http:      &http.Client{Timeout: 180 * time.Second},
+		http:      &http.Client{Timeout: 300 * time.Second},
 		maxTokens: 4096,
 		stats:     ClientStats{ByModel: map[string]int{}},
 	}
@@ -253,6 +253,12 @@ func (c *ChatClient) emptyAnswerErr(model, finish, reasoning string) error {
 	return fmt.Errorf("%s: пустой ответ модели (finish_reason=%q)", model, finish)
 }
 
+// rateLimitWait is the first pause before retrying a 429. The provider limits
+// requests per sliding window (60 s in practice), so a one-second retry is
+// useless: the next attempt must wait out the window. Later attempts multiply
+// the pause, which lets a burst of calls settle instead of failing the turn.
+const rateLimitWait = 30 * time.Second
+
 // Chat sends one request, retrying transient failures (429/5xx) up to 3 times.
 func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message, tools []ToolSchema, temperature float64) (*ChatResponse, error) {
 	wire := make([]wireMessage, len(messages))
@@ -276,12 +282,18 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 
 	start := time.Now()
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	rateLimited := false
+	const attempts = 4
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
+			wait := time.Duration(attempt) * time.Second
+			if rateLimited {
+				wait = time.Duration(attempt) * rateLimitWait
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(wait):
 			}
 		}
 
@@ -290,10 +302,12 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			rateLimited = false
 			lastErr = err
 			continue
 		}
 		if status == http.StatusTooManyRequests || status >= 500 {
+			rateLimited = status == http.StatusTooManyRequests
 			lastErr = fmt.Errorf("%s: status %d: %s", model, status, config.Truncate(string(data), 500))
 			continue
 		}
@@ -342,6 +356,7 @@ type streamFail int
 const (
 	failRetry    streamFail = iota // transient — retry the streaming request
 	failFallback                   // endpoint likely cannot stream — repeat without stream
+	failRate                       // 429 — retry after the provider's rate window
 	failStop                       // give up: error is final or text is already on screen
 )
 
@@ -376,13 +391,19 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 
 	start := time.Now()
 	fallback := false
+	rateLimited := false
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	const attempts = 4
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
+			wait := time.Duration(attempt-1) * time.Second
+			if rateLimited {
+				wait = time.Duration(attempt-1) * rateLimitWait
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt-1) * time.Second):
+			case <-time.After(wait):
 			}
 		}
 		resp, emitted, fail, err := c.streamOnce(ctx, model, payload, onDelta, onReason)
@@ -402,12 +423,13 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 			fallback = true
 			break
 		}
+		rateLimited = fail == failRate
 		lastErr = err
 	}
 	if fallback {
 		return c.Chat(ctx, model, messages, tools, temperature)
 	}
-	return nil, fmt.Errorf("%s: запрос не удался после 3 попыток: %w", model, lastErr)
+	return nil, fmt.Errorf("%s: запрос не удался после %d попыток: %w", model, attempts, lastErr)
 }
 
 // sendStream performs one HTTP round-trip and returns the open response body
@@ -433,7 +455,11 @@ func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byt
 	}
 	defer httpResp.Body.Close()
 
-	if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
+	if httpResp.StatusCode == http.StatusTooManyRequests {
+		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
+		return nil, false, failRate, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 500))
+	}
+	if httpResp.StatusCode >= 500 {
 		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, false, failRetry, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 500))
 	}

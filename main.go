@@ -39,8 +39,9 @@ type app struct {
 	strategy     compact.Strategy
 	window       int
 	noReasoning  bool
-	profile      string // active named profile; "" is the shared default
-	skipProfile  bool   // no onboarding dialogue at startup (scripts, runs)
+	profile      string        // active named profile; "" is the shared default
+	skipProfile  bool          // no onboarding dialogue at startup (scripts, runs)
+	scriptDelay  time.Duration // pause between dialogue turns in -script (rate limits)
 
 	hist  *history.History
 	agent *agent.Agent
@@ -253,7 +254,7 @@ func (u *ui) trace(s string) {
 }
 
 func main() {
-	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или deepseek-v4.1-flash)")
+	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или deepseek-v4-flash)")
 	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или самая дешёвая в списке)")
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
@@ -280,6 +281,7 @@ func main() {
 	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
 	profileFlag := flag.String("profile", "", "профиль пользователя: имя каталога в <data>/profiles (пусто — общий <data>/shared)")
 	skipProfile := flag.Bool("skip-profile", false, "не спрашивать профиль при старте (сценарии и прогоны)")
+	scriptDelay := flag.Duration("script-delay", 0, "пауза между репликами в -script (для лимитов провайдера, например 30s)")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -384,6 +386,7 @@ func main() {
 		window:       window,
 		profile:      *profileFlag,
 		skipProfile:  *skipProfile,
+		scriptDelay:  *scriptDelay,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 	// The task machine is per-session, so the registry holds a provider, not
@@ -1053,6 +1056,7 @@ func (a *app) runScript(path string) error {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sawTurn := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1072,6 +1076,14 @@ func (a *app) runScript(path string) error {
 			}
 			continue
 		}
+		// The provider limits requests per sliding window (a 60 s quota in
+		// practice), and every turn costs two calls: the answer and the memory
+		// extractor. Without a pause the second turn already gets 429, so the
+		// script waits between turns instead of burning retries.
+		if a.scriptDelay > 0 && sawTurn {
+			time.Sleep(a.scriptDelay)
+		}
+		sawTurn = true
 		a.ask(line)
 	}
 	return sc.Err()

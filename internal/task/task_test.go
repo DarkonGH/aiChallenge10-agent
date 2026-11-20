@@ -234,7 +234,7 @@ func TestBlock(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	b := m.Block()
-	for _, want := range []string{"planning", "шаг", "ждём", "task_transition", "execution"} {
+	for _, want := range []string{"planning", "шаг", "ждём", "task_transition", "execution", "правило проверки", "не переходи"} {
 		if !strings.Contains(b, want) {
 			t.Errorf("в блоке нет %q:\n%s", want, b)
 		}

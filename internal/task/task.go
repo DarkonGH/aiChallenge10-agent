@@ -250,10 +250,21 @@ func (m *Machine) Block() string {
 		fmt.Fprintf(&b, "- ожидаемое действие: %s\n", m.state.Expected)
 	}
 	fmt.Fprintf(&b, "- план утверждён: %s\n", yesNo(m.state.Approved))
+	// Статус паузы печатается всегда: после /task resume модель должна видеть
+	// явное «нет», а не тащить из своего прошлого ответа устаревшую причину
+	// «пауза активна» и отказываться от перехода.
 	if m.state.Paused {
 		b.WriteString("- пауза: да (переходы запрещены до /task resume от пользователя)\n")
+	} else {
+		b.WriteString("- пауза: нет\n")
 	}
 	fmt.Fprintf(&b, "- допустимые переходы: %s\n", orNone(m.Next()))
+	// The check gate the code cannot verify: whether the work of the stage was
+	// actually done. The rule is explicit so the model does not rubber-stamp a
+	// transition the user asked for while the data is still missing.
+	b.WriteString("- правило проверки: в validation переходи только когда результаты шага зафиксированы " +
+		"в ответе (что сделано, с какими данными и числами); если данных не хватает — не переходи, " +
+		"перечисли, чего не хватает, и дождись ответа пользователя\n")
 	return strings.TrimRight(b.String(), "\n")
 }
 
