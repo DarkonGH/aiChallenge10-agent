@@ -13,9 +13,24 @@
 
 import json
 import sys
+import textwrap
 import time
 
 WIDTH, HEIGHT = 148, 50
+# Терминал переносит строки на границе колонок; если не обернуть текст заранее,
+# длинная строка рвётся посреди слова и в видео получаются «хаотичные переносы».
+COLS = WIDTH - 2  # оставляем запас справа, чтобы слово не упиралось в край
+
+
+def wrap_text(text, width=COLS):
+    """Переносит каждую строку по словам, сохраняя абзацы и списки."""
+    out = []
+    for line in text.split("\n"):
+        if line == "":
+            out.append("")
+        else:
+            out.extend(textwrap.wrap(line, width=width))
+    return "\n".join(out)
 
 
 def render_memory(mem):
@@ -44,15 +59,16 @@ def convert(in_path, out_path):
             role = m.get("role")
             if role == "tool":
                 name = m.get("name", "инструмент")
-                text = (m.get("content") or "").strip()
+                prefix = f"  [инструмент {name}] "
+                text = wrap_text((m.get("content") or "").strip(), COLS - len(prefix))
                 events.append(("tool", name, text))
             elif role == "user":
-                text = (m.get("content") or "").strip()
+                text = wrap_text((m.get("content") or "").strip(), COLS - len("agent> "))
                 events.append(("user", "", text))
             elif role == "assistant":
                 if m.get("tool_calls") or not (m.get("content") or "").strip():
                     continue
-                events.append(("assistant", "", m["content"].strip()))
+                events.append(("assistant", "", wrap_text(m["content"].strip())))
         elif typ == "memory":
             text = render_memory(ev.get("memory", {}))
             if text:

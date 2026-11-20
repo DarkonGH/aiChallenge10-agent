@@ -120,7 +120,7 @@ python3 scripts/render_cast.py --cast /tmp/day13-demo.cast \
 python3 scripts/check_task.py /tmp/day13-run-ok/demo
 ```
 
-Видео: 59 с, 1352x970, 8 fps, без аудио. Каст собирается детерминированно
+Видео: 61 с, 1352x970, 8 fps, без аудио. Каст собирается детерминированно
 скриптом `scripts/run_to_cast.py` из лога удачного прогона — живые записи
 на `deepseek-v4-flash` нестабильны (модель иногда не доводит сценарий до
 `done`). Карточки — `testdata/day13-cards.json`.
