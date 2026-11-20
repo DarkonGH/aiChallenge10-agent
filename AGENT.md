@@ -50,12 +50,16 @@ internal/memory/      модель памяти: Store, слои, Relevant, ре
 internal/history/     event-sourced session.jsonl: события message/compact/
                       evict/facts/memory/fork, реплей при загрузке
 internal/llm/         HTTP-клиент OpenAI-совместимого API, SSE-стрим, reasoning
-internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt)
+internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt),
+                      task_transition — запрос перехода задачи (день 13)
+internal/task/        конечный автомат задачи: этапы, таблица переходов,
+                      гейты плана и паузы, task.json сессии
 internal/tokens/      оценка токенов и калибровка (EMA по факту ответа)
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt,
-                      day12-*: профили, вопрос, устойчивость, демо, карточки)
+                      day12-*: профили, вопрос, устойчивость, демо, карточки,
+                      day13-*: сценарий и карточки автомата задачи)
 scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
                       cascade.sh — каскадная проверка памяти,
                       check_memory.py — проверка ответов по журналу,
@@ -64,10 +68,13 @@ scripts/              render_cast.py — сборка демо-видео из a
                       check_profile.py — длина/код/обращение по журналу,
                       day12-demo.sh — подготовка данных для демо дня 12,
                       day12-onboard-demo.py — запись онбординга в pty
-                      (пустой профиль → диалог → правка в диалоге)
+                      (пустой профиль → диалог → правка в диалоге),
+                      day13-demo.sh — подготовка данных для демо дня 13,
+                      check_task.py — автомат задачи по журналу и task.json
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
+TASK.md               отчёт дня 13: конечный автомат задачи, гейты, пауза
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
 ```
 

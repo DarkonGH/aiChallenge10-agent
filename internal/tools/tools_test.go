@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"strings"
 	"testing"
 )
@@ -80,11 +81,32 @@ func TestRegistryExecute(t *testing.T) {
 
 func TestToolSchemas(t *testing.T) {
 	r := NewToolRegistry(nil)
-	schemas := r.Schemas()
-	if len(schemas) != 3 {
-		t.Fatalf("got %d schemas, want 3", len(schemas))
+	// task_transition is lazy: without a started task its schema is not
+	// offered, so a plain chat pays tokens only for the three base tools.
+	if got := len(r.Schemas()); got != 3 {
+		t.Fatalf("got %d schemas without a task, want 3", got)
 	}
+	// Once a task is started the schema joins the request.
+	var machine *task.Machine
+	r.SetTaskProvider(func() *task.Machine { return machine })
+	var err error
+	machine, err = task.Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(r.Schemas()); got != 3 {
+		t.Fatalf("got %d schemas with an unloaded task, want 3", got)
+	}
+	if err := machine.Start("проверка", "схема видна", "test"); err != nil {
+		t.Fatal(err)
+	}
+	schemas := r.Schemas()
+	if len(schemas) != 4 {
+		t.Fatalf("got %d schemas with a started task, want 4", len(schemas))
+	}
+	names := map[string]bool{}
 	for _, s := range schemas {
+		names[s.Function.Name] = true
 		if s.Type != "function" || s.Function.Name == "" {
 			t.Errorf("bad schema: %+v", s)
 		}
@@ -95,5 +117,67 @@ func TestToolSchemas(t *testing.T) {
 		if !json.Valid(b) {
 			t.Errorf("invalid parameters JSON: %s", b)
 		}
+	}
+	if !names["task_transition"] {
+		t.Errorf("started task must expose task_transition, got %v", names)
+	}
+}
+
+// TestTaskTransitionTool checks the day-13 tool through Execute: a legal
+// transition applies, a forbidden one comes back as an error text and the
+// state stays untouched, the plan gate rejects implementation without the
+// user's approval, and without a machine the tool asks for /task start.
+func TestTaskTransitionTool(t *testing.T) {
+	r := NewToolRegistry(nil)
+
+	// No machine attached: actionable error, not a crash.
+	out := r.Execute(call("task_transition", `{"to":"execution"}`))
+	if !strings.Contains(out, "/task start") {
+		t.Errorf("без автомата: %q", out)
+	}
+
+	var machine *task.Machine
+	r.SetTaskProvider(func() *task.Machine { return machine })
+
+	var err error
+	machine, err = task.Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := machine.Start("сбор требований", "план", "user"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Forbidden jump: planning → done.
+	out = r.Execute(call("task_transition", `{"to":"done"}`))
+	if !strings.Contains(out, "запрещён") {
+		t.Errorf("planning → done должен быть отклонён: %q", out)
+	}
+	if machine.State().Stage != task.StagePlanning {
+		t.Fatalf("этап изменился при запрещённом переходе: %s", machine.State().Stage)
+	}
+
+	// The gate: no implementation before an approved plan.
+	out = r.Execute(call("task_transition", `{"to":"execution","step":"писать код"}`))
+	if !strings.Contains(out, "план не утверждён") {
+		t.Errorf("гейт плана не сработал: %q", out)
+	}
+
+	// After the user approves, the same request applies.
+	if err := machine.Approve(); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	out = r.Execute(call("task_transition", `{"to":"execution","step":"писать код","expected":"коммит"}`))
+	if !strings.Contains(out, "переход применён: planning → execution") {
+		t.Errorf("легальный переход отклонён: %q", out)
+	}
+	if machine.State().Stage != task.StageExecution || machine.State().Step != "писать код" {
+		t.Fatalf("состояние после перехода: %+v", machine.State())
+	}
+
+	// Unknown stage names are rejected with the list of valid ones.
+	out = r.Execute(call("task_transition", `{"to":"deploy"}`))
+	if !strings.Contains(out, "неизвестный этап") || !strings.Contains(out, "validation") {
+		t.Errorf("неизвестный этап: %q", out)
 	}
 }

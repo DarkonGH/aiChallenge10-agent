@@ -7,6 +7,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"strings"
 	"time"
@@ -51,6 +52,10 @@ type Compactor struct {
 	// current turn — it decides which knowledge records enter the prompt.
 	mem      *memory.Store
 	question string
+
+	// task is the day-13 task machine provider; its state block joins the
+	// system prompt after the memory layers.
+	task func() *task.Machine
 }
 
 // SetCompactEvery enables the message-count trigger: the history is compacted
@@ -69,6 +74,11 @@ func (c *Compactor) SetWindow(n int) { c.window = n }
 
 // SetMemory attaches the explicit memory model. Nil disables the memory block.
 func (c *Compactor) SetMemory(m *memory.Store) { c.mem = m }
+
+// SetTask attaches the day-13 task machine provider. The provider (not a
+// pointer) is deliberate: /new and /session swap the machine per session. Nil
+// provider or no started task removes the block from the prompt.
+func (c *Compactor) SetTask(p func() *task.Machine) { c.task = p }
 
 // SetQuestion records the user text of the current turn. Knowledge records are
 // filtered by relevance to it, so the prompt must be built after this call.
@@ -135,11 +145,19 @@ func (c *Compactor) PromptTokens(system string) int {
 
 // promptSystem assembles the system prompt with the strategy's memory block:
 // the rolling summary for the summary strategy, the sticky facts for the
-// facts strategy, nothing extra for the bare window.
+// facts strategy, nothing extra for the bare window. The day-13 task state
+// block goes last, after the memory layers.
 func (c *Compactor) PromptSystem(system string) string {
 	base := c.shortBlock(system)
 	if block := c.MemoryBlock(); block != "" {
-		return base + "\n\n" + block
+		base = base + "\n\n" + block
+	}
+	if c.task != nil {
+		if m := c.task(); m != nil {
+			if block := m.Block(); block != "" {
+				base = base + "\n\n" + block
+			}
+		}
 	}
 	return base
 }

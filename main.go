@@ -13,6 +13,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"os"
@@ -44,6 +45,7 @@ type app struct {
 	hist  *history.History
 	agent *agent.Agent
 	mem   *memory.Store
+	task  *task.Machine // day-13 task state machine of the current session
 	ui    *ui
 }
 
@@ -384,6 +386,9 @@ func main() {
 		skipProfile:  *skipProfile,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
+	// The task machine is per-session, so the registry holds a provider, not
+	// a pointer: the task_transition tool always acts on the current session.
+	a.tools.SetTaskProvider(func() *task.Machine { return a.task })
 
 	sessionID := *sessionFlag
 	if *continueFlag {
@@ -426,8 +431,18 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 		return err
 	}
 	a.mem = mem
+	// The task state machine (day 13) lives next to the session log:
+	// task.json in the session directory. Providers are closures over the app,
+	// so /new and /session swap the machine and the tool and the prompt block
+	// follow automatically.
+	tsk, err := task.Load(filepath.Join(a.dataDir, h.ID()))
+	if err != nil {
+		return err
+	}
+	a.task = tsk
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetMemory(mem)
+	a.agent.SetTask(func() *task.Machine { return a.task })
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	if !a.noReasoning {
@@ -728,6 +743,9 @@ func (a *app) command(line string) (bool, error) {
 	case "/profile":
 		return false, a.profileCommand(arg)
 
+	case "/task":
+		return false, a.taskCommand(arg)
+
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
@@ -948,6 +966,9 @@ func (a *app) printContext() {
 			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
 		}
 	}
+	if stage, tok := a.taskBlockInfo(); stage != "" {
+		fmt.Printf("  задача               ~%4d ток.  этап %s, всегда\n", tok, stage)
+	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
 			histTok, len(promptMsgs), promptMsgs[0].Seq, promptMsgs[len(promptMsgs)-1].Seq)
@@ -1139,6 +1160,10 @@ const helpText = `Команды:
                    профиль пользователя: стиль, формат, обращение, ограничения;
                    уходит в каждый запрос последним блоком и пополняется из
                    диалога сам; list — какие есть, use — переключить
+  /task [start | approve | pause | resume | state <этап> | reset]
+                   состояние задачи (день 13): конечный автомат planning →
+                   execution → validation → done; переходы ассистента
+                   проверяет код, approve/pause/resume — только здесь
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

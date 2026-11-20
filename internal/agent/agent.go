@@ -8,6 +8,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"strings"
@@ -108,6 +109,10 @@ func (a *Agent) SetMemory(m *memory.Store) {
 	a.mem = m
 	a.Comp.SetMemory(m)
 }
+
+// SetTask attaches the day-13 task machine provider: the state block joins the
+// system prompt after the memory layers.
+func (a *Agent) SetTask(p func() *task.Machine) { a.Comp.SetTask(p) }
 
 // Memory returns the attached memory model (nil when memory is off).
 func (a *Agent) Memory() *memory.Store { return a.mem }
