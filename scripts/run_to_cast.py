@@ -119,6 +119,15 @@ def convert(in_path, out_path, commands_path=""):
             if text:
                 events.append(("memory", "", text))
 
+    # Команды без якоря-реплики (например, финальный /task) добавляются в
+    # конец: в session.jsonl для них нет user-сообщения, к которому их можно
+    # привязать.
+    for c in [x for x in pending if x.get("after_last")]:
+        events.append(("command", "", plain_text(c.get("command", ""))))
+        for out_line in c.get("output", []):
+            events.append(("command_out", "", plain_text(out_line)))
+        pending.remove(c)
+
     chat = header.get("chat_model") or "модель"
     summary = header.get("summary_model") or chat
     banner = (f"сессия demo · модель {chat} · сжатие и проверка {summary}\n"
