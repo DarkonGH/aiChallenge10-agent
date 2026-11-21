@@ -129,13 +129,53 @@ func TestDecisionsStripDateFromExtractorKey(t *testing.T) {
 	}
 }
 
+// TestRemoveDecisionsWithDateKey: removals come from the same extractor as
+// additions, so the date prefix must be stripped there too. Otherwise a
+// decision that Render shows as "2026-11-21 · итог" cannot be deleted.
+func TestRemoveDecisionsWithDateKey(t *testing.T) {
+	s := openTemp(t)
+	s.Apply(Update{Decisions: []Entry{{Key: "итог", Value: "коворкинг"}}})
+
+	changes := s.Apply(Update{Remove: map[Layer][]string{
+		LayerDecisions: {"2026-11-21 · итог"},
+	}})
+	if len(changes) != 1 || changes[0].Kind != "remove" || changes[0].Old != "коворкинг" {
+		t.Fatalf("журнал удаления: %+v", changes)
+	}
+	if got := s.Section(LayerDecisions); len(got) != 0 {
+		t.Fatalf("решение с датой в ключе не удалено: %+v", got)
+	}
+}
+
+// TestOlderWriteSubsecond keeps two writes to the same key inside one second
+// ordered: Now uses RFC3339Nano, and olderWrite must parse the fraction.
+func TestOlderWriteSubsecond(t *testing.T) {
+	early := "2026-11-21T21:35:15.100+03:00"
+	late := "2026-11-21T21:35:15.900+03:00"
+	if !olderWrite(early, late) {
+		t.Errorf("olderWrite(%q, %q) = false, ожидалось true", early, late)
+	}
+	if olderWrite(late, early) {
+		t.Errorf("olderWrite(%q, %q) = true, ожидалось false", late, early)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, Now()); err != nil {
+		t.Errorf("Now() не RFC3339Nano: %v", err)
+	}
+}
+
 // TestDescribeChanges is the text used by traces and -print-session.
 func TestDescribeChanges(t *testing.T) {
 	got := DescribeChanges([]Change{
 		{Layer: LayerWorking, Key: "срок", Kind: "update", Old: "15 декабря", New: "20 декабря"},
 		{Layer: LayerWorking, Key: "статус", Kind: "stale", Old: "согласован", New: "отменён"},
+		{Layer: LayerWorking, Key: "адрес", Kind: "evict", Old: "Пулковское шоссе 15"},
 	})
-	for _, want := range []string{"15 декабря → 20 декабря", "устаревшее значение"} {
+	for _, want := range []string{
+		"15 декабря → 20 декабря",
+		"устаревшее значение",
+		"вытеснено лимитом",
+		"Пулковское шоссе 15",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("в описании нет %q: %s", want, got)
 		}

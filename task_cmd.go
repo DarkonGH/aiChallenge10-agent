@@ -84,6 +84,12 @@ func (a *app) taskCommand(arg string) error {
 		if err := m.Transition(to, step, "", "user"); err != nil {
 			return err
 		}
+		// The tool path calls the same hook from ToolRegistry; a manual
+		// /task state done must not leave the finished task's working layer
+		// behind.
+		if a.agent != nil && m.State().Stage == task.StageDone && before != task.StageDone {
+			a.agent.TaskDone()
+		}
 		fmt.Printf("переход применён: %s → %s\n", before, to)
 		a.printTask()
 		return nil

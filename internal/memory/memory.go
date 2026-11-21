@@ -60,13 +60,14 @@ type Entry struct {
 }
 
 // Now returns the timestamp written into Entry.UpdatedAt and Change.At.
-// RFC3339 keeps the time zone: a comparison between two records must not
-// depend on the machine's local time.
-func Now() string { return time.Now().Format(time.RFC3339) }
+// RFC3339Nano keeps the time zone and sub-second precision: a comparison
+// between two records must not depend on the machine's local time, and two
+// writes to the same key within one second must still have a defined order.
+func Now() string { return time.Now().Format(time.RFC3339Nano) }
 
 // Change is one entry of the memory journal: what a single update did to one
-// key. Kind is "add", "update", "remove" or "stale"; Old and New carry the
-// values, so the log answers both «что было» and «что стало».
+// key. Kind is "add", "update", "remove", "evict" or "stale"; Old and New carry
+// the values, so the log answers both «что было» and «что стало».
 type Change struct {
 	Layer Layer  `json:"layer"`
 	Key   string `json:"key"`
@@ -85,6 +86,8 @@ func DescribeChange(c Change) string {
 		return fmt.Sprintf("%s %s: %s → %s", c.Layer, c.Key, c.Old, c.New)
 	case "remove":
 		return fmt.Sprintf("%s − %s (было: %s)", c.Layer, c.Key, c.Old)
+	case "evict":
+		return fmt.Sprintf("%s − %s (вытеснено лимитом, было: %s)", c.Layer, c.Key, c.Old)
 	case "stale":
 		return fmt.Sprintf("%s %s: отклонено устаревшее значение %q (актуально %q)", c.Layer, c.Key, c.New, c.Old)
 	}
@@ -389,7 +392,8 @@ func canonicalKey(l Layer, key string) string {
 // records first.
 //
 // The returned changes are the day-15 journal: add, update (old → new),
-// remove and stale. A stale entry is one whose UpdatedAt is older than the
+// remove, evict (the layer cap dropped a record) and stale. A stale entry is
+// one whose UpdatedAt is older than the
 // stored value: the later write wins and the old one is not applied.
 func (s *Store) Apply(u Update) []Change {
 	var changes []Change
@@ -447,12 +451,24 @@ func removeEntriesChanged(entries []Entry, keys []string, l Layer, at string) ([
 	if len(keys) == 0 {
 		return entries, nil
 	}
+	// Removal keys come from the same extractor as additions, so they can
+	// carry the date that Render puts in front of a decision. Canonicalize
+	// them exactly like added keys, or the stored record will not match.
+	canonical := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k = canonicalKey(l, k); k != "" {
+			canonical = append(canonical, k)
+		}
+	}
+	if len(canonical) == 0 {
+		return entries, nil
+	}
 	out := make([]Entry, 0, len(entries))
 	var changes []Change
 	for _, e := range entries {
 		drop := false
-		for _, k := range keys {
-			if strings.EqualFold(e.Key, strings.TrimSpace(k)) {
+		for _, k := range canonical {
+			if strings.EqualFold(e.Key, k) {
 				drop = true
 				break
 			}
