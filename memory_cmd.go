@@ -88,10 +88,18 @@ func (a *app) memoryCommand(arg string) error {
 // model path journals through Agent.updateMemory; the command path must use the
 // same event so /memory history is complete regardless of who changed a fact.
 func (a *app) journalMemoryChanges(upd memory.Update, changes []memory.Change) {
-	if len(changes) == 0 {
+	// AddWithChange returns an empty Change when the value did not change.
+	// Such a no-op must not create a memory event or an empty history line.
+	nonEmpty := make([]memory.Change, 0, len(changes))
+	for _, c := range changes {
+		if c.Kind != "" {
+			nonEmpty = append(nonEmpty, c)
+		}
+	}
+	if len(nonEmpty) == 0 {
 		return
 	}
-	if err := a.hist.AppendMemoryChanges(upd, changes); err != nil {
+	if err := a.hist.AppendMemoryChanges(upd, nonEmpty); err != nil {
 		fmt.Printf("журнал памяти: %v\n", err)
 	}
 }
@@ -102,6 +110,11 @@ func (a *app) printMemoryHistory(key string) {
 	all := a.hist.MemoryChanges()
 	var filtered []memory.Change
 	for _, c := range all {
+		// Older sessions may already contain the no-op events written before
+		// this check existed; they must not render as a blank history line.
+		if c.Kind == "" {
+			continue
+		}
 		if key != "" && !strings.Contains(strings.ToLower(c.Key), key) {
 			continue
 		}
