@@ -164,6 +164,9 @@ func (a *Agent) tracef(format string, args ...any) {
 // Chat handles one user turn. It may perform several model/tool round-trips
 // and returns the final text once the model stops requesting tools.
 func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	a.hist.AppendUser(userText)
 	// The question drives knowledge relevance, so it is recorded before any
 	// prompt is assembled.
@@ -188,7 +191,9 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	if a.mode() == compact.StrategyFacts {
 		out, err := a.Comp.ExtractFacts(ctx, a.hist.Facts(), userText)
 		if err != nil {
-			a.tracef("факты: не удалось обновить (%s) — остаются прежние", config.OneLine(err.Error()))
+			if ctx.Err() == nil {
+				a.tracef("факты: не удалось обновить (%s) — остаются прежние", config.OneLine(err.Error()))
+			}
 		} else if facts, perr := compact.ParseFactsJSON(out); perr != nil {
 			a.tracef("факты: %s — остаются прежние", perr)
 		} else if len(facts) == 0 && len(a.hist.Facts()) > 0 {
@@ -201,11 +206,19 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	}
 
 	for step := 1; step <= a.maxSteps; step++ {
+		// A cancelled turn must stop before any more model calls. This also
+		// covers cancellation while memory extraction or compaction was
+		// running: those failures are non-fatal, but the turn is not.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		switch a.mode() {
 		case compact.StrategySummary:
 			if !a.noCompact {
 				if _, err := a.Comp.MaybeCompact(ctx, a.hist.SystemPrompt()); err != nil {
-					a.tracef("сжатие контекста: %v", err)
+					if ctx.Err() == nil {
+						a.tracef("сжатие контекста: %v", err)
+					}
 				}
 			}
 		case compact.StrategyWindow, compact.StrategyFacts:
@@ -251,6 +264,12 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		if len(resp.ToolCalls) == 0 {
 			if inv != nil {
 				problem := a.invariantProblem(ctx, inv, resp.Content)
+				// The local checker uses the same context. If Ctrl-C cancelled
+				// it, the keyword fallback may have let the draft through;
+				// never release an answer from a cancelled turn.
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
 				if problem != "" {
 					rejects++
 					if rejects > maxInvariantRejects {
@@ -366,6 +385,11 @@ func keywordProblem(set *invariant.Set, text string) string {
 func (a *Agent) updateMemory(ctx context.Context, userText string) {
 	out, err := a.Comp.ExtractMemory(ctx, a.mem, userText)
 	if err != nil {
+		// Cancellation is not a memory failure: the user stopped the turn and
+		// the "прервано" line already explains it.
+		if ctx.Err() != nil {
+			return
+		}
 		a.tracef("память: не удалось обновить (%s) — остаётся прежняя", config.OneLine(err.Error()))
 		return
 	}

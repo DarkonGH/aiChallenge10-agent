@@ -373,7 +373,29 @@ func utf8SeqLen(b byte) int {
 var (
 	rawMu      sync.Mutex
 	rawCurrent *rawState
+
+	interruptMu      sync.Mutex
+	interruptHandler func() bool
 )
+
+// SetInterruptHandler installs a handler for SIGINT received outside the raw
+// input mode — that is, while the agent is working on a request, because the
+// line editor has already restored the terminal. The handler returns true when
+// it consumed the signal (a running turn was cancelled); false keeps the old
+// behaviour, so Ctrl-C still terminates the process when there is nothing to
+// cancel. Ctrl-C at the prompt is a byte in raw mode and never reaches here.
+func SetInterruptHandler(fn func() bool) {
+	interruptMu.Lock()
+	interruptHandler = fn
+	interruptMu.Unlock()
+}
+
+func dispatchInterrupt() bool {
+	interruptMu.Lock()
+	fn := interruptHandler
+	interruptMu.Unlock()
+	return fn != nil && fn()
+}
 
 func init() {
 	c := make(chan os.Signal, 1)
@@ -384,8 +406,14 @@ func init() {
 			st := rawCurrent
 			rawMu.Unlock()
 			if st == nil {
-				// Сырой режим не включён — возвращаем системе поведение
-				// по умолчанию и переотправляем сигнал себе.
+				// The terminal is cooked (no Read in progress). While the agent
+				// is answering, Ctrl-C should cancel that answer, not kill the
+				// process: Ctrl-D at an empty prompt remains the exit command.
+				if sig == syscall.SIGINT && dispatchInterrupt() {
+					continue
+				}
+				// Nothing to cancel — return the signal to the system so the
+				// process still terminates as expected.
 				signal.Reset(sig)
 				if s, ok := sig.(syscall.Signal); ok {
 					_ = syscall.Kill(syscall.Getpid(), s)

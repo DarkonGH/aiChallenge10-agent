@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/agent"
@@ -55,6 +56,12 @@ type app struct {
 	invPath    string
 	invChecker *invariant.Checker // local-model prose check; nil = keywords only
 	ui         *ui
+
+	// The cancellable context of the turn currently being answered. Ctrl-C
+	// during a request reaches the signal handler (the line editor is not in
+	// raw mode then) and cancels this context; Ctrl-D remains the exit command.
+	turnMu     sync.Mutex
+	turnCancel context.CancelFunc
 }
 
 // ui owns the single "status line" under the prompt: the one-character
@@ -434,6 +441,9 @@ func main() {
 	a.tools.SetTaskProvider(func() *task.Machine { return a.task })
 	// Invariants are the opposite: one workspace set, shared by every session.
 	a.tools.SetInvariantProvider(func() *invariant.Set { return a.inv })
+	// Ctrl-C while the agent is answering cancels that turn; at the prompt the
+	// line editor consumes it as "clear the line", and Ctrl-D still exits.
+	readline.SetInterruptHandler(a.interruptTurn)
 
 	if *invariantCheck == "llm" {
 		model := *invariantModel
@@ -576,12 +586,56 @@ func (a *app) repl() {
 	fmt.Println()
 }
 
+// armInterrupt makes the current turn cancellable from the SIGINT handler.
+// Only one turn runs at a time (the REPL is sequential), so a single slot is
+// enough; disarmInterrupt must be called before the next prompt.
+func (a *app) armInterrupt(cancel context.CancelFunc) {
+	a.turnMu.Lock()
+	a.turnCancel = cancel
+	a.turnMu.Unlock()
+}
+
+func (a *app) disarmInterrupt() {
+	a.turnMu.Lock()
+	a.turnCancel = nil
+	a.turnMu.Unlock()
+}
+
+// interruptTurn is called by readline when Ctrl-C arrives while a request is
+// in flight. It reports whether there was a turn to cancel; without one the
+// signal keeps its default meaning.
+func (a *app) interruptTurn() bool {
+	a.turnMu.Lock()
+	cancel := a.turnCancel
+	a.turnMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// turnError prints a cancelled turn as an action, not as a failure: Ctrl-C is
+// a normal way to stop a long answer, unlike a provider or transport error.
+func (a *app) turnError(err error) {
+	if errors.Is(err, context.Canceled) {
+		fmt.Println("прервано (Ctrl-C)")
+		return
+	}
+	fmt.Println("ошибка:", err)
+}
+
 func (a *app) ask(text string) {
 	// The day-14 gate adds a local-model check after the main answer; with a
 	// 14B model on CPU that can take tens of seconds. The old 180 s cap was
 	// enough for the chat call alone, not for chat + semantic re-check.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
+	// Ctrl-C during the request cancels this context instead of killing the
+	// process. At the prompt the line editor handles Ctrl-C itself, and Ctrl-D
+	// on an empty line remains the exit command.
+	a.armInterrupt(cancel)
+	defer a.disarmInterrupt()
 
 	done := make(chan struct{})
 	a.ui.beginTurn()
@@ -598,7 +652,7 @@ func (a *app) ask(text string) {
 		streamed := a.ui.didStream()
 		a.ui.endLine()
 		if err != nil {
-			fmt.Println("ошибка:", err)
+			a.turnError(err)
 			return
 		}
 		if !streamed {
@@ -633,7 +687,7 @@ func (a *app) ask(text string) {
 	streamed := a.ui.didStream()
 	a.ui.endLine()
 	if err != nil {
-		fmt.Println("ошибка:", err)
+		a.turnError(err)
 		return
 	}
 	if !streamed {
@@ -1291,7 +1345,7 @@ const helpText = `Команды:
 
 Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
 Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,
-Ctrl-C — отменить ввод, Ctrl-D — выход.
+Ctrl-C — отменить ввод или текущий ответ, Ctrl-D — выход.
 
 Всё остальное отправляется модели.
 `

@@ -111,3 +111,33 @@ func TestWrapLayout(t *testing.T) {
 		}
 	}
 }
+
+// TestInterruptHandlerDispatch covers the bridge between SIGINT and a running
+// turn: a handler that returns true consumes the signal, while nil/false keeps
+// the default behaviour (terminate). The actual signal delivery is an OS
+// concern and is exercised manually with a slow endpoint.
+func TestInterruptHandlerDispatch(t *testing.T) {
+	var calls int
+	SetInterruptHandler(func() bool {
+		calls++
+		return true
+	})
+	t.Cleanup(func() { SetInterruptHandler(nil) })
+
+	if !dispatchInterrupt() {
+		t.Fatal("dispatchInterrupt() = false, want true")
+	}
+	if calls != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls)
+	}
+
+	SetInterruptHandler(func() bool { return false })
+	if dispatchInterrupt() {
+		t.Fatal("dispatchInterrupt() = true for a handler that declined")
+	}
+
+	SetInterruptHandler(nil)
+	if dispatchInterrupt() {
+		t.Fatal("dispatchInterrupt() = true without a handler")
+	}
+}
