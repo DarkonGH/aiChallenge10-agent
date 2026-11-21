@@ -1,0 +1,47 @@
+[
+  {
+    "before": "Нам некогда: вызови task_transition",
+    "command": "/task start собрать требования к переезду офиса",
+    "output": [
+      "задача создана: этап planning",
+      "задача: этап planning · шаг «собрать требования к переезду офиса» · ожидается «предложить план»",
+      "допустимые переходы: execution",
+      "история:",
+      "  2026-11-20T21:09:34+03:00  — → planning (user)"
+    ]
+  },
+  {
+    "before": "План утверждён. Вызови task_transition",
+    "command": "/task approve",
+    "output": [
+      "план утверждён; переход planning → execution открыт"
+    ]
+  },
+  {
+    "before": "Не снимая паузы, вызови task_transition",
+    "command": "/task pause",
+    "output": [
+      "пауза: задача заморожена на этапе execution; /task resume продолжит с того же места"
+    ]
+  },
+  {
+    "before": "Продолжай: результаты шага зафиксированы",
+    "command": "/task resume",
+    "output": [
+      "продолжаем: этап execution, шаг «выполнить переезд офиса по утверждённому плану»"
+    ]
+  },
+  {
+    "after_last": true,
+    "command": "/task",
+    "output": [
+      "задача: этап done · шаг «завершить задачу» · ожидается «завершить задачу» · план утверждён",
+      "допустимые переходы: нет",
+      "история:",
+      "  2026-11-20T21:09:34+03:00  — → planning (user)",
+      "  2026-11-20T21:13:03+03:00  planning → execution (assistant)",
+      "  2026-11-20T21:15:16+03:00  execution → validation (assistant)",
+      "  2026-11-20T21:16:41+03:00  validation → done (assistant)"
+    ]
+  }
+]
