@@ -8,12 +8,18 @@
 память — приглушённо, отказ кода — строкой «⛔ код: …». Дальше каст собирает
 render_cast.py с карточками из testdata/dayNN-cards.json.
 
-    python3 scripts/run_to_cast.py /tmp/day14-run-ok/demo/session.jsonl /tmp/day14-demo.cast
+    python3 scripts/run_to_cast.py /tmp/day14-run-ok/demo/session.jsonl /tmp/day14-demo.cast \
+        --commands testdata/day14-commands.json
+
+The session log has no command events: commands and their output are printed to
+stdout but are not part of the dialogue. --commands adds those blocks back by
+the text of the next user message, so the video shows an explicit invariant
+change instead of a jump from refusal to agreement.
 """
 
+import argparse
 import json
 import re
-import sys
 import textwrap
 import time
 
@@ -66,7 +72,13 @@ def render_memory(mem):
     return "; ".join(parts)
 
 
-def convert(in_path, out_path):
+def convert(in_path, out_path, commands_path=""):
+    commands = []
+    if commands_path:
+        with open(commands_path, encoding="utf-8") as f:
+            commands = json.load(f)
+    pending = list(commands)
+
     events = []
     header = {}
     for line in open(in_path, encoding="utf-8"):
@@ -90,6 +102,12 @@ def convert(in_path, out_path):
                     text = wrap_text(plain_text(raw[len(NOTICE_PREFIX):]), COLS - len("  ⛔ код: "))
                     events.append(("notice", "", text))
                 else:
+                    for c in list(pending):
+                        if c.get("before") and c["before"] in raw:
+                            events.append(("command", "", plain_text(c.get("command", ""))))
+                            for out_line in c.get("output", []):
+                                events.append(("command_out", "", plain_text(out_line)))
+                            pending.remove(c)
                     text = wrap_text(plain_text(raw), COLS - len("agent> "))
                     events.append(("user", "", text))
             elif role == "assistant":
@@ -122,8 +140,22 @@ def convert(in_path, out_path):
         elif kind == "notice":
             out.append((round(t, 3), "o", f"  ⛔ код: {text}\n"))
             t += 0.8
+        elif kind == "command":
+            body = wrap_text(text, COLS - len("agent> "))
+            out.append((round(t, 3), "o", f"agent> {body}\n\n"))
+            t += 0.9
+        elif kind == "command_out":
+            body = wrap_text(text, COLS - 2)
+            out.append((round(t, 3), "o", f"  {body}\n"))
+            t += 0.5
         elif kind == "memory":
-            out.append((round(t, 3), "o", f"  ↳ память: {text}\n"))
+            # Память приходит из журнала отдельным событием и тоже содержит
+            # «₽»; без plain_text шрифт рисует его квадратом. Обёртка нужна,
+            # чтобы длинная строка не рвалась посреди слова на краю экрана.
+            prefix = "  ↳ память: "
+            body = wrap_text(plain_text(text), COLS - len(prefix))
+            body = body.replace("\n", "\n  ")
+            out.append((round(t, 3), "o", f"{prefix}{body}\n"))
             t += 0.4
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -137,6 +169,10 @@ def convert(in_path, out_path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("использование: run_to_cast.py <session.jsonl> <out.cast>")
-    convert(sys.argv[1], sys.argv[2])
+    parser = argparse.ArgumentParser(description="синтез asciicast из session.jsonl")
+    parser.add_argument("session", help="session.jsonl удачного прогона")
+    parser.add_argument("out", help="куда записать .cast")
+    parser.add_argument("--commands", default="",
+                        help="JSON с командами и их выводом (не попадают в session.jsonl)")
+    args = parser.parse_args()
+    convert(args.session, args.out, args.commands)

@@ -15,8 +15,11 @@ set -a; [ -f "$HOME/.env" ] && . "$HOME/.env"; set +a
 
 # The local endpoint must win over ~/.env's summary settings: the checker model
 # and the endpoint have to match, otherwise qwen2.5:14b is sent to opencode.
-export LLM_SUMMARY_BASE_URL=${LLM_SUMMARY_BASE_URL:-http://localhost:11434/v1}
-export LLM_SUMMARY_API_KEY=${LLM_SUMMARY_API_KEY:-ollama}
+# A ${VAR:-default} would silently keep an LLM_SUMMARY_* value from ~/.env, so
+# the demo uses its own names (SUMMARY_BASE_URL/SUMMARY_API_KEY) as the escape
+# hatch and overwrites the generic variables unconditionally.
+export LLM_SUMMARY_BASE_URL=${SUMMARY_BASE_URL:-http://localhost:11434/v1}
+export LLM_SUMMARY_API_KEY=${SUMMARY_API_KEY:-ollama}
 export LLM_SUMMARY_MODEL="$SUMMARY_MODEL"
 export LLM_INVARIANT_MODEL="$SUMMARY_MODEL"
 

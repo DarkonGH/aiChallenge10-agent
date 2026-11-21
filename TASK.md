@@ -133,7 +133,9 @@ scripts/day14-demo.sh
 python3 scripts/check_invariants.py /tmp/day14-demo
 
 # каст из сохранённого удачного прогона и видео
-python3 scripts/run_to_cast.py /tmp/day14-demo/demo/session.jsonl /tmp/day14-demo.cast
+# команды не попадают в session.jsonl — их вывод добавляется из sidecar
+python3 scripts/run_to_cast.py /tmp/day14-demo/demo/session.jsonl /tmp/day14-demo.cast \
+  --commands testdata/day14-commands.json
 python3 scripts/render_cast.py --cast /tmp/day14-demo.cast \
   --out video/инварианты-день-14.mp4 \
   --title "День 14 · инварианты проекта" \
@@ -141,6 +143,9 @@ python3 scripts/render_cast.py --cast /tmp/day14-demo.cast \
   --cards testdata/day14-cards.json
 ```
 
-Видео: 107 с, 1352x970, 8 fps, без аудио. Каст собирается
+Видео: 109 с, 1352x970, 8 fps, без аудио. Каст собирается
 детерминированно из сохранённого прогона: живые записи на модели
 нестабильны, а гейт и счётчики от этого не зависят — их проверяет код.
+`testdata/day14-commands.json` возвращает в кадр смену инварианта
+`budget` (300 000 → 400 000): в журнале сессии команд нет, поэтому без
+sidecar видео прыгало от отказа к согласию без видимой причины.
