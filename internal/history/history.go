@@ -48,6 +48,10 @@ type Event struct {
 	// changed records. The files under <session>/memory are the source of
 	// truth; the event lets a copied log rebuild them.
 	Memory *memory.Update `json:"memory,omitempty"`
+	// Changes is the day-15 audit trail of the same event: what each key was
+	// before and after. Memory still reconstructs the store; Changes explains
+	// the replacement to a human reading the log.
+	Changes []memory.Change `json:"changes,omitempty"`
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -79,6 +83,10 @@ type History struct {
 	// live memory: the store files are. It exists so a session whose memory
 	// directory is missing can be rebuilt from its log.
 	memUpdates []memory.Update
+
+	// memChanges is the replay of the per-key old → new journal. It is what
+	// /memory history prints; it is not used to rebuild the store.
+	memChanges []memory.Change
 
 	forkOf  string // parent session id, when this session is a branch
 	forkSeq int64  // seq of the parent's log at the fork point
@@ -227,6 +235,7 @@ func (h *History) apply(ev *Event) {
 		if ev.Memory != nil {
 			h.memUpdates = append(h.memUpdates, *ev.Memory)
 		}
+		h.memChanges = append(h.memChanges, ev.Changes...)
 	case "evict":
 		if len(ev.Covers) == 2 {
 			h.applyEvict(ev.Covers[0], ev.Covers[1])
@@ -365,18 +374,37 @@ func (h *History) SetFacts(facts []Fact) error {
 func (h *History) Facts() []Fact { return h.facts }
 
 // AppendMemory journals one layered-memory change. The update is a diff: only
-// the records the extractor added or changed.
+// the records the extractor added or changed. It is kept as the compatibility
+// entry point for callers that do not have the old → new changes; live turns
+// use AppendMemoryChanges.
 func (h *History) AppendMemory(u memory.Update) error {
-	if err := h.writeEvent(Event{Type: "memory", Memory: &u}); err != nil {
+	return h.AppendMemoryChanges(u, nil)
+}
+
+// AppendMemoryChanges journals one layered-memory change together with the
+// day-15 per-key journal: what was overwritten, removed or rejected as stale.
+// Both halves live in one event so a reader cannot see the new value without
+// its history.
+func (h *History) AppendMemoryChanges(u memory.Update, changes []memory.Change) error {
+	ev := Event{Type: "memory", Memory: &u}
+	if len(changes) > 0 {
+		ev.Changes = changes
+	}
+	if err := h.writeEvent(ev); err != nil {
 		return err
 	}
 	h.memUpdates = append(h.memUpdates, u)
+	h.memChanges = append(h.memChanges, changes...)
 	return nil
 }
 
 // MemoryUpdates returns the replayed memory diffs in order, so a store can be
 // rebuilt from the log alone.
 func (h *History) MemoryUpdates() []memory.Update { return h.memUpdates }
+
+// MemoryChanges returns the replayed old → new journal in order. The store
+// files are the current state; this is the audit trail of how it got there.
+func (h *History) MemoryChanges() []memory.Change { return h.memChanges }
 
 // ForkOf returns the parent session id when this session is a branch.
 func (h *History) ForkOf() string { return h.forkOf }
@@ -745,7 +773,9 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 		case "facts":
 			fmt.Fprintf(w, "       — факты: %d ключей\n", len(ev.Facts))
 		case "memory":
-			if ev.Memory != nil {
+			if len(ev.Changes) > 0 {
+				fmt.Fprintf(w, "       — память: %s\n", describeMemoryChanges(ev.Changes))
+			} else if ev.Memory != nil {
 				fmt.Fprintf(w, "       — память: %s\n", describeMemoryUpdate(*ev.Memory))
 			}
 		case "fork":
@@ -787,6 +817,16 @@ func printLogMessage(w io.Writer, m *llm.Message) {
 	default:
 		fmt.Fprintf(w, "[%3d] %-9s %s\n", m.Seq, m.Role, text)
 	}
+}
+
+// describeMemoryChanges renders the day-15 journal: the old and new value of
+// every key, not just the layer counters.
+func describeMemoryChanges(changes []memory.Change) string {
+	parts := make([]string, 0, len(changes))
+	for _, c := range changes {
+		parts = append(parts, memory.DescribeChange(c))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // describeMemoryUpdate renders one memory event for -print-session: which

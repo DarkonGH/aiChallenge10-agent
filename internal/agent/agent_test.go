@@ -7,6 +7,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"net/http"
 	"net/http/httptest"
@@ -399,5 +400,43 @@ func TestAgentInvariantGateRequiresCheck(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Errorf("calls = %d, want 3 (draft, check_solution, answer)", calls)
+	}
+}
+
+// TestTaskDoneClearsWorkingMemory is the day-15 cleanup guarantee: the card of
+// a finished task disappears, while the long-term layers and their history
+// stay. The removals are journaled with old values.
+func TestTaskDoneClearsWorkingMemory(t *testing.T) {
+	dir := t.TempDir()
+	h, err := history.OpenHistory(dir, "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	mem, err := memory.Open(filepath.Join(dir, "s", "memory"), filepath.Join(dir, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem.Apply(memory.Update{
+		Working:   []memory.Entry{{Key: "срок", Value: "20 декабря"}},
+		Decisions: []memory.Entry{{Key: "площадка", Value: "коворкинг"}},
+	})
+	if err := mem.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	ag := NewAgent(llm.NewChatClientAt("http://example.invalid", ""), tools.NewToolRegistry(nil), h, compact.DefaultBudget(), 2, 0, 800)
+	ag.SetMemory(mem)
+	ag.TaskDone()
+
+	if got := mem.Len(memory.LayerWorking); got != 0 {
+		t.Errorf("рабочая память после done: %d записей", got)
+	}
+	if got := mem.Len(memory.LayerDecisions); got != 1 {
+		t.Errorf("долговременная память пострадала: decisions %d", got)
+	}
+	changes := h.MemoryChanges()
+	if len(changes) != 1 || changes[0].Kind != "remove" || changes[0].Key != "срок" || changes[0].Old != "20 декабря" {
+		t.Errorf("журнал очистки: %+v", changes)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 )
 
 // memoryCommand handles /memory and its subcommands. The layer listing is the
@@ -31,13 +32,18 @@ func (a *app) memoryCommand(arg string) error {
 		if err != nil {
 			return err
 		}
-		if err := a.mem.Clear(layer); err != nil {
-			return err
-		}
+		changes := a.mem.ClearWithChanges(layer)
 		if err := a.mem.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("слой %s очищен\n", layer)
+		if len(changes) > 0 {
+			upd := memory.Update{Remove: map[memory.Layer][]string{}}
+			for _, c := range changes {
+				upd.Remove[c.Layer] = append(upd.Remove[c.Layer], c.Key)
+			}
+			a.journalMemoryChanges(upd, changes)
+		}
+		fmt.Printf("слой %s очищен: %d записей\n", layer, len(changes))
 		a.printMemory()
 	case "add":
 		if len(fields) < 3 {
@@ -53,18 +59,86 @@ func (a *app) memoryCommand(arg string) error {
 		if !ok || strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
 			return fmt.Errorf("нужно: /memory add %s ключ=значение", layer)
 		}
-		if err := a.mem.Add(layer, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
+		key = strings.TrimSpace(key)
+		ch, err := a.mem.AddWithChange(layer, key, strings.TrimSpace(value))
+		if err != nil {
 			return err
 		}
 		if err := a.mem.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("%s += %s\n", layer, strings.TrimSpace(key))
+		a.journalMemoryChanges(memory.Update{}, []memory.Change{ch})
+		fmt.Printf("%s += %s\n", layer, key)
 		a.printMemory()
+	case "history", "log":
+		key := ""
+		if len(fields) > 1 {
+			key = strings.ToLower(strings.Join(fields[1:], " "))
+		}
+		a.printMemoryHistory(key)
+	case "prompt", "block":
+		a.printMemoryPrompt()
 	default:
-		return fmt.Errorf("неизвестная подкоманда %q; /memory | /memory clear <слой> | /memory add <слой> ключ=значение", fields[0])
+		return fmt.Errorf("неизвестная подкоманда %q; /memory | /memory clear <слой> | /memory add <слой> ключ=значение | /memory history [ключ] | /memory prompt", fields[0])
 	}
 	return nil
+}
+
+// journalMemoryChanges writes a manual /memory edit to the session log. The
+// model path journals through Agent.updateMemory; the command path must use the
+// same event so /memory history is complete regardless of who changed a fact.
+func (a *app) journalMemoryChanges(upd memory.Update, changes []memory.Change) {
+	if len(changes) == 0 {
+		return
+	}
+	if err := a.hist.AppendMemoryChanges(upd, changes); err != nil {
+		fmt.Printf("журнал памяти: %v\n", err)
+	}
+}
+
+// printMemoryHistory shows the old → new journal. The store files are the
+// current state; this view answers «когда и на что заменили».
+func (a *app) printMemoryHistory(key string) {
+	all := a.hist.MemoryChanges()
+	var filtered []memory.Change
+	for _, c := range all {
+		if key != "" && !strings.Contains(strings.ToLower(c.Key), key) {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	if len(filtered) == 0 {
+		if key == "" {
+			fmt.Println("журнал изменений памяти пуст")
+		} else {
+			fmt.Printf("в журнале нет изменений ключа %q\n", key)
+		}
+		return
+	}
+	fmt.Printf("журнал памяти: %d изменений\n", len(filtered))
+	for _, c := range filtered {
+		when := memory.FormatTime(c.At)
+		if when == "" {
+			when = c.At
+		}
+		fmt.Printf("  %s  %s\n", when, memory.DescribeChange(c))
+	}
+}
+
+// printMemoryPrompt shows exactly the block that goes into the system prompt.
+// The store is the source of truth: if old values are absent from the files,
+// they cannot leak through the memory block even when dialogue history is
+// long. It is the direct answer to «проверить, что старые значения не попадают
+// в промпт» without asking the model to introspect itself.
+func (a *app) printMemoryPrompt() {
+	a.agent.Comp.SetQuestion(a.lastUserText())
+	block := a.agent.Comp.MemoryBlock()
+	if strings.TrimSpace(block) == "" {
+		fmt.Println("блок памяти в промпте пуст")
+		return
+	}
+	fmt.Printf("блок памяти в промпте (~%d ток.):\n%s\n",
+		tokens.EstimateTokens(block), strings.TrimRight(block, "\n"))
 }
 
 // printMemory renders every layer with its size, its token cost and whether it
@@ -101,6 +175,9 @@ func (a *app) printMemory() {
 			line := e.Key + ": " + e.Value
 			if e.At != "" {
 				line = e.At + " · " + line
+			}
+			if label := e.UpdatedLabel(); label != "" {
+				line += " [" + label + "]"
 			}
 			if layer == memory.LayerKnowledge {
 				mark := " × "
@@ -164,8 +241,8 @@ func memoryReportCmd(dataDir, id, profileDir string) error {
 			break
 		}
 	}
-	fmt.Printf("сессия %s · модель %s · память: %d записей, обновлений в журнале %d\n",
-		h.ID(), h.ChatModel(), mem.Total(), len(h.MemoryUpdates()))
+	fmt.Printf("сессия %s · модель %s · память: %d записей, обновлений в журнале %d (%d замен/удалений)\n",
+		h.ID(), h.ChatModel(), mem.Total(), len(h.MemoryUpdates()), len(h.MemoryChanges()))
 	toks := mem.LayerTokens(q)
 	total := 0
 	for _, l := range memory.Layers {

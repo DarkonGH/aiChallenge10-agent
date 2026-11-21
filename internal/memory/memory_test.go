@@ -30,8 +30,11 @@ func TestApplyMergesByKey(t *testing.T) {
 		t.Fatalf("записей %d, ожидалось %d: %v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if got[i].Key != want[i].Key || got[i].Value != want[i].Value {
 			t.Errorf("запись %d = %v, ожидалось %v", i, got[i], want[i])
+		}
+		if got[i].UpdatedAt == "" {
+			t.Errorf("запись %d без времени последней записи", i)
 		}
 	}
 }

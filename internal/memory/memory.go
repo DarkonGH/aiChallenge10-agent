@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -52,6 +53,67 @@ type Entry struct {
 	Value string `json:"value"`
 	// At is the date a decision was taken (YYYY-MM-DD). Empty for other layers.
 	At string `json:"at,omitempty"`
+	// UpdatedAt is when this value was last written (RFC3339). The code stamps
+	// it; the extractor never supplies it. It is the tie-breaker when two
+	// records for the same key race: the later write wins.
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+// Now returns the timestamp written into Entry.UpdatedAt and Change.At.
+// RFC3339 keeps the time zone: a comparison between two records must not
+// depend on the machine's local time.
+func Now() string { return time.Now().Format(time.RFC3339) }
+
+// Change is one entry of the memory journal: what a single update did to one
+// key. Kind is "add", "update", "remove" or "stale"; Old and New carry the
+// values, so the log answers both «что было» and «что стало».
+type Change struct {
+	Layer Layer  `json:"layer"`
+	Key   string `json:"key"`
+	Kind  string `json:"kind"`
+	Old   string `json:"old,omitempty"`
+	New   string `json:"new,omitempty"`
+	At    string `json:"at"`
+}
+
+// DescribeChange renders one change for /memory history and -print-session.
+func DescribeChange(c Change) string {
+	switch c.Kind {
+	case "add":
+		return fmt.Sprintf("%s + %s: %s", c.Layer, c.Key, c.New)
+	case "update":
+		return fmt.Sprintf("%s %s: %s → %s", c.Layer, c.Key, c.Old, c.New)
+	case "remove":
+		return fmt.Sprintf("%s − %s (было: %s)", c.Layer, c.Key, c.Old)
+	case "stale":
+		return fmt.Sprintf("%s %s: отклонено устаревшее значение %q (актуально %q)", c.Layer, c.Key, c.New, c.Old)
+	}
+	return fmt.Sprintf("%s %s: %s", c.Layer, c.Key, c.Kind)
+}
+
+// DescribeChanges joins changes for one trace/journal line.
+func DescribeChanges(changes []Change) string {
+	parts := make([]string, 0, len(changes))
+	for _, c := range changes {
+		parts = append(parts, DescribeChange(c))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// UpdatedLabel is the compact local time shown next to an entry.
+func (e Entry) UpdatedLabel() string { return FormatTime(e.UpdatedAt) }
+
+// FormatTime turns an RFC3339 timestamp into the compact local form used in
+// listings and the journal. An empty or broken value renders as "".
+func FormatTime(s string) string {
+	if s == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return ""
+	}
+	return t.Local().Format("02.01 15:04")
 }
 
 // Update is the extractor's answer: the entries to merge into the store. Only
@@ -308,36 +370,85 @@ func (s *Store) EvictedTotal() int {
 	return n
 }
 
+// decisionDatePrefix matches the date that Render puts in front of a decision
+// ("2026-11-21 · площадка: …"). The extractor sometimes copies it back into the
+// key; the date already lives in Entry.At, so keeping it in the key would create
+// a second record instead of replacing the original.
+var decisionDatePrefix = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}\s*[·:\-–—]\s*`)
+
+func canonicalKey(l Layer, key string) string {
+	key = strings.TrimSpace(key)
+	if l == LayerDecisions {
+		key = strings.TrimSpace(decisionDatePrefix.ReplaceAllString(key, ""))
+	}
+	return key
+}
+
 // Apply merges the extractor's update: removals go first, then an existing key
 // is updated in place and a new key is appended. Layer caps evict the oldest
 // records first.
-func (s *Store) Apply(u Update) {
+//
+// The returned changes are the day-15 journal: add, update (old → new),
+// remove and stale. A stale entry is one whose UpdatedAt is older than the
+// stored value: the later write wins and the old one is not applied.
+func (s *Store) Apply(u Update) []Change {
+	var changes []Change
+	at := Now()
 	for _, l := range Layers {
 		entries := u.Layer(l)
 		removed := u.Removed(l)
 		if len(entries) == 0 && len(removed) == 0 {
 			continue
 		}
-		cur := removeEntries(s.Section(l), removed)
+		cur := s.Section(l)
+		var removedChanges []Change
+		cur, removedChanges = removeEntriesChanged(cur, removed, l, at)
+		changes = append(changes, removedChanges...)
 		for _, e := range entries {
+			e.Key = canonicalKey(l, e.Key)
+			if e.Key == "" {
+				continue
+			}
+			// The code owns the write time: the extractor cannot backdate a
+			// fact to make it win a conflict.
+			if e.UpdatedAt == "" {
+				e.UpdatedAt = at
+			}
 			// Decisions are dated when they are first stored; a later
-			// re-statement keeps the original date (mergeEntry does that).
+			// re-statement keeps the original date (mergeEntryChanged does that).
 			if l == LayerDecisions && e.At == "" {
 				e.At = Date()
 			}
-			cur = mergeEntry(cur, e)
+			var ch Change
+			cur, ch = mergeEntryChanged(cur, e, l, at)
+			if ch.Kind != "" {
+				changes = append(changes, ch)
+			}
 		}
+		// SetSection enforces the cap. Capture what it will drop so the log
+		// says explicitly that old records left the prompt, not just that the
+		// layer became smaller.
+		willDrop := 0
+		if n := Caps[l]; n > 0 && len(cur) > n {
+			willDrop = len(cur) - n
+		}
+		dropped := append([]Entry(nil), cur[:willDrop]...)
 		s.SetSection(l, cur)
+		for _, e := range dropped {
+			changes = append(changes, Change{Layer: l, Key: e.Key, Kind: "evict", Old: e.Value, At: at})
+		}
 	}
+	return changes
 }
 
-// removeEntries drops the records whose key matches one of keys, ignoring
-// case. It returns a fresh slice so the caller's array is not mutated.
-func removeEntries(entries []Entry, keys []string) []Entry {
+// removeEntriesChanged drops the records whose key matches one of keys,
+// ignoring case, and journals each removal with its old value.
+func removeEntriesChanged(entries []Entry, keys []string, l Layer, at string) ([]Entry, []Change) {
 	if len(keys) == 0 {
-		return entries
+		return entries, nil
 	}
 	out := make([]Entry, 0, len(entries))
+	var changes []Change
 	for _, e := range entries {
 		drop := false
 		for _, k := range keys {
@@ -346,30 +457,61 @@ func removeEntries(entries []Entry, keys []string) []Entry {
 				break
 			}
 		}
-		if !drop {
-			out = append(out, e)
+		if drop {
+			changes = append(changes, Change{Layer: l, Key: e.Key, Kind: "remove", Old: e.Value, At: at})
+			continue
 		}
+		out = append(out, e)
 	}
-	return out
+	return out, changes
+}
+
+// AddWithChange inserts or updates one record and returns the journal entry
+// (the /memory add command). Add keeps the old signature for callers that do
+// not journal.
+func (s *Store) AddWithChange(l Layer, key, value string) (Change, error) {
+	if _, ok := Caps[l]; !ok {
+		return Change{}, fmt.Errorf("неизвестный слой %q; доступны: working, profile, decisions, knowledge", l)
+	}
+	key = canonicalKey(l, key)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" {
+		return Change{}, fmt.Errorf("нужны ключ и значение: /memory add <слой> ключ=значение")
+	}
+	at := Now()
+	ent := Entry{Key: key, Value: value, UpdatedAt: at}
+	if l == LayerDecisions {
+		ent.At = Date()
+	}
+	cur, ch := mergeEntryChanged(s.Section(l), ent, l, at)
+	s.SetSection(l, cur)
+	return ch, nil
 }
 
 // Add inserts or updates one record (the /memory add command).
 func (s *Store) Add(l Layer, key, value string) error {
+	_, err := s.AddWithChange(l, key, value)
+	return err
+}
+
+// ClearWithChanges empties one layer and returns the removed records, so a
+// manual clear and the automatic working-memory cleanup after a finished task
+// leave the same audit trail.
+func (s *Store) ClearWithChanges(l Layer) []Change {
 	if _, ok := Caps[l]; !ok {
-		return fmt.Errorf("неизвестный слой %q; доступны: working, profile, decisions, knowledge", l)
+		return nil
 	}
-	key = strings.TrimSpace(key)
-	value = strings.TrimSpace(value)
-	if key == "" || value == "" {
-		return fmt.Errorf("нужны ключ и значение: /memory add <слой> ключ=значение")
+	entries := s.Section(l)
+	if len(entries) == 0 {
+		return nil
 	}
-	ent := Entry{Key: key, Value: value}
-	if l == LayerDecisions {
-		ent.At = Date()
+	at := Now()
+	changes := make([]Change, 0, len(entries))
+	for _, e := range entries {
+		changes = append(changes, Change{Layer: l, Key: e.Key, Kind: "remove", Old: e.Value, At: at})
 	}
-	cur := mergeEntry(s.Section(l), ent)
-	s.SetSection(l, cur)
-	return nil
+	s.SetSection(l, nil)
+	return changes
 }
 
 // Clear empties one layer.
@@ -381,18 +523,46 @@ func (s *Store) Clear(l Layer) error {
 	return nil
 }
 
-// mergeEntry replaces the value of an existing key or appends a new record.
-func mergeEntry(entries []Entry, e Entry) []Entry {
+// mergeEntryChanged replaces the value of an existing key or appends a new
+// record. An entry whose write time is older than the stored one is rejected
+// as stale: the later fact wins, as the assignment requires.
+func mergeEntryChanged(entries []Entry, e Entry, l Layer, at string) ([]Entry, Change) {
 	for i := range entries {
 		if strings.EqualFold(entries[i].Key, e.Key) {
+			if olderWrite(e.UpdatedAt, entries[i].UpdatedAt) {
+				return entries, Change{Layer: l, Key: entries[i].Key, Kind: "stale", Old: entries[i].Value, New: e.Value, At: at}
+			}
+			old := entries[i].Value
 			entries[i].Value = e.Value
-			if e.At != "" {
+			entries[i].UpdatedAt = e.UpdatedAt
+			// A decision keeps the date it was taken; the replacement gets a
+			// new UpdatedAt but not a new decision date.
+			if e.At != "" && entries[i].At == "" {
 				entries[i].At = e.At
 			}
-			return entries
+			if old == e.Value {
+				// Repeating the same value is not a change; keeping it out of
+				// the journal makes the log readable.
+				return entries, Change{}
+			}
+			return entries, Change{Layer: l, Key: entries[i].Key, Kind: "update", Old: old, New: e.Value, At: at}
 		}
 	}
-	return append(entries, e)
+	return append(entries, e), Change{Layer: l, Key: e.Key, Kind: "add", New: e.Value, At: at}
+}
+
+// olderWrite reports whether a is strictly older than b. Missing timestamps
+// mean "unknown", and an unknown write never wins a conflict.
+func olderWrite(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	ta, errA := time.Parse(time.RFC3339, a)
+	tb, errB := time.Parse(time.RFC3339, b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ta.Before(tb)
 }
 
 // capEntries keeps the newest n records: the front of the slice is the oldest.

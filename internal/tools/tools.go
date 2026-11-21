@@ -35,6 +35,10 @@ type ToolRegistry struct {
 	// onInvariantCheck reports the check_solution verdict: true opens the
 	// agent's gate for the current turn, false closes it again.
 	onInvariantCheck func(ok bool)
+	// onTaskDone runs once when the FSM enters done. Day 15 uses it to clear
+	// the working memory of the finished task; the tool knows nothing about
+	// memory, it just reports the transition.
+	onTaskDone func()
 }
 
 // NewToolRegistry builds the agent's tool set. tasks is the in-memory list from
@@ -195,6 +199,10 @@ func (r *ToolRegistry) SetInvariantProvider(p func() *invariant.Set) { r.inv = p
 // SetInvariantCheckHook sets the callback for a successful check_solution.
 func (r *ToolRegistry) SetInvariantCheckHook(f func(ok bool)) { r.onInvariantCheck = f }
 
+// SetTaskDoneHook sets the callback for the transition into done. It is called
+// only on the edge into done, not on every task tool call.
+func (r *ToolRegistry) SetTaskDoneHook(f func()) { r.onTaskDone = f }
+
 // runCheckSolution validates the declared choices against the invariants.
 // The success hook is what lets the agent gate release this turn's answer.
 func (r *ToolRegistry) runCheckSolution(args json.RawMessage) (string, error) {
@@ -264,6 +272,9 @@ func (r *ToolRegistry) runTaskTransition(args json.RawMessage) (string, error) {
 		return "", err
 	}
 	st := m.State()
+	if st.Stage == task.StageDone && before != task.StageDone && r.onTaskDone != nil {
+		r.onTaskDone()
+	}
 	return fmt.Sprintf("переход применён: %s → %s; шаг: %s; ожидаемое действие: %s",
 		before, st.Stage, orDash(st.Step), orDash(st.Expected)), nil
 }

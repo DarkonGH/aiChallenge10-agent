@@ -37,7 +37,11 @@ func Header(l Layer) string {
 	return ""
 }
 
-// Render prints entries as "- ключ: значение" lines. Decisions carry their date.
+// Render prints entries as "- ключ: значение" lines. Decisions carry their
+// date, and every record carries the compact time of its last write in square
+// brackets. The timestamp is part of the prompt on purpose: when two facts
+// disagree, the model can see which one is newer, and the code enforces the
+// same rule in mergeEntryChanged.
 func Render(entries []Entry) string {
 	var b strings.Builder
 	for _, e := range entries {
@@ -49,6 +53,11 @@ func Render(entries []Entry) string {
 		b.WriteString(e.Key)
 		b.WriteString(": ")
 		b.WriteString(e.Value)
+		if label := e.UpdatedLabel(); label != "" {
+			b.WriteString(" [")
+			b.WriteString(label)
+			b.WriteString("]")
+		}
 		b.WriteByte('\n')
 	}
 	return strings.TrimRight(b.String(), "\n")

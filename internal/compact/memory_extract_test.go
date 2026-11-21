@@ -143,7 +143,7 @@ func TestImportFactsRoutesThroughModel(t *testing.T) {
 		t.Errorf("город попал не в profile: %+v", u.Profile)
 	}
 	// The model must see the routing rules and every fact, not a keyword list.
-	for _, want := range []string{"раскладываешь", "working", "profile", "decisions", "knowledge"} {
+	for _, want := range []string{"экстрактор", "working", "profile", "decisions", "knowledge"} {
 		if !strings.Contains(seenSystem, want) {
 			t.Errorf("в системном промпте нет %q", want)
 		}
@@ -181,8 +181,30 @@ func TestSystemPromptKeepsPreferences(t *testing.T) {
 			t.Errorf("в системном промпте нет %q", want)
 		}
 	}
-	if !strings.Contains(memorySystemPrompt, "случайный тон одной реплики") {
+	if !strings.Contains(strings.ToLower(memorySystemPrompt), "случайный тон одной реплики") {
 		t.Error("промпт не отличает предпочтение от случайного тона")
+	}
+}
+
+// TestSystemPromptDefinesLayersOnce guards against the old duplication where
+// the day-11 layer list and the day-15 replacement rules described working and
+// decisions twice. The extractor should get one description per layer, with the
+// replacement rule attached to the layer it belongs to.
+func TestSystemPromptDefinesLayersOnce(t *testing.T) {
+	for _, layer := range []string{"working", "profile", "decisions", "knowledge"} {
+		if n := strings.Count(memorySystemPrompt, layer+" — "); n != 1 {
+			t.Errorf("слой %s описан %d раз, ожидался один", layer, n)
+		}
+	}
+	for _, want := range []string{
+		"верни ТОТ ЖЕ ключ",
+		"при отмене требования верни null",
+		"код запишет замену в журнал",
+		"не включай дату в ключ",
+	} {
+		if !strings.Contains(memorySystemPrompt, want) {
+			t.Errorf("в системном промпте нет правила дня 15 %q", want)
+		}
 	}
 }
 

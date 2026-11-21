@@ -523,6 +523,9 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetInvariants(func() *invariant.Set { return a.inv })
 	a.agent.SetInvariantChecker(a.invChecker)
 	a.tools.SetInvariantCheckHook(a.agent.MarkChecked)
+	// Day 15: the FSM reports the edge into done; the agent clears the working
+	// card of the finished task and journals the removals.
+	a.tools.SetTaskDoneHook(a.agent.TaskDone)
 	a.agent.SetSummaryClient(a.summary)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
@@ -1312,10 +1315,12 @@ const helpText = `Команды:
                    N сообщений), facts (ключ-значение + последние N); без
                    аргумента — текущая; N — размер окна для window/facts
   /facts           память «ключ-значение» стратегии facts
-  /memory [clear <слой> | add <слой> ключ=значение]
+  /memory [clear <слой> | add <слой> ключ=значение | history [ключ] | prompt]
                    слои памяти: рабочая, профиль, решения, знания; без
-                   аргумента — что в каждом слое и сколько токенов он добавляет
-                   к запросу; clear — очистить слой; add — добавить запись
+                   аргумента — что в каждом слое, время записи и сколько
+                   токенов он добавляет к запросу; clear — очистить слой;
+                   add — добавить запись; history — журнал «было → стало»;
+                   prompt — ровно тот блок памяти, который уходит в промпт
   /profile [list | use <имя> | set ключ=значение | clear]
                    профиль пользователя: стиль, формат, обращение, ограничения;
                    уходит в каждый запрос последним блоком и пополняется из
