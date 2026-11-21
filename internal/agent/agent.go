@@ -114,6 +114,10 @@ func (a *Agent) SetMemory(m *memory.Store) {
 // system prompt after the memory layers.
 func (a *Agent) SetTask(p func() *task.Machine) { a.Comp.SetTask(p) }
 
+// SetSummaryClient routes compaction (summary, facts, memory extraction) to a
+// separate endpoint; nil keeps it on the chat client.
+func (a *Agent) SetSummaryClient(cl *llm.ChatClient) { a.Comp.SetSummaryClient(cl) }
+
 // Memory returns the attached memory model (nil when memory is off).
 func (a *Agent) Memory() *memory.Store { return a.mem }
 

@@ -216,7 +216,7 @@ func (c *Compactor) ExtractMemory(ctx context.Context, store *memory.Store, user
 	prompt := memoryPrompt(store, userText)
 	primary := c.hist.SummaryModel()
 
-	out, err := c.jsonRequest(ctx, primary, memorySystemPrompt, prompt)
+	out, err := c.jsonRequest(ctx, c.summaryClient(), primary, memorySystemPrompt, prompt)
 	if err != nil {
 		backup := c.hist.ChatModel()
 		if backup == "" || backup == primary || ctx.Err() != nil {
@@ -225,7 +225,7 @@ func (c *Compactor) ExtractMemory(ctx context.Context, store *memory.Store, user
 		if c.trace != nil {
 			c.trace(fmt.Sprintf("память: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
 		}
-		out2, err2 := c.jsonRequest(ctx, backup, memorySystemPrompt, prompt)
+		out2, err2 := c.jsonRequest(ctx, c.client, backup, memorySystemPrompt, prompt)
 		if err2 != nil {
 			return "", fmt.Errorf("%s: %v; запасная %s: %v", primary, err, backup, err2)
 		}
@@ -236,8 +236,8 @@ func (c *Compactor) ExtractMemory(ctx context.Context, store *memory.Store, user
 
 // jsonRequest runs one extractor request under the summarizer's per-attempt
 // timeout and returns the raw answer.
-func (c *Compactor) jsonRequest(ctx context.Context, model, system, prompt string) (string, error) {
-	return jsonChat(ctx, c.client, model, system, prompt, summaryAttemptTimeout)
+func (c *Compactor) jsonRequest(ctx context.Context, cl *llm.ChatClient, model, system, prompt string) (string, error) {
+	return jsonChat(ctx, cl, model, system, prompt, summaryAttemptTimeout)
 }
 
 // jsonChat is the transport of both extractor paths: one system+user request

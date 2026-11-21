@@ -43,6 +43,8 @@ type app struct {
 	skipProfile  bool          // no onboarding dialogue at startup (scripts, runs)
 	scriptDelay  time.Duration // pause between dialogue turns in -script (rate limits)
 
+	summary *llm.ChatClient // client for compaction; nil means the chat client
+
 	hist  *history.History
 	agent *agent.Agent
 	mem   *memory.Store
@@ -254,7 +256,7 @@ func (u *ui) trace(s string) {
 }
 
 func main() {
-	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или deepseek-v4-flash)")
+	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или opencode-go/deepseek-v4.1-flash)")
 	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или самая дешёвая в списке)")
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
@@ -370,6 +372,14 @@ func main() {
 	}
 	client.SetMaxTokens(*maxTokens)
 
+	// Compaction may live on another endpoint (local Ollama). Without
+	// LLM_SUMMARY_BASE_URL this is the same client as chat.
+	summaryClient := llm.NewSummaryClient()
+	summaryClient.SetMaxTokens(*maxTokens)
+	if summaryClient != client {
+		fmt.Printf("сжатие: %s\n", llm.DescribeEndpoint(summaryClient))
+	}
+
 	a := &app{
 		client:       client,
 		tools:        tools.NewToolRegistry(tasks),
@@ -387,6 +397,7 @@ func main() {
 		profile:      *profileFlag,
 		skipProfile:  *skipProfile,
 		scriptDelay:  *scriptDelay,
+		summary:      summaryClient,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 	// The task machine is per-session, so the registry holds a provider, not
@@ -446,6 +457,7 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetMemory(mem)
 	a.agent.SetTask(func() *task.Machine { return a.task })
+	a.agent.SetSummaryClient(a.summary)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	if !a.noReasoning {
@@ -604,10 +616,16 @@ func (a *app) footer() {
 		over = " · ПЕРЕПОЛНЕНИЕ"
 	}
 	s := a.client.Stats()
-	fmt.Printf("· %s · промпт ~%d/%d ток · ответ ~%d ток · актив %d, архив %d сообщ%s · API %d выз., $%.4f%s\n",
+	// Implicit caching is invisible in the estimate but halves the bill: show
+	// the share of the prompt the provider served from its cache.
+	cache := ""
+	if s.CachedTokens > 0 {
+		cache = fmt.Sprintf(" · кеш %d/%d", s.CachedTokens, s.PromptTokens)
+	}
+	fmt.Printf("· %s · промпт ~%d/%d ток · ответ ~%d ток%s · актив %d, архив %d сообщ%s · API %d выз., $%.4f%s\n",
 		a.hist.ChatModel(),
 		prompt, a.budget.MaxPromptTokens,
-		a.agent.LastAnswerTokens(),
+		a.agent.LastAnswerTokens(), cache,
 		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost, over)
 }
 
@@ -927,6 +945,9 @@ func (a *app) printContext() {
 	}
 
 	fmt.Printf("что уходит в модель (сессия %s, модель %s, стратегия %s):\n", a.hist.ID(), a.hist.ChatModel(), a.strategy)
+	if a.summary != nil && a.summary != a.client {
+		fmt.Printf("  сжатие               %s, модель %s\n", llm.DescribeEndpoint(a.summary), a.hist.SummaryModel())
+	}
 	fmt.Printf("  system prompt        ~%d ток.\n", base)
 	switch a.strategy {
 	case compact.StrategyFacts:
@@ -1043,8 +1064,8 @@ func (a *app) printTokens() {
 	fmt.Printf("модель сжатия: %s\n", a.hist.SummaryModel())
 
 	s := a.client.Stats()
-	fmt.Printf("API: %d вызовов, промпт %d, ответ %d, всего %d ток., $%.4f\n",
-		s.Calls, s.PromptTokens, s.CompletionTokens, s.TotalTokens, s.Cost)
+	fmt.Printf("API: %d вызовов, промпт %d (из кеша %d), ответ %d, всего %d ток., $%.4f\n",
+		s.Calls, s.PromptTokens, s.CachedTokens, s.CompletionTokens, s.TotalTokens, s.Cost)
 }
 
 func (a *app) runScript(path string) error {
@@ -1132,7 +1153,15 @@ func printModels() {
 		if m.ID == config.DefaultModel() {
 			mark = "*"
 		}
-		fmt.Printf(" %s %-22s %-10s $%.4f/1M\n", mark, m.ID, m.Tier, m.RatePerM)
+		// Кеш-чтение дешевле обычного входа, поэтому печатаем отдельной
+		// колонкой: по ней видно, сколько даёт повторный промпт. Прочерк
+		// означает, что провайдер кеш-ставку не сообщает.
+		cache := "—"
+		if m.RateCachePerM > 0 {
+			cache = fmt.Sprintf("$%.3f", m.RateCachePerM)
+		}
+		fmt.Printf(" %s %-32s %-10s вход $%.2f / выход $%.2f / кеш %-6s за 1M\n",
+			mark, m.ID, m.Tier, m.RateInPerM, m.RateOutPerM, cache)
 	}
 	fmt.Println("(* — по умолчанию)")
 }
