@@ -76,7 +76,8 @@ internal/task/        конечный автомат задачи: этапы, 
                       гейты плана и паузы, task.json сессии
 internal/tokens/      оценка токенов и калибровка (EMA по факту ответа)
 internal/config/      список моделей, лимиты, Truncate/OneLine
-internal/readline/    строчный редактор с ANSI
+internal/readline/    строчный редактор с ANSI; Ctrl-C в ответе отменяет ход,
+                      Ctrl-D на пустой строке — выход
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt,
                       day12-*: профили, вопрос, устойчивость, демо, карточки,
                       day13-*: сценарий и карточки автомата задачи)
