@@ -181,3 +181,46 @@ func TestTaskTransitionTool(t *testing.T) {
 		t.Errorf("неизвестный этап: %q", out)
 	}
 }
+
+// TestTaskDoneHook checks the day-15 edge trigger: the hook fires only when
+// the machine enters done, not on the earlier transitions and not twice.
+func TestTaskDoneHook(t *testing.T) {
+	r := NewToolRegistry(nil)
+	var machine *task.Machine
+	r.SetTaskProvider(func() *task.Machine { return machine })
+	done := 0
+	r.SetTaskDoneHook(func() { done++ })
+
+	var err error
+	machine, err = task.Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := machine.Start("сбор", "план", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Approve(); err != nil {
+		t.Fatal(err)
+	}
+	for _, to := range []string{"execution", "validation"} {
+		out := r.Execute(call("task_transition", `{"to":"`+to+`"}`))
+		if !strings.Contains(out, "переход применён") {
+			t.Fatalf("%s: %q", to, out)
+		}
+	}
+	if done != 0 {
+		t.Fatalf("hook сработал до done: %d", done)
+	}
+	out := r.Execute(call("task_transition", `{"to":"done"}`))
+	if !strings.Contains(out, "переход применён: validation → done") {
+		t.Fatalf("done: %q", out)
+	}
+	if done != 1 {
+		t.Fatalf("hook на done сработал %d раз, ожидался 1", done)
+	}
+	// done is a dead end: a second call is rejected and must not fire again.
+	r.Execute(call("task_transition", `{"to":"done"}`))
+	if done != 1 {
+		t.Fatalf("hook повторно сработал на запрещённом переходе: %d", done)
+	}
+}

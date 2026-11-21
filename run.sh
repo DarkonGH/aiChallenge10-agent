@@ -20,7 +20,12 @@ if [ -z "${LLM_SUMMARY_BASE_URL:-}" ] &&
    curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
   export LLM_SUMMARY_BASE_URL=http://localhost:11434/v1
   export LLM_SUMMARY_API_KEY=${LLM_SUMMARY_API_KEY:-ollama}
-  export LLM_SUMMARY_MODEL=${LLM_SUMMARY_MODEL:-qwen2.5:14b}
+  # The endpoint is local, so the model must be local too. ~/.env often exports
+  # LLM_SUMMARY_MODEL with the cloud chat id (opencode-go/deepseek-v4.1-flash);
+  # Ollama then answers 404 and the profile/memory extractor dies on every turn.
+  # Choosing the endpoint here also means choosing its model, so this is not a
+  # default that an inherited cloud id can override.
+  export LLM_SUMMARY_MODEL=qwen2.5:14b
   export LLM_INVARIANT_MODEL=${LLM_INVARIANT_MODEL:-$LLM_SUMMARY_MODEL}
 fi
 

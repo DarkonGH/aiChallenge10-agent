@@ -122,6 +122,33 @@ func (a *Agent) SetMemory(m *memory.Store) {
 	a.Comp.SetMemory(m)
 }
 
+// TaskDone is the day-15 cleanup hook: when the task machine reaches done, the
+// working layer is a card of the finished task and must not leak into the next
+// one. Long-term layers (profile, decisions, knowledge) stay untouched. The
+// removals are journaled with their old values, exactly like a model update.
+func (a *Agent) TaskDone() {
+	if a.mem == nil {
+		return
+	}
+	changes := a.mem.ClearWithChanges(memory.LayerWorking)
+	if len(changes) == 0 {
+		return
+	}
+	if err := a.mem.Save(); err != nil {
+		a.tracef("память: задачу завершили, но сохранить очистку не удалось: %v", err)
+		return
+	}
+	upd := memory.Update{Remove: map[memory.Layer][]string{}}
+	for _, c := range changes {
+		upd.Remove[c.Layer] = append(upd.Remove[c.Layer], c.Key)
+	}
+	if err := a.hist.AppendMemoryChanges(upd, changes); err != nil {
+		a.tracef("память: журнал очистки: %v", err)
+	}
+	a.tracef("память: задача завершена — рабочая память очищена (%s); "+
+		"долговременная сохранена", memory.DescribeChanges(changes))
+}
+
 // SetTask attaches the day-13 task machine provider: the state block joins the
 // system prompt after the memory layers.
 func (a *Agent) SetTask(p func() *task.Machine) { a.Comp.SetTask(p) }
@@ -401,12 +428,16 @@ func (a *Agent) updateMemory(ctx context.Context, userText string) {
 	if upd.Empty() {
 		return // nothing durable in this message
 	}
-	a.mem.Apply(upd)
+	changes := a.mem.Apply(upd)
 	if err := a.mem.Save(); err != nil {
 		a.tracef("память: сохранить не удалось: %v", err)
 	}
-	if err := a.hist.AppendMemory(upd); err != nil {
+	if err := a.hist.AppendMemoryChanges(upd, changes); err != nil {
 		a.tracef("память: журнал: %v", err)
+	}
+	if len(changes) > 0 {
+		a.tracef("память: %s; всего %d", memory.DescribeChanges(changes), a.mem.Total())
+		return
 	}
 	a.tracef("память: %s; всего %d", describeUpdate(upd), a.mem.Total())
 }

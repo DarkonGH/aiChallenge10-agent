@@ -219,6 +219,9 @@ def load_cards(path):
     for c in raw:
         lines = []
         for text, size, color, gap in c["lines"]:
+            # Menlo не содержит глифа рубля и рисует квадрат; в карточках
+            # заменяем так же, как в транскрипте (run_to_cast.plain_text).
+            text = text.replace("₽", "руб.")
             lines.append((text, int(size), CARD_COLORS[color], int(gap)))
         out.append((float(c.get("seconds", 6)), lines))
     return out
