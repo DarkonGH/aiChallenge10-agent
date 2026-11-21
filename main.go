@@ -10,6 +10,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
@@ -49,7 +50,11 @@ type app struct {
 	agent *agent.Agent
 	mem   *memory.Store
 	task  *task.Machine // day-13 task state machine of the current session
-	ui    *ui
+	// Day-14 project invariants: one set per workspace, outside every session.
+	inv        *invariant.Set
+	invPath    string
+	invChecker *invariant.Checker // local-model prose check; nil = keywords only
+	ui         *ui
 }
 
 // ui owns the single "status line" under the prompt: the one-character
@@ -284,7 +289,14 @@ func main() {
 	profileFlag := flag.String("profile", "", "профиль пользователя: имя каталога в <data>/profiles (пусто — общий <data>/shared)")
 	skipProfile := flag.Bool("skip-profile", false, "не спрашивать профиль при старте (сценарии и прогоны)")
 	scriptDelay := flag.Duration("script-delay", 0, "пауза между репликами в -script (для лимитов провайдера, например 30s)")
+	invariantsFlag := flag.String("invariants", "", "файл инвариантов проекта (по умолчанию <data>/invariants.json)")
+	invariantCheck := flag.String("invariant-check", "llm", "проверка текста ответа: llm (локальная модель + ключевые слова) или keywords")
+	invariantModel := flag.String("invariant-model", "", "модель семантической проверки (по умолчанию LLM_INVARIANT_MODEL / LLM_SUMMARY_MODEL)")
 	flag.Parse()
+
+	if *invariantCheck != "llm" && *invariantCheck != "keywords" {
+		fatalf("-invariant-check: допустимо llm или keywords, получено %q", *invariantCheck)
+	}
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
 	if err != nil {
@@ -361,6 +373,21 @@ func main() {
 		system = strings.TrimSpace(string(b))
 	}
 
+	// The invariant set is a workspace file, not part of any session: /new,
+	// /session and a fresh log leave it untouched. Loading it before the app
+	// also fails fast on a malformed file instead of mid-dialogue.
+	invariantsPath := *invariantsFlag
+	if invariantsPath == "" {
+		invariantsPath = filepath.Join(dataDir, "invariants.json")
+	}
+	inv, err := invariant.Load(invariantsPath)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if inv.Active() {
+		fmt.Printf("инварианты: %d правил (%s)\n", inv.Len(), invariantsPath)
+	}
+
 	tasks, err := config.LoadTasks(*tasksFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
@@ -398,11 +425,37 @@ func main() {
 		skipProfile:  *skipProfile,
 		scriptDelay:  *scriptDelay,
 		summary:      summaryClient,
+		inv:          inv,
+		invPath:      invariantsPath,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 	// The task machine is per-session, so the registry holds a provider, not
 	// a pointer: the task_transition tool always acts on the current session.
 	a.tools.SetTaskProvider(func() *task.Machine { return a.task })
+	// Invariants are the opposite: one workspace set, shared by every session.
+	a.tools.SetInvariantProvider(func() *invariant.Set { return a.inv })
+
+	if *invariantCheck == "llm" {
+		model := *invariantModel
+		if model == "" {
+			model = os.Getenv("LLM_INVARIANT_MODEL")
+		}
+		if model == "" {
+			model = os.Getenv("LLM_SUMMARY_MODEL")
+		}
+		// The checker reuses the summary endpoint: locally it is Ollama, so
+		// the extra per-answer call costs no money. The fallback resolves the
+		// session's summary model after newSession.
+		a.invChecker = invariant.NewChecker(summaryClient, func() string {
+			if model != "" {
+				return model
+			}
+			if a.hist != nil {
+				return a.hist.SummaryModel()
+			}
+			return config.DefaultSummaryModel()
+		})
+	}
 
 	sessionID := *sessionFlag
 	if *continueFlag {
@@ -457,6 +510,9 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetMemory(mem)
 	a.agent.SetTask(func() *task.Machine { return a.task })
+	a.agent.SetInvariants(func() *invariant.Set { return a.inv })
+	a.agent.SetInvariantChecker(a.invChecker)
+	a.tools.SetInvariantCheckHook(a.agent.MarkChecked)
 	a.agent.SetSummaryClient(a.summary)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
@@ -521,7 +577,10 @@ func (a *app) repl() {
 }
 
 func (a *app) ask(text string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	// The day-14 gate adds a local-model check after the main answer; with a
+	// 14B model on CPU that can take tens of seconds. The old 180 s cap was
+	// enough for the chat call alone, not for chat + semantic re-check.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	done := make(chan struct{})
@@ -767,6 +826,9 @@ func (a *app) command(line string) (bool, error) {
 	case "/task":
 		return false, a.taskCommand(arg)
 
+	case "/invariant":
+		return false, a.invariantCommand(arg)
+
 	case "/branch":
 		if arg == "" {
 			if p := a.hist.ForkOf(); p != "" {
@@ -990,6 +1052,9 @@ func (a *app) printContext() {
 			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
 		}
 	}
+	if block := a.agent.Comp.InvariantBlock(); block != "" {
+		fmt.Printf("  инварианты           ~%4d ток.  %d правил, всегда\n", tokens.EstimateTokens(block), a.inv.Len())
+	}
 	if stage, tok := a.taskBlockInfo(); stage != "" {
 		fmt.Printf("  задача               ~%4d ток.  этап %s, всегда\n", tok, stage)
 	}
@@ -1205,6 +1270,11 @@ const helpText = `Команды:
                    состояние задачи (день 13): конечный автомат planning →
                    execution → validation → done; переходы ассистента
                    проверяет код, approve/pause/resume — только здесь
+  /invariant [list | add | change | remove | history]
+                   инварианты проекта (день 14): архитектура, стек, бюджет;
+                   хранятся в <data>/invariants.json отдельно от диалога,
+                   меняются только этой командой, каждое изменение — в журнал
+                   с парой «было → стало»; модель их не меняет
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

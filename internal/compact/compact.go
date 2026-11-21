@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
@@ -63,6 +64,7 @@ type Compactor struct {
 	// task is the day-13 task machine provider; its state block joins the
 	// system prompt after the memory layers.
 	task func() *task.Machine
+	inv  func() *invariant.Set
 }
 
 // SetSummaryClient routes summarization and extraction to a dedicated client.
@@ -99,6 +101,11 @@ func (c *Compactor) SetMemory(m *memory.Store) { c.mem = m }
 // pointer) is deliberate: /new and /session swap the machine per session. Nil
 // provider or no started task removes the block from the prompt.
 func (c *Compactor) SetTask(p func() *task.Machine) { c.task = p }
+
+// SetInvariants attaches the workspace's project invariants. They sit between
+// memory and the task block: first who the user is, then what must not be
+// broken, then where the current task stands.
+func (c *Compactor) SetInvariants(p func() *invariant.Set) { c.inv = p }
 
 // SetQuestion records the user text of the current turn. Knowledge records are
 // filtered by relevance to it, so the prompt must be built after this call.
@@ -163,13 +170,28 @@ func (c *Compactor) PromptTokens(system string) int {
 	return c.calib.Scale(n)
 }
 
+// InvariantBlock renders the project invariants for the prompt and for
+// /context. Empty when the workspace has no invariants.
+func (c *Compactor) InvariantBlock() string {
+	if c.inv == nil {
+		return ""
+	}
+	if s := c.inv(); s != nil {
+		return s.Block()
+	}
+	return ""
+}
+
 // promptSystem assembles the system prompt with the strategy's memory block:
 // the rolling summary for the summary strategy, the sticky facts for the
-// facts strategy, nothing extra for the bare window. The day-13 task state
-// block goes last, after the memory layers.
+// facts strategy, nothing extra for the bare window. The day-14 invariants
+// follow memory, then the day-13 task state block goes last.
 func (c *Compactor) PromptSystem(system string) string {
 	base := c.shortBlock(system)
 	if block := c.MemoryBlock(); block != "" {
+		base = base + "\n\n" + block
+	}
+	if block := c.InvariantBlock(); block != "" {
 		base = base + "\n\n" + block
 	}
 	if c.task != nil {

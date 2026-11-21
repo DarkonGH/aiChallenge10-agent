@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"strconv"
@@ -29,7 +30,11 @@ type ToolRegistry struct {
 	tools     map[string]*Tool
 	order     []string
 	maxResult int
-	task      func() *task.Machine // current session's task machine (day 13)
+	task      func() *task.Machine  // current session's task machine (day 13)
+	inv       func() *invariant.Set // current workspace's invariants (day 14)
+	// onInvariantCheck reports the check_solution verdict: true opens the
+	// agent's gate for the current turn, false closes it again.
+	onInvariantCheck func(ok bool)
 }
 
 // NewToolRegistry builds the agent's tool set. tasks is the in-memory list from
@@ -122,11 +127,117 @@ func NewToolRegistry(tasks []config.Task) *ToolRegistry {
 		},
 	})
 
+	// The day-14 tool: before releasing an answer, the model declares every
+	// technical choice and the invariants it took into account. The code
+	// checks the values; the agent gate refuses to release a draft until this
+	// call has passed. The schema is lazy (only while invariants exist), so a
+	// workspace without them pays nothing.
+	r.add(&Tool{
+		Name: "check_solution",
+		Description: "Проверяет предлагаемое решение на соответствие инвариантам проекта. " +
+			"Вызывай ОБЯЗАТЕЛЬНО перед каждым ответом, если инварианты заданы: " +
+			"в choices перечисли каждый технический выбор (area — область инварианта, " +
+			"value — только принятое значение), в invariants — id всех затронутых инвариантов. " +
+			"Отвергнутые варианты в choices не перечисляй: value описывает то, что ты предлагаешь, " +
+			"а не то, от чего отказываешься. " +
+			"Если выбор не назван или инвариант не учтён, проверка не пройдёт и ответ не будет выдан.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"summary": map[string]any{
+					"type":        "string",
+					"description": "Короткое описание предлагаемого решения",
+				},
+				"choices": map[string]any{
+					"type":        "array",
+					"description": "Технические выборы решения",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"area": map[string]any{
+								"type":        "string",
+								"description": "Область инварианта, например database или budget",
+							},
+							"value": map[string]any{
+								"type":        "string",
+								"description": "Только принятое значение, например PostgreSQL 15 или 240 000 ₽/мес; запрещённые и отвергнутые варианты сюда не пиши",
+							},
+						},
+						"required":             []string{"area", "value"},
+						"additionalProperties": false,
+					},
+				},
+				"invariants": map[string]any{
+					"type":        "array",
+					"description": "id всех инвариантов, которые учтены в ответе",
+					"items":       map[string]any{"type": "string"},
+				},
+			},
+			"required":             []string{"choices", "invariants"},
+			"additionalProperties": false,
+		},
+		Run: r.runCheckSolution,
+		Visible: func() bool {
+			return r.inv != nil && r.inv() != nil && r.inv().Active()
+		},
+	})
+
 	return r
 }
 
 // SetTaskProvider attaches the source of the current session's task machine.
 func (r *ToolRegistry) SetTaskProvider(p func() *task.Machine) { r.task = p }
+
+// SetInvariantProvider attaches the workspace's invariant set. The set is
+// shared by all sessions and survives /new, so it is a provider, not a copy.
+func (r *ToolRegistry) SetInvariantProvider(p func() *invariant.Set) { r.inv = p }
+
+// SetInvariantCheckHook sets the callback for a successful check_solution.
+func (r *ToolRegistry) SetInvariantCheckHook(f func(ok bool)) { r.onInvariantCheck = f }
+
+// runCheckSolution validates the declared choices against the invariants.
+// The success hook is what lets the agent gate release this turn's answer.
+func (r *ToolRegistry) runCheckSolution(args json.RawMessage) (string, error) {
+	if r.inv == nil || r.inv() == nil || !r.inv().Active() {
+		return "", fmt.Errorf("инварианты не заданы; проверять нечего")
+	}
+	var a struct {
+		Summary    string             `json:"summary"`
+		Choices    []invariant.Choice `json:"choices"`
+		Invariants []string           `json:"invariants"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "", fmt.Errorf("аргументы: %w", err)
+	}
+	set := r.inv()
+	if err := set.Check(a.Choices, a.Invariants); err != nil {
+		if r.onInvariantCheck != nil {
+			r.onInvariantCheck(false)
+		}
+		return "", err
+	}
+	if r.onInvariantCheck != nil {
+		r.onInvariantCheck(true)
+	}
+
+	// Report the canonical ids, not the aliases the model may have used.
+	ids := make([]string, 0, len(a.Invariants))
+	seen := map[string]bool{}
+	for _, id := range a.Invariants {
+		it := set.Find(id)
+		if it == nil || seen[it.ID] {
+			continue
+		}
+		seen[it.ID] = true
+		ids = append(ids, it.ID)
+	}
+	what := "выборов нет"
+	if len(a.Choices) > 0 {
+		what = fmt.Sprintf("выборов %d", len(a.Choices))
+	}
+	return fmt.Sprintf("проверка пройдена: %s, инварианты %s; ответ можно выдавать",
+		what, orDash(strings.Join(ids, ", "))), nil
+}
 
 // runTaskTransition applies the requested stage change through the machine;
 // a forbidden transition comes back as an error, so the model sees the

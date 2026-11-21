@@ -6,6 +6,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
@@ -44,7 +45,18 @@ type Agent struct {
 	// mem is the explicit memory model (day 11). Nil = memory disabled: the
 	// prompt carries only the short-term strategy block.
 	mem *memory.Store
+
+	// inv is the project invariants (day 14). checkedOK opens the gate for
+	// the current turn: only a successful check_solution sets it, and it stays
+	// open while the prose layer rejects drafts for wording.
+	inv        func() *invariant.Set
+	invChecker *invariant.Checker
+	checkedOK  bool
 }
+
+// maxInvariantRejects bounds how many drafts the gate may reject in one turn
+// before the agent gives up with an honest error instead of looping.
+const maxInvariantRejects = 3
 
 // NewAgent wires a session, a tool set and a context compactor together.
 func NewAgent(client *llm.ChatClient, tools *tools.ToolRegistry, hist *history.History, budget compact.Budget, maxSteps int, temperature float64, maxToolChars int) *Agent {
@@ -114,6 +126,21 @@ func (a *Agent) SetMemory(m *memory.Store) {
 // system prompt after the memory layers.
 func (a *Agent) SetTask(p func() *task.Machine) { a.Comp.SetTask(p) }
 
+// SetInvariants attaches the day-14 project invariants. The block joins the
+// system prompt between memory and the task state; the gate below enforces it.
+func (a *Agent) SetInvariants(p func() *invariant.Set) {
+	a.inv = p
+	a.Comp.SetInvariants(p)
+}
+
+// SetInvariantChecker attaches the local-model prose checker. Nil keeps only
+// the deterministic keyword fallback.
+func (a *Agent) SetInvariantChecker(c *invariant.Checker) { a.invChecker = c }
+
+// MarkChecked opens or closes the gate for the current turn. The tool registry
+// calls it from check_solution: success opens, failure closes.
+func (a *Agent) MarkChecked(ok bool) { a.checkedOK = ok }
+
 // SetSummaryClient routes compaction (summary, facts, memory extraction) to a
 // separate endpoint; nil keeps it on the chat client.
 func (a *Agent) SetSummaryClient(cl *llm.ChatClient) { a.Comp.SetSummaryClient(cl) }
@@ -141,6 +168,12 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	// The question drives knowledge relevance, so it is recorded before any
 	// prompt is assembled.
 	a.Comp.SetQuestion(userText)
+
+	// Every turn starts with the invariant gate closed: the model must call
+	// check_solution again, even if the previous turn passed.
+	a.checkedOK = false
+	inv := a.activeInvariants()
+	rejects := 0
 
 	// Explicit memory model: one extractor call per turn routes the durable
 	// part of the message into working/long-term layers. On failure the layers
@@ -193,7 +226,14 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		var resp *llm.ChatResponse
 		var err error
 		if a.onContent != nil {
-			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, a.onContent, a.onReasoning)
+			// With invariants the answer is buffered: the deltas are swallowed
+			// and the text is printed only after the gate lets it through.
+			// Reasoning still streams: it is not part of the answer.
+			onDelta := a.onContent
+			if inv != nil {
+				onDelta = func(string) {}
+			}
+			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, onDelta, a.onReasoning)
 		} else {
 			resp, err = a.client.Chat(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature)
 		}
@@ -209,6 +249,23 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			if inv != nil {
+				problem := a.invariantProblem(ctx, inv, resp.Content)
+				if problem != "" {
+					rejects++
+					if rejects > maxInvariantRejects {
+						return "", fmt.Errorf("инварианты: ответ не прошёл проверку кода %d раз; последний отказ: %s", maxInvariantRejects, problem)
+					}
+					// The draft stays in the log (audit), the notice tells the
+					// model what to fix. The violating text never reaches
+					// stdout: with invariants the stream was swallowed.
+					a.hist.AppendNotice(problem +
+						" Черновик выше не выпущен. Перепиши ответ: убери нарушение, " +
+						"вызови check_solution и только после успешной проверки отвечай.")
+					a.tracef("инварианты: черновик отклонён кодом — %s", config.OneLine(problem))
+					continue
+				}
+			}
 			return resp.Content, nil
 		}
 
@@ -220,6 +277,88 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	}
 
 	return "", fmt.Errorf("агент: превышен лимит шагов (%d), модель продолжает вызывать инструменты", a.maxSteps)
+}
+
+// activeInvariants returns the set only when it has rules to enforce.
+func (a *Agent) activeInvariants() *invariant.Set {
+	if a.inv == nil {
+		return nil
+	}
+	set := a.inv()
+	if set == nil || !set.Active() {
+		return nil
+	}
+	return set
+}
+
+// invariantProblem is the gate's verdict on a final draft. Empty means the
+// answer may be released. The order is deliberate: the structural check (the
+// model's own check_solution declaration) is the hard guarantee, then the
+// keyword scan, then the local model for meaning. If the local endpoint is
+// down, the first two still hold.
+func (a *Agent) invariantProblem(ctx context.Context, set *invariant.Set, text string) string {
+	if !a.checkedOK {
+		return "check_solution не пройден: перед ответом вызови инструмент и перечисли все затронутые инварианты и выборы"
+	}
+	// The semantic layer is primary: it understands refusals and comparisons,
+	// while the keyword scan is deliberately conservative and would reject a
+	// correct "MongoDB can only be changed by the user" explanation. Keywords
+	// remain the fallback when the local endpoint is unavailable.
+	if a.invChecker != nil {
+		a.tracef("инварианты: проверяю текст локальной моделью %s", a.invChecker.Model())
+		v, err := a.invChecker.Check(ctx, text, set.All())
+		if err != nil {
+			a.tracef("инварианты: локальная проверка недоступна (%s) — остаются ключевые слова", config.OneLine(err.Error()))
+			return keywordProblem(set, text)
+		}
+		if v.Violates {
+			// A small local model can invent a plausible quote. Blocking on a
+			// sentence that is not in the answer would reject a correct
+			// refusal on fabricated evidence; require the quote to be present.
+			if !invariant.QuotePresent(text, v.Quote) {
+				a.tracef("инварианты: локальная модель сослалась на фразу, которой нет в ответе — вердикт отброшен")
+				return ""
+			}
+			// A refusal may quote the forbidden number or name while
+			// explaining why it is not allowed. The semantic layer sometimes
+			// flags exactly that; do not let it reject a correct refusal.
+			if invariant.NegatedQuote(text, v.Quote) {
+				a.tracef("инварианты: локальная модель ошиблась — цитата в отрицающем предложении")
+				return ""
+			}
+			// A numeric rule has a deterministic answer: if no number in the
+			// text is above max, the model's "budget exceeded" verdict is
+			// wrong. This catches the valid "350 000 при лимите 400 000" case.
+			if it := set.Find(v.ID); it != nil && it.Rule.Max != nil && !invariant.ExceedsMax(text, *it.Rule.Max) {
+				a.tracef("инварианты: локальная модель ошиблась — числа не превышают предел %g", *it.Rule.Max)
+				return ""
+			}
+			quote := config.Truncate(config.OneLine(v.Quote), 140)
+			id := v.ID
+			if id == "" {
+				id = "?"
+			}
+			reason := config.OneLine(v.Reason)
+			if reason == "" {
+				reason = "предлагает запрещённое решение"
+			}
+			return fmt.Sprintf("локальная модель увидела нарушение инварианта %s: %q — %s", id, quote, reason)
+		}
+		a.tracef("инварианты: нарушений нет")
+		return ""
+	}
+	return keywordProblem(set, text)
+}
+
+// keywordProblem is the deterministic fallback for free text. It is
+// intentionally simple and over-blocks some refusals; it runs only when no
+// semantic checker is configured or the local endpoint failed.
+func keywordProblem(set *invariant.Set, text string) string {
+	if vs := set.CheckText(text); len(vs) > 0 {
+		v := vs[0]
+		return fmt.Sprintf("в ответе запрещённое значение %q (инвариант %s)", v.Term, v.ID)
+	}
+	return ""
 }
 
 // updateMemory folds the new user message into the layered memory: extract a

@@ -311,6 +311,18 @@ func (h *History) AppendTool(callID, name, content string) *llm.Message {
 	return h.appendMsg(&llm.Message{Role: "tool", ToolCallID: callID, Name: name, Content: content})
 }
 
+// NoticePrefix marks a service turn written by the code gate, not by the user.
+// It has role user because the API only accepts user/assistant/tool messages,
+// but the prefix lets the log render it as a code verdict.
+const NoticePrefix = "[проверка кода · инварианты] "
+
+// AppendNotice records a code gate refusal in the dialogue. Keeping it in the
+// log is the audit trail: the rejected draft stays in history too, so it is
+// visible why the answer was not released.
+func (h *History) AppendNotice(content string) *llm.Message {
+	return h.appendMsg(&llm.Message{Role: "user", Content: NoticePrefix + content})
+}
+
 // Compact moves messages with seq in [from,to] out of the prompt and replaces
 // the rolling summary. Raw messages stay in the log forever.
 func (h *History) Compact(from, to int64, summary string) error {
@@ -758,6 +770,8 @@ func PrintSessionLog(dataDir, id string, w io.Writer) error {
 func printLogMessage(w io.Writer, m *llm.Message) {
 	text := strings.TrimRight(m.Content, "\n")
 	switch {
+	case strings.HasPrefix(text, NoticePrefix):
+		fmt.Fprintf(w, "[%3d] проверка кода ⛔ %s\n", m.Seq, strings.TrimPrefix(text, NoticePrefix))
 	case len(m.ToolCalls) > 0:
 		for _, tc := range m.ToolCalls {
 			fmt.Fprintf(w, "[%3d] %-9s → %s(%s)\n", m.Seq, m.Role, tc.Function.Name, config.OneLine(tc.Function.Arguments))

@@ -1,0 +1,77 @@
+{
+  "invariants": [
+    {
+      "id": "arch",
+      "area": "architecture",
+      "text": "Только модульный монолит: один деплой и один процесс, без распределённых сервисов.",
+      "rule": {
+        "deny": [
+          "микросервис",
+          "microservice",
+          "service mesh",
+          "kubernetes",
+          "k8s",
+          "serverless"
+        ]
+      }
+    },
+    {
+      "id": "db",
+      "area": "database",
+      "text": "Единственная СУБД — PostgreSQL 15.",
+      "rule": {
+        "deny": [
+          "mysql",
+          "mariadb",
+          "mongodb",
+          "mongo",
+          "oracle",
+          "sqlite",
+          "mssql",
+          "sql server"
+        ]
+      }
+    },
+    {
+      "id": "queue",
+      "area": "queue",
+      "text": "Шина событий — Kafka; другие брокеры не добавляем.",
+      "rule": {
+        "deny": [
+          "rabbitmq",
+          "rabbit mq",
+          "nats",
+          "activemq",
+          "sqs",
+          "google pub/sub",
+          "pulsar"
+        ]
+      }
+    },
+    {
+      "id": "host",
+      "area": "hosting",
+      "text": "Хостинг только в Российской Федерации.",
+      "rule": {
+        "deny": [
+          "aws",
+          "amazon web services",
+          "google cloud",
+          "gcp",
+          "azure",
+          "heroku",
+          "digitalocean"
+        ]
+      }
+    },
+    {
+      "id": "budget",
+      "area": "budget",
+      "text": "Бюджет инфраструктуры — не более 300 000 ₽ в месяц.",
+      "rule": {
+        "max": 300000
+      }
+    }
+  ],
+  "changes": []
+}

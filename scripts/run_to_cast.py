@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
-"""Синтез asciicast-v2 из session.jsonl удачного прогона дня 13.
+"""Синтез asciicast-v2 из session.jsonl удачного прогона (день 13/14).
 
-Зачем: живая запись демо на deepseek-v4-flash нестабильна (модель недетерминирована,
-иногда не доходит до done). Удачный прогон (лог /tmp/day13-run-ok/demo/session.jsonl,
-28 событий, дошёл до done, 3 перехода применены, чекер exit 0) — единственный полный.
-Здесь тот же диалог перекладывается в каст без новых вызовов модели: user-реплики
+Зачем: живая запись демо на модели нестабильна (модель недетерминирована,
+иногда не доходит до финала). Удачный прогон — единственный полный; здесь тот
+же диалог перекладывается в каст без новых вызовов модели: user-реплики
 печатаются как 'agent> <текст>', assistant-текст и вывод инструмента — следом,
-память — приглушённо. Дальше каст собирает render_cast.py с testdata/day13-cards.json.
+память — приглушённо, отказ кода — строкой «⛔ код: …». Дальше каст собирает
+render_cast.py с карточками из testdata/dayNN-cards.json.
 
-    python3 scripts/run_to_cast.py /tmp/day13-run-ok/demo/session.jsonl /tmp/day13-demo.cast
+    python3 scripts/run_to_cast.py /tmp/day14-run-ok/demo/session.jsonl /tmp/day14-demo.cast
 """
 
 import json
+import re
 import sys
 import textwrap
 import time
+
+NOTICE_PREFIX = "[проверка кода · инварианты] "
 
 WIDTH, HEIGHT = 148, 50
 # Терминал переносит строки на границе колонок; если не обернуть текст заранее,
 # длинная строка рвётся посреди слова и в видео получаются «хаотичные переносы».
 COLS = WIDTH - 2  # оставляем запас справа, чтобы слово не упиралось в край
+
+
+def plain_text(text):
+    """Приводит ответ модели к тому, что видно в терминале.
+
+    Модель отвечает Markdown-разметкой, а TUI её не рендерит: в кадре
+    оставались бы **жирные** звёздочки и обратные кавычки. Знак рубля Menlo
+    не содержит и рисует квадратом, поэтому заменяем его на «руб.».
+    """
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = text.replace("`", "")
+    text = text.replace("₽", "руб.")
+    return text
 
 
 def wrap_text(text, width=COLS):
@@ -51,30 +68,42 @@ def render_memory(mem):
 
 def convert(in_path, out_path):
     events = []
+    header = {}
     for line in open(in_path, encoding="utf-8"):
         ev = json.loads(line)
         typ = ev.get("type")
+        if typ == "session" and not header:
+            header = ev
         if typ == "message":
             m = ev["message"]
             role = m.get("role")
             if role == "tool":
                 name = m.get("name", "инструмент")
                 prefix = f"  [инструмент {name}] "
-                text = wrap_text((m.get("content") or "").strip(), COLS - len(prefix))
+                text = wrap_text(plain_text((m.get("content") or "").strip()), COLS - len(prefix))
                 events.append(("tool", name, text))
             elif role == "user":
-                text = wrap_text((m.get("content") or "").strip(), COLS - len("agent> "))
-                events.append(("user", "", text))
+                raw = (m.get("content") or "").strip()
+                if raw.startswith(NOTICE_PREFIX):
+                    # The gate's rejection is part of the story: it shows that
+                    # the draft never reached stdout but stayed in the journal.
+                    text = wrap_text(plain_text(raw[len(NOTICE_PREFIX):]), COLS - len("  ⛔ код: "))
+                    events.append(("notice", "", text))
+                else:
+                    text = wrap_text(plain_text(raw), COLS - len("agent> "))
+                    events.append(("user", "", text))
             elif role == "assistant":
                 if m.get("tool_calls") or not (m.get("content") or "").strip():
                     continue
-                events.append(("assistant", "", wrap_text(m["content"].strip())))
+                events.append(("assistant", "", wrap_text(plain_text(m["content"].strip()))))
         elif typ == "memory":
             text = render_memory(ev.get("memory", {}))
             if text:
                 events.append(("memory", "", text))
 
-    banner = ("сессия demo · модель deepseek-v4-flash · сжатие deepseek-v4-flash\n"
+    chat = header.get("chat_model") or "модель"
+    summary = header.get("summary_model") or chat
+    banner = (f"сессия demo · модель {chat} · сжатие и проверка {summary}\n"
               "/help — команды: /model — модель, /session — сессия, /branch — ветки, /exit — выход; статистика — после каждого ответа\n\n")
 
     out = []
@@ -90,6 +119,9 @@ def convert(in_path, out_path):
         elif kind == "tool":
             out.append((round(t, 3), "o", f"  [инструмент {name}] {text}\n"))
             t += 0.6
+        elif kind == "notice":
+            out.append((round(t, 3), "o", f"  ⛔ код: {text}\n"))
+            t += 0.8
         elif kind == "memory":
             out.append((round(t, 3), "o", f"  ↳ память: {text}\n"))
             t += 0.4
