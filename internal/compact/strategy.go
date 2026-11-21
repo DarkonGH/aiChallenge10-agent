@@ -145,7 +145,7 @@ func (c *Compactor) ExtractFacts(ctx context.Context, prev []history.Fact, userT
 	prompt := factsPrompt(prev, userText)
 	primary := c.hist.SummaryModel()
 
-	out, err := c.factsRequest(ctx, primary, prompt)
+	out, err := c.factsRequest(ctx, c.summaryClient(), primary, prompt)
 	if err != nil {
 		backup := c.hist.ChatModel()
 		if backup == "" || backup == primary || ctx.Err() != nil {
@@ -154,7 +154,7 @@ func (c *Compactor) ExtractFacts(ctx context.Context, prev []history.Fact, userT
 		if c.trace != nil {
 			c.trace(fmt.Sprintf("факты: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
 		}
-		out, err2 := c.factsRequest(ctx, backup, prompt)
+		out, err2 := c.factsRequest(ctx, c.client, backup, prompt)
 		if err2 != nil {
 			return "", fmt.Errorf("%s: %v; запасная %s: %v", primary, err, backup, err2)
 		}
@@ -165,10 +165,10 @@ func (c *Compactor) ExtractFacts(ctx context.Context, prev []history.Fact, userT
 
 // factsRequest runs one extractor request under the same per-attempt timeout
 // as the summarizer.
-func (c *Compactor) factsRequest(ctx context.Context, model, prompt string) (string, error) {
+func (c *Compactor) factsRequest(ctx context.Context, cl *llm.ChatClient, model, prompt string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
 	defer cancel()
-	resp, err := c.client.Chat(actx, model, []llm.Message{
+	resp, err := cl.Chat(actx, model, []llm.Message{
 		{Role: "system", Content: factsSystemPrompt},
 		{Role: "user", Content: prompt},
 	}, nil, 0)

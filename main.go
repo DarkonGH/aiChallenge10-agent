@@ -13,6 +13,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"os"
@@ -38,12 +39,16 @@ type app struct {
 	strategy     compact.Strategy
 	window       int
 	noReasoning  bool
-	profile      string // active named profile; "" is the shared default
-	skipProfile  bool   // no onboarding dialogue at startup (scripts, runs)
+	profile      string        // active named profile; "" is the shared default
+	skipProfile  bool          // no onboarding dialogue at startup (scripts, runs)
+	scriptDelay  time.Duration // pause between dialogue turns in -script (rate limits)
+
+	summary *llm.ChatClient // client for compaction; nil means the chat client
 
 	hist  *history.History
 	agent *agent.Agent
 	mem   *memory.Store
+	task  *task.Machine // day-13 task state machine of the current session
 	ui    *ui
 }
 
@@ -251,7 +256,7 @@ func (u *ui) trace(s string) {
 }
 
 func main() {
-	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или deepseek-v4.1-flash)")
+	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или opencode-go/deepseek-v4.1-flash)")
 	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или самая дешёвая в списке)")
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
@@ -278,6 +283,7 @@ func main() {
 	importMemory := flag.String("import-memory", "", "разложить факты дня 10 из сессии в слои памяти текущей -session")
 	profileFlag := flag.String("profile", "", "профиль пользователя: имя каталога в <data>/profiles (пусто — общий <data>/shared)")
 	skipProfile := flag.Bool("skip-profile", false, "не спрашивать профиль при старте (сценарии и прогоны)")
+	scriptDelay := flag.Duration("script-delay", 0, "пауза между репликами в -script (для лимитов провайдера, например 30s)")
 	flag.Parse()
 
 	strategy, err := compact.ParseStrategy(*strategyFlag)
@@ -366,6 +372,14 @@ func main() {
 	}
 	client.SetMaxTokens(*maxTokens)
 
+	// Compaction may live on another endpoint (local Ollama). Without
+	// LLM_SUMMARY_BASE_URL this is the same client as chat.
+	summaryClient := llm.NewSummaryClient()
+	summaryClient.SetMaxTokens(*maxTokens)
+	if summaryClient != client {
+		fmt.Printf("сжатие: %s\n", llm.DescribeEndpoint(summaryClient))
+	}
+
 	a := &app{
 		client:       client,
 		tools:        tools.NewToolRegistry(tasks),
@@ -382,8 +396,13 @@ func main() {
 		window:       window,
 		profile:      *profileFlag,
 		skipProfile:  *skipProfile,
+		scriptDelay:  *scriptDelay,
+		summary:      summaryClient,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
+	// The task machine is per-session, so the registry holds a provider, not
+	// a pointer: the task_transition tool always acts on the current session.
+	a.tools.SetTaskProvider(func() *task.Machine { return a.task })
 
 	sessionID := *sessionFlag
 	if *continueFlag {
@@ -426,8 +445,19 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 		return err
 	}
 	a.mem = mem
+	// The task state machine (day 13) lives next to the session log:
+	// task.json in the session directory. Providers are closures over the app,
+	// so /new and /session swap the machine and the tool and the prompt block
+	// follow automatically.
+	tsk, err := task.Load(filepath.Join(a.dataDir, h.ID()))
+	if err != nil {
+		return err
+	}
+	a.task = tsk
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetMemory(mem)
+	a.agent.SetTask(func() *task.Machine { return a.task })
+	a.agent.SetSummaryClient(a.summary)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	if !a.noReasoning {
@@ -586,10 +616,16 @@ func (a *app) footer() {
 		over = " · ПЕРЕПОЛНЕНИЕ"
 	}
 	s := a.client.Stats()
-	fmt.Printf("· %s · промпт ~%d/%d ток · ответ ~%d ток · актив %d, архив %d сообщ%s · API %d выз., $%.4f%s\n",
+	// Implicit caching is invisible in the estimate but halves the bill: show
+	// the share of the prompt the provider served from its cache.
+	cache := ""
+	if s.CachedTokens > 0 {
+		cache = fmt.Sprintf(" · кеш %d/%d", s.CachedTokens, s.PromptTokens)
+	}
+	fmt.Printf("· %s · промпт ~%d/%d ток · ответ ~%d ток%s · актив %d, архив %d сообщ%s · API %d выз., $%.4f%s\n",
 		a.hist.ChatModel(),
 		prompt, a.budget.MaxPromptTokens,
-		a.agent.LastAnswerTokens(),
+		a.agent.LastAnswerTokens(), cache,
 		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost, over)
 }
 
@@ -727,6 +763,9 @@ func (a *app) command(line string) (bool, error) {
 
 	case "/profile":
 		return false, a.profileCommand(arg)
+
+	case "/task":
+		return false, a.taskCommand(arg)
 
 	case "/branch":
 		if arg == "" {
@@ -906,6 +945,9 @@ func (a *app) printContext() {
 	}
 
 	fmt.Printf("что уходит в модель (сессия %s, модель %s, стратегия %s):\n", a.hist.ID(), a.hist.ChatModel(), a.strategy)
+	if a.summary != nil && a.summary != a.client {
+		fmt.Printf("  сжатие               %s, модель %s\n", llm.DescribeEndpoint(a.summary), a.hist.SummaryModel())
+	}
 	fmt.Printf("  system prompt        ~%d ток.\n", base)
 	switch a.strategy {
 	case compact.StrategyFacts:
@@ -947,6 +989,9 @@ func (a *app) printContext() {
 			}
 			fmt.Printf("    %-12s ~%4d ток.  %d/%d, %s\n", string(l), memTok[l], n, memory.Caps[l], note)
 		}
+	}
+	if stage, tok := a.taskBlockInfo(); stage != "" {
+		fmt.Printf("  задача               ~%4d ток.  этап %s, всегда\n", tok, stage)
 	}
 	if len(promptMsgs) > 0 {
 		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
@@ -1019,8 +1064,8 @@ func (a *app) printTokens() {
 	fmt.Printf("модель сжатия: %s\n", a.hist.SummaryModel())
 
 	s := a.client.Stats()
-	fmt.Printf("API: %d вызовов, промпт %d, ответ %d, всего %d ток., $%.4f\n",
-		s.Calls, s.PromptTokens, s.CompletionTokens, s.TotalTokens, s.Cost)
+	fmt.Printf("API: %d вызовов, промпт %d (из кеша %d), ответ %d, всего %d ток., $%.4f\n",
+		s.Calls, s.PromptTokens, s.CachedTokens, s.CompletionTokens, s.TotalTokens, s.Cost)
 }
 
 func (a *app) runScript(path string) error {
@@ -1032,6 +1077,7 @@ func (a *app) runScript(path string) error {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sawTurn := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1051,6 +1097,14 @@ func (a *app) runScript(path string) error {
 			}
 			continue
 		}
+		// The provider limits requests per sliding window (a 60 s quota in
+		// practice), and every turn costs two calls: the answer and the memory
+		// extractor. Without a pause the second turn already gets 429, so the
+		// script waits between turns instead of burning retries.
+		if a.scriptDelay > 0 && sawTurn {
+			time.Sleep(a.scriptDelay)
+		}
+		sawTurn = true
 		a.ask(line)
 	}
 	return sc.Err()
@@ -1099,7 +1153,15 @@ func printModels() {
 		if m.ID == config.DefaultModel() {
 			mark = "*"
 		}
-		fmt.Printf(" %s %-22s %-10s $%.4f/1M\n", mark, m.ID, m.Tier, m.RatePerM)
+		// Кеш-чтение дешевле обычного входа, поэтому печатаем отдельной
+		// колонкой: по ней видно, сколько даёт повторный промпт. Прочерк
+		// означает, что провайдер кеш-ставку не сообщает.
+		cache := "—"
+		if m.RateCachePerM > 0 {
+			cache = fmt.Sprintf("$%.3f", m.RateCachePerM)
+		}
+		fmt.Printf(" %s %-32s %-10s вход $%.2f / выход $%.2f / кеш %-6s за 1M\n",
+			mark, m.ID, m.Tier, m.RateInPerM, m.RateOutPerM, cache)
 	}
 	fmt.Println("(* — по умолчанию)")
 }
@@ -1139,6 +1201,10 @@ const helpText = `Команды:
                    профиль пользователя: стиль, формат, обращение, ограничения;
                    уходит в каждый запрос последним блоком и пополняется из
                    диалога сам; list — какие есть, use — переключить
+  /task [start | approve | pause | resume | state <этап> | reset]
+                   состояние задачи (день 13): конечный автомат planning →
+                   execution → validation → done; переходы ассистента
+                   проверяет код, approve/pause/resume — только здесь
   /branch [имя]    ветки диалога: без аргумента — список, /branch <имя> —
                    чекпоинт (создать ветку от текущего места), повторный
                    /branch <существующее имя> — переключение

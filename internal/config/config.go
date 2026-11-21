@@ -11,17 +11,60 @@ import (
 
 // Model is one backend available to the agent.
 type Model struct {
-	ID       string  // model id sent to the API
-	Tier     string  // маленькая / средняя / флагман
-	RatePerM float64 // blended USD per 1M total tokens
+	ID   string // model id sent to the API
+	Tier string // маленькая / средняя / флагман
+
+	// RateInPerM and RateOutPerM are USD per 1M prompt and completion tokens.
+	// They are separate because a request is mostly input and an answer is
+	// pure output: one blended number lied in both directions.
+	RateInPerM  float64
+	RateOutPerM float64
+
+	// RateCachePerM is USD per 1M prompt tokens served from the provider's
+	// implicit cache. Zero means the provider does not report a cache rate;
+	// such tokens are billed as ordinary input (CostUsd).
+	RateCachePerM float64
 }
 
-// ModelSet is the roster inherited from task1-05. The same provider serves all
-// three ids, so switching models mid-session needs no extra configuration.
+// CostUsd turns one call's usage into dollars. cachedTokens are a part of
+// promptTokens: the provider bills them at the cache-read rate, which is
+// roughly fifty times cheaper than fresh input, so charging the whole prompt
+// at RateInPerM would overstate the bill whenever caching works.
+func (m Model) CostUsd(promptTokens, cachedTokens, completionTokens int) float64 {
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens
+	}
+	cacheRate := m.RateCachePerM
+	if cacheRate == 0 {
+		cacheRate = m.RateInPerM
+	}
+	fresh := promptTokens - cachedTokens
+	return (float64(fresh)*m.RateInPerM +
+		float64(cachedTokens)*cacheRate +
+		float64(completionTokens)*m.RateOutPerM) / 1e6
+}
+
+// ModelSet is the roster inherited from task1-05. Switching models mid-session
+// needs no extra configuration: every id speaks the same OpenAI protocol.
+//
+// deepseek-v4.1-flash is billed per API token, not by a flat subscription:
+// GET /models for the opencode endpoint reports 0.30/1M input and 1.20/1M
+// output (cache read 0.006). The footer therefore counts real money again.
+//
+// The id keeps the provider prefix opencode-go/: the gateway routes by it.
+// Without the prefix the same model answers 402 «Insufficient balance».
+//
+// For the older ids the provider offers one blended rate, so both halves carry
+// it; the split is unknown and the cost is an estimate to the same degree as
+// before.
 var ModelSet = []Model{
-	{ID: "deepseek-v4.1-flash", Tier: "маленькая", RatePerM: 0.311270},
-	{ID: "glm-5.3-flash", Tier: "средняя", RatePerM: 0.788471},
-	{ID: "qwen3.8-27b", Tier: "флагман", RatePerM: 0.303003},
+	{ID: "opencode-go/deepseek-v4.1-flash", Tier: "маленькая", RateInPerM: 0.30, RateOutPerM: 1.20, RateCachePerM: 0.006},
+	{ID: "deepseek-v4-flash", Tier: "маленькая", RateInPerM: 0.311270, RateOutPerM: 0.311270},
+	{ID: "glm-5.3-flash", Tier: "средняя", RateInPerM: 0.788471, RateOutPerM: 0.788471},
+	{ID: "qwen3.8-27b", Tier: "флагман", RateInPerM: 0.303003, RateOutPerM: 0.303003},
 }
 
 // DefaultModel is used for chat when nothing else is configured. LLM_MODEL
@@ -35,17 +78,18 @@ func DefaultModel() string {
 }
 
 // DefaultSummaryModel is used for compaction. LLM_SUMMARY_MODEL wins;
-// otherwise compaction runs on the cheapest model in the roster — it is a
-// service call and must cost less than the tokens it saves. If that model is
-// unavailable the compactor degrades gracefully: messages are archived and a
-// note is left, nothing is lost.
+// otherwise compaction runs on the cheapest model in the roster by input rate:
+// a compaction call is a long prompt with a short answer, so its cost is
+// dominated by input tokens. If that model is unavailable the compactor
+// degrades gracefully: messages are archived and a note is left, nothing is
+// lost.
 func DefaultSummaryModel() string {
 	if m := strings.TrimSpace(os.Getenv("LLM_SUMMARY_MODEL")); m != "" {
 		return m
 	}
 	cheapest := ModelSet[0]
 	for _, m := range ModelSet[1:] {
-		if m.RatePerM < cheapest.RatePerM {
+		if m.RateInPerM < cheapest.RateInPerM {
 			cheapest = m
 		}
 	}

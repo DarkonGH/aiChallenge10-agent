@@ -17,13 +17,20 @@ go build -o agent .       # или просто ./run.sh — соберёт и �
 # запуск: нужен OpenAI-совместимый эндпоинт
 export LLM_BASE_URL="https://..."
 export OPENAI_API_KEY="..."
+# необязательно: заголовки, которых требует шлюз (opencode просит сессию)
+export LLM_EXTRA_HEADERS="x-opencode-session: goagent-cli"
 ./run.sh                  # интерактивный чат (run.sh подхватит ~/.env)
 ./run.sh -script testdata/checks-day9.txt   # прогон сценария без человека
 ```
 
 Модель по умолчанию задаётся в `internal/config` (`ModelSet`, `DefaultModel`);
 переопределяется `LLM_MODEL` / `LLM_SUMMARY_MODEL` или флагами `-model`,
-`-summary-model`. Все реальные прогоны — на `glm-5.3-flash`.
+`-summary-model`. Все реальные прогоны — на `opencode-go/deepseek-v4.1-flash`
+(шлюз opencode требует префикс провайдера в id; без него — `402`). Ставки
+хранятся раздельно — вход, выход и чтение из кеша (`RateInPerM`,
+`RateOutPerM`, `RateCachePerM`); стоимость считается по фактическому
+`usage`, поэтому кешированный префикс промпта стоит в 50 раз дешевле и виден
+в футере как `кеш N/M`.
 
 Локальные модели (эксперименты): Ollama отдаёт OpenAI-совместимый эндпоинт,
 агент подключается так:
@@ -31,6 +38,19 @@ export OPENAI_API_KEY="..."
 ```bash
 LLM_BASE_URL=http://localhost:11434/v1 OPENAI_API_KEY=ollama \
   ./agent -model qwen2.5:14b -summary-model qwen2.5:14b -max-tokens 4096
+```
+
+Сжатие можно увести на локальную модель, оставив чат на платном эндпоинте:
+`LLM_SUMMARY_BASE_URL` (плюс `LLM_SUMMARY_API_KEY`, `LLM_SUMMARY_EXTRA_HEADERS`)
+задаёт отдельный клиент только для конспекта, фактов и экстрактора памяти.
+Экстрактор вызывается каждый ход, поэтому локальная модель экономит и деньги,
+и лимиты провайдера; запасная попытка при её сбое по-прежнему идёт на
+чат-модель.
+
+```bash
+# чат — opencode, сжатие — локальный Ollama
+export LLM_SUMMARY_BASE_URL=http://localhost:11434/v1
+./agent -summary-model qwen2.5:14b
 ```
 
 Замечание: у Ollama дефолтный контекст 32768; на машине с 24 ГБ памятью
@@ -50,12 +70,16 @@ internal/memory/      модель памяти: Store, слои, Relevant, ре
 internal/history/     event-sourced session.jsonl: события message/compact/
                       evict/facts/memory/fork, реплей при загрузке
 internal/llm/         HTTP-клиент OpenAI-совместимого API, SSE-стрим, reasoning
-internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt)
+internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt),
+                      task_transition — запрос перехода задачи (день 13)
+internal/task/        конечный автомат задачи: этапы, таблица переходов,
+                      гейты плана и паузы, task.json сессии
 internal/tokens/      оценка токенов и калибровка (EMA по факту ответа)
 internal/config/      список моделей, лимиты, Truncate/OneLine
 internal/readline/    строчный редактор с ANSI
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt,
-                      day12-*: профили, вопрос, устойчивость, демо, карточки)
+                      day12-*: профили, вопрос, устойчивость, демо, карточки,
+                      day13-*: сценарий и карточки автомата задачи)
 scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
                       cascade.sh — каскадная проверка памяти,
                       check_memory.py — проверка ответов по журналу,
@@ -64,10 +88,15 @@ scripts/              render_cast.py — сборка демо-видео из a
                       check_profile.py — длина/код/обращение по журналу,
                       day12-demo.sh — подготовка данных для демо дня 12,
                       day12-onboard-demo.py — запись онбординга в pty
-                      (пустой профиль → диалог → правка в диалоге)
+                      (пустой профиль → диалог → правка в диалоге),
+                      day13-demo.sh — подготовка данных для демо дня 13,
+                      check_task.py — автомат задачи по журналу и task.json,
+                      run_to_cast.py — детерминированная сборка каста из
+                      session.jsonl (для видео, без вызовов модели)
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
+TASK.md               отчёт дня 13: конечный автомат задачи, гейты, пауза
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
 ```
 

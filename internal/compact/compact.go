@@ -7,6 +7,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"strings"
 	"time"
@@ -51,6 +52,30 @@ type Compactor struct {
 	// current turn — it decides which knowledge records enter the prompt.
 	mem      *memory.Store
 	question string
+
+	// sum is the endpoint used for the summary and the extractor calls. Nil
+	// means "same client as chat": the provider handles everything. A separate
+	// client lets compaction run on a local Ollama model while the chat stays
+	// on the paid API — the extractor is called every turn and is the first to
+	// hit rate limits.
+	sum *llm.ChatClient
+
+	// task is the day-13 task machine provider; its state block joins the
+	// system prompt after the memory layers.
+	task func() *task.Machine
+}
+
+// SetSummaryClient routes summarization and extraction to a dedicated client.
+// Nil restores the default (one client for everything).
+func (c *Compactor) SetSummaryClient(cl *llm.ChatClient) { c.sum = cl }
+
+// summaryClient is the client for the summary model. Chat backups keep using
+// the main client explicitly: a local endpoint does not serve the chat model.
+func (c *Compactor) summaryClient() *llm.ChatClient {
+	if c.sum != nil {
+		return c.sum
+	}
+	return c.client
 }
 
 // SetCompactEvery enables the message-count trigger: the history is compacted
@@ -69,6 +94,11 @@ func (c *Compactor) SetWindow(n int) { c.window = n }
 
 // SetMemory attaches the explicit memory model. Nil disables the memory block.
 func (c *Compactor) SetMemory(m *memory.Store) { c.mem = m }
+
+// SetTask attaches the day-13 task machine provider. The provider (not a
+// pointer) is deliberate: /new and /session swap the machine per session. Nil
+// provider or no started task removes the block from the prompt.
+func (c *Compactor) SetTask(p func() *task.Machine) { c.task = p }
 
 // SetQuestion records the user text of the current turn. Knowledge records are
 // filtered by relevance to it, so the prompt must be built after this call.
@@ -135,11 +165,19 @@ func (c *Compactor) PromptTokens(system string) int {
 
 // promptSystem assembles the system prompt with the strategy's memory block:
 // the rolling summary for the summary strategy, the sticky facts for the
-// facts strategy, nothing extra for the bare window.
+// facts strategy, nothing extra for the bare window. The day-13 task state
+// block goes last, after the memory layers.
 func (c *Compactor) PromptSystem(system string) string {
 	base := c.shortBlock(system)
 	if block := c.MemoryBlock(); block != "" {
-		return base + "\n\n" + block
+		base = base + "\n\n" + block
+	}
+	if c.task != nil {
+		if m := c.task(); m != nil {
+			if block := m.Block(); block != "" {
+				base = base + "\n\n" + block
+			}
+		}
 	}
 	return base
 }
@@ -373,7 +411,7 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*llm.Message) (strin
 	prompt := c.summarizePrompt(prefix)
 	primary := c.hist.SummaryModel()
 
-	summary, err := c.summarizeWith(ctx, primary, prompt)
+	summary, err := c.summarizeWith(ctx, c.summaryClient(), primary, prompt)
 	if err == nil {
 		return summary, nil
 	}
@@ -385,7 +423,7 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*llm.Message) (strin
 	if c.trace != nil {
 		c.trace(fmt.Sprintf("сжатие: %s не справился (%s) — пробую %s", primary, config.OneLine(err.Error()), backup))
 	}
-	summary, err2 := c.summarizeWith(ctx, backup, prompt)
+	summary, err2 := c.summarizeWith(ctx, c.client, backup, prompt)
 	if err2 != nil {
 		return "", fmt.Errorf("%s: %v; запасная %s: %v", primary, err, backup, err2)
 	}
@@ -396,7 +434,7 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*llm.Message) (strin
 }
 
 // summarizeWith runs one summarizer request on one model under its own timeout.
-func (c *Compactor) summarizeWith(ctx context.Context, model, prompt string) (string, error) {
+func (c *Compactor) summarizeWith(ctx context.Context, cl *llm.ChatClient, model, prompt string) (string, error) {
 	sys := "Ты сжимаешь историю диалога в компактный конспект. Сохрани: что просил пользователь, " +
 		"какие инструменты вызывались и с каким результатом, какие выводы и решения приняты. " +
 		"Обязательно выписывай конкретные детали с их значениями — имена, числа, сроки, бюджеты, " +
@@ -405,7 +443,7 @@ func (c *Compactor) summarizeWith(ctx context.Context, model, prompt string) (st
 
 	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
 	defer cancel()
-	resp, err := c.client.Chat(actx, model, []llm.Message{
+	resp, err := cl.Chat(actx, model, []llm.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: prompt},
 	}, nil, 0)

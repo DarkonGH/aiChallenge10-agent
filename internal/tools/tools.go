@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,11 @@ type Tool struct {
 	Description string
 	Parameters  map[string]any
 	Run         func(args json.RawMessage) (string, error)
+	// Visible, when set, gates the schema: the tool is offered to the model
+	// only while it returns true. Execute stays available regardless — a
+	// call for a hidden tool is still answered with an error text instead
+	// of a provider-side "unknown tool".
+	Visible func() bool
 }
 
 // ToolRegistry maps names to tools and builds their JSON schemas.
@@ -23,6 +29,7 @@ type ToolRegistry struct {
 	tools     map[string]*Tool
 	order     []string
 	maxResult int
+	task      func() *task.Machine // current session's task machine (day 13)
 }
 
 // NewToolRegistry builds the agent's tool set. tasks is the in-memory list from
@@ -74,7 +81,87 @@ func NewToolRegistry(tasks []config.Task) *ToolRegistry {
 		Run: runFindTask(tasks),
 	})
 
+	// The day-13 tool: the model requests a stage change, the code validates
+	// the transition before applying it. The machine is per-session, so the
+	// registry keeps a provider, not a pointer: /new and /session swap the
+	// machine under the same closure.
+	r.add(&Tool{
+		Name: "task_transition",
+		Description: "Переводит задачу на следующий этап конечного автомата " +
+			"(planning → execution → validation → done). Переход проверяется кодом: " +
+			"запрещённый, из паузы или без утверждённого плана будет отклонён. " +
+			"Переходи на следующий этап только когда текущий фактически выполнен. " +
+			"В validation не переходи, пока результаты шага не зафиксированы в ответе: " +
+			"если данных не хватает, перечисли их и дождись ответа пользователя.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"to": map[string]any{
+					"type":        "string",
+					"enum":        []string{"planning", "execution", "validation", "done"},
+					"description": "Целевой этап",
+				},
+				"step": map[string]any{
+					"type":        "string",
+					"description": "Новый текущий шаг (что именно делается на новом этапе)",
+				},
+				"expected": map[string]any{
+					"type":        "string",
+					"description": "Ожидаемое действие на новом этапе",
+				},
+			},
+			"required":             []string{"to"},
+			"additionalProperties": false,
+		},
+		Run: r.runTaskTransition,
+		// Ленивый инструмент: пока задача не начата (/task start), схема не
+		// уходит в запрос — экономим ~260 токенов на каждом ходу обычного
+		// диалога. После старта схема появляется, и модель ведёт задачу.
+		Visible: func() bool {
+			return r.task != nil && r.task() != nil && r.task().Started()
+		},
+	})
+
 	return r
+}
+
+// SetTaskProvider attaches the source of the current session's task machine.
+func (r *ToolRegistry) SetTaskProvider(p func() *task.Machine) { r.task = p }
+
+// runTaskTransition applies the requested stage change through the machine;
+// a forbidden transition comes back as an error, so the model sees the
+// rejection and the state stays untouched.
+func (r *ToolRegistry) runTaskTransition(args json.RawMessage) (string, error) {
+	if r.task == nil || r.task() == nil {
+		return "", fmt.Errorf("задача не начата; попросите пользователя запустить её: /task start")
+	}
+	var a struct {
+		To       string `json:"to"`
+		Step     string `json:"step"`
+		Expected string `json:"expected"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "", fmt.Errorf("аргументы: %w", err)
+	}
+	to, err := task.ParseStage(a.To)
+	if err != nil {
+		return "", err
+	}
+	m := r.task()
+	before := m.State().Stage
+	if err := m.Transition(to, a.Step, a.Expected, "assistant"); err != nil {
+		return "", err
+	}
+	st := m.State()
+	return fmt.Sprintf("переход применён: %s → %s; шаг: %s; ожидаемое действие: %s",
+		before, st.Stage, orDash(st.Step), orDash(st.Expected)), nil
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
 }
 
 func (r *ToolRegistry) add(t *Tool) {
@@ -82,11 +169,16 @@ func (r *ToolRegistry) add(t *Tool) {
 	r.order = append(r.order, t.Name)
 }
 
-// Schemas returns the tool schemas for the API request.
+// Schemas returns the tool schemas for the API request. Tools with a Visible
+// gate that currently evaluates false are left out: the model pays tokens
+// only for the tools it can actually use right now.
 func (r *ToolRegistry) Schemas() []llm.ToolSchema {
 	out := make([]llm.ToolSchema, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
+		if t.Visible != nil && !t.Visible() {
+			continue
+		}
 		out = append(out, llm.ToolSchema{
 			Type: "function",
 			Function: llm.ToolFunction{

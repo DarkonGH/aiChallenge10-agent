@@ -95,9 +95,12 @@ type streamOptions struct {
 
 // usage holds token counts, incl. reasoning tokens.
 type usage struct {
-	PromptTokens            int `json:"prompt_tokens"`
-	CompletionTokens        int `json:"completion_tokens"`
-	TotalTokens             int `json:"total_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 	CompletionTokensDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
@@ -157,6 +160,7 @@ type ChatResponse struct {
 type ClientStats struct {
 	Calls            int
 	PromptTokens     int
+	CachedTokens     int
 	CompletionTokens int
 	TotalTokens      int
 	Cost             float64
@@ -165,11 +169,12 @@ type ClientStats struct {
 
 // ChatClient is a minimal OpenAI-compatible client with tool calling.
 type ChatClient struct {
-	baseURL   string
-	apiKey    string
-	http      *http.Client
-	maxTokens int
-	stats     ClientStats
+	baseURL      string
+	apiKey       string
+	http         *http.Client
+	maxTokens    int
+	extraHeaders map[string]string
+	stats        ClientStats
 }
 
 // NewChatClient builds a client from LLM_BASE_URL and OPENAI_API_KEY.
@@ -180,12 +185,73 @@ func NewChatClient() *ChatClient {
 // NewChatClientAt builds a client for an explicit endpoint: a self-hosted
 // gateway, a proxy, or a stub server in tests.
 func NewChatClientAt(baseURL, apiKey string) *ChatClient {
+	return newClientAt(baseURL, apiKey, ParseExtraHeaders(os.Getenv("LLM_EXTRA_HEADERS")))
+}
+
+// newClientAt is the shared constructor; headers differ per endpoint.
+func newClientAt(baseURL, apiKey string, headers map[string]string) *ChatClient {
 	return &ChatClient{
-		baseURL:   baseURL,
-		apiKey:    apiKey,
-		http:      &http.Client{Timeout: 180 * time.Second},
-		maxTokens: 4096,
-		stats:     ClientStats{ByModel: map[string]int{}},
+		baseURL:      baseURL,
+		apiKey:       apiKey,
+		http:         &http.Client{Timeout: 300 * time.Second},
+		maxTokens:    4096,
+		extraHeaders: headers,
+		stats:        ClientStats{ByModel: map[string]int{}},
+	}
+}
+
+// NewSummaryClient builds the client for compaction: the rolling summary, the
+// fact extractor and the memory extractor. LLM_SUMMARY_BASE_URL lets those
+// calls run on another endpoint — a local Ollama, for instance — while the chat
+// stays on the paid API. Compaction fires on every turn and is the first to hit
+// provider rate limits, so keeping it local is a practical saving, not a
+// toy. Without the variable the summary client is the chat client.
+func NewSummaryClient() *ChatClient {
+	base := strings.TrimSpace(os.Getenv("LLM_SUMMARY_BASE_URL"))
+	if base == "" {
+		return NewChatClient()
+	}
+	key := os.Getenv("LLM_SUMMARY_API_KEY")
+	if key == "" {
+		key = os.Getenv("OPENAI_API_KEY")
+	}
+	return newClientAt(base, key, ParseExtraHeaders(os.Getenv("LLM_SUMMARY_EXTRA_HEADERS")))
+}
+
+// DescribeEndpoint names the client's endpoint for status output. The API key
+// is never printed.
+func DescribeEndpoint(c *ChatClient) string {
+	if c == nil || strings.TrimSpace(c.baseURL) == "" {
+		return "эндпоинт не задан"
+	}
+	return "эндпоинт " + c.baseURL
+}
+
+// ParseExtraHeaders reads LLM_EXTRA_HEADERS: extra HTTP headers for gateways
+// that ask for them (opencode inference, for one, rejects a request without
+// x-opencode-session). Format: "Name: value", pairs separated by ";" or a
+// newline. Keeping it in the environment means no provider is hardcoded in the
+// client: another gateway just asks for a different header value.
+func ParseExtraHeaders(raw string) map[string]string {
+	headers := make(map[string]string)
+	for _, pair := range strings.FieldsFunc(raw, func(r rune) bool { return r == ';' || r == '\n' }) {
+		name, value, ok := strings.Cut(pair, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		headers[name] = strings.TrimSpace(value)
+	}
+	return headers
+}
+
+// addHeaders sets the headers every request needs: auth, JSON and whatever the
+// configured gateway asked for in LLM_EXTRA_HEADERS.
+func (c *ChatClient) addHeaders(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	for name, value := range c.extraHeaders {
+		req.Header.Set(name, value)
 	}
 }
 
@@ -217,8 +283,7 @@ func (c *ChatClient) send(ctx context.Context, payload []byte) (int, []byte, err
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	c.addHeaders(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -236,11 +301,12 @@ func (c *ChatClient) send(ctx context.Context, payload []byte) (int, []byte, err
 func (c *ChatClient) record(model string, u usage) {
 	c.stats.Calls++
 	c.stats.PromptTokens += u.PromptTokens
+	c.stats.CachedTokens += u.PromptTokensDetails.CachedTokens
 	c.stats.CompletionTokens += u.CompletionTokens
 	c.stats.TotalTokens += u.TotalTokens
 	c.stats.ByModel[model]++
 	if m, ok := config.FindModel(model); ok {
-		c.stats.Cost += float64(u.TotalTokens) * m.RatePerM / 1e6
+		c.stats.Cost += m.CostUsd(u.PromptTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokens)
 	}
 }
 
@@ -252,6 +318,12 @@ func (c *ChatClient) emptyAnswerErr(model, finish, reasoning string) error {
 	}
 	return fmt.Errorf("%s: пустой ответ модели (finish_reason=%q)", model, finish)
 }
+
+// rateLimitWait is the first pause before retrying a 429. The provider limits
+// requests per sliding window (60 s in practice), so a one-second retry is
+// useless: the next attempt must wait out the window. Later attempts multiply
+// the pause, which lets a burst of calls settle instead of failing the turn.
+const rateLimitWait = 30 * time.Second
 
 // Chat sends one request, retrying transient failures (429/5xx) up to 3 times.
 func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message, tools []ToolSchema, temperature float64) (*ChatResponse, error) {
@@ -276,12 +348,18 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 
 	start := time.Now()
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	rateLimited := false
+	const attempts = 4
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
+			wait := time.Duration(attempt) * time.Second
+			if rateLimited {
+				wait = time.Duration(attempt) * rateLimitWait
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(wait):
 			}
 		}
 
@@ -290,10 +368,12 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			rateLimited = false
 			lastErr = err
 			continue
 		}
 		if status == http.StatusTooManyRequests || status >= 500 {
+			rateLimited = status == http.StatusTooManyRequests
 			lastErr = fmt.Errorf("%s: status %d: %s", model, status, config.Truncate(string(data), 500))
 			continue
 		}
@@ -342,6 +422,7 @@ type streamFail int
 const (
 	failRetry    streamFail = iota // transient — retry the streaming request
 	failFallback                   // endpoint likely cannot stream — repeat without stream
+	failRate                       // 429 — retry after the provider's rate window
 	failStop                       // give up: error is final or text is already on screen
 )
 
@@ -376,13 +457,19 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 
 	start := time.Now()
 	fallback := false
+	rateLimited := false
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	const attempts = 4
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
+			wait := time.Duration(attempt-1) * time.Second
+			if rateLimited {
+				wait = time.Duration(attempt-1) * rateLimitWait
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt-1) * time.Second):
+			case <-time.After(wait):
 			}
 		}
 		resp, emitted, fail, err := c.streamOnce(ctx, model, payload, onDelta, onReason)
@@ -402,12 +489,13 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 			fallback = true
 			break
 		}
+		rateLimited = fail == failRate
 		lastErr = err
 	}
 	if fallback {
 		return c.Chat(ctx, model, messages, tools, temperature)
 	}
-	return nil, fmt.Errorf("%s: запрос не удался после 3 попыток: %w", model, lastErr)
+	return nil, fmt.Errorf("%s: запрос не удался после %d попыток: %w", model, attempts, lastErr)
 }
 
 // sendStream performs one HTTP round-trip and returns the open response body
@@ -417,9 +505,8 @@ func (c *ChatClient) sendStream(ctx context.Context, payload []byte) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "text/event-stream")
+	c.addHeaders(req)
 	return c.http.Do(req)
 }
 
@@ -433,7 +520,11 @@ func (c *ChatClient) streamOnce(ctx context.Context, model string, payload []byt
 	}
 	defer httpResp.Body.Close()
 
-	if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
+	if httpResp.StatusCode == http.StatusTooManyRequests {
+		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
+		return nil, false, failRate, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 500))
+	}
+	if httpResp.StatusCode >= 500 {
 		data, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, false, failRetry, fmt.Errorf("status %d: %s", httpResp.StatusCode, config.Truncate(string(data), 500))
 	}
