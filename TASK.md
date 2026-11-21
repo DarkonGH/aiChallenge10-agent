@@ -127,14 +127,14 @@ go build -o agent .
 
 # демо: 4 меняющихся факта, локальный экстрактор qwen2.5:14b,
 # задача доходит до done и очищает working
-scripts/day15-demo.sh
+scripts/day15-demo.sh 2>&1 | tee /tmp/day15-demo.log
 
 # независимая проверка: замены, устаревшие ответы, очистка
 python3 scripts/check_memory_conflicts.py /tmp/day15-demo
 
-# каст из сохранённого прогона: команды не попадают в session.jsonl
-python3 scripts/run_to_cast.py /tmp/day15-demo/demo/session.jsonl /tmp/day15-demo.cast \
-  --commands testdata/day15-commands.json
+# каст из настоящего stdout-лога: в нём есть футер статистики, «всего N»,
+# полные строки инструментов и таблицы /memory — ровно то, что видел пользователь
+python3 scripts/log_to_cast.py /tmp/day15-demo.log /tmp/day15-demo.cast
 python3 scripts/render_cast.py --cast /tmp/day15-demo.cast \
   --out video/устаревание-памяти-день-15.mp4 \
   --title "День 15 · устаревание и конфликты памяти" \
@@ -142,6 +142,8 @@ python3 scripts/render_cast.py --cast /tmp/day15-demo.cast \
   --cards testdata/day15-cards.json
 ```
 
-Видео: 124 с, 1352x970, 8 fps, без аудио. Каст собирается
-детерминированно из сохранённого прогона; команды и их вывод добавляются из
-`testdata/day15-commands.json`, потому что в `session.jsonl` команд нет.
+Видео: 131 с, 1352x970, 8 fps, без аудио. Каст собирается из stdout-лога
+(`tee` при прогоне), поэтому в нём есть футер, «всего N» и полные строки
+инструментов. `run_to_cast.py` остаётся для сборки из `session.jsonl`, но там
+этих строк нет: команды и их вывод приходится брать из sidecar, и видео
+неизбежно расходится с консолью.

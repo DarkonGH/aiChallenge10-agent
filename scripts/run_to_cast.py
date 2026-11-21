@@ -110,6 +110,12 @@ def convert(in_path, out_path, commands_path=""):
     events = []
     header = {}
     pending_memory = []
+    # The four seed /memory add commands are replayed from the sidecar: their
+    # full output is already in the log. The memory events they produced are
+    # still in session.jsonl, but the console never printed a trace for a manual
+    # command — so a «↳ память» line before the first user turn would be output
+    # that does not exist in the console.
+    seen_user = False
 
     def flush_memory():
         for text in pending_memory:
@@ -139,6 +145,7 @@ def convert(in_path, out_path, commands_path=""):
                     text = wrap_text(plain_text(raw[len(NOTICE_PREFIX):]), COLS - len("  ⛔ код: "))
                     events.append(("notice", "", text))
                 else:
+                    seen_user = True
                     for c in list(pending):
                         if c.get("before") and c["before"] in raw:
                             events.append(("command", "", plain_text(c.get("command", ""))))
@@ -154,6 +161,8 @@ def convert(in_path, out_path, commands_path=""):
                     continue
                 events.append(("assistant", "", wrap_text(plain_text(m["content"].strip()))))
         elif typ == "memory":
+            if not seen_user:
+                continue
             text = render_memory_event(ev)
             if text:
                 pending_memory.append(text)
@@ -177,9 +186,19 @@ def convert(in_path, out_path, commands_path=""):
     out = []
     t = 0.0
     out.append((t, "o", banner))
+
+    def prompt_lead():
+        # В консоли приглашение отделено от предыдущего вывода пустой строкой.
+        # Баннер уже заканчивается пустой строкой — вторую не добавляем, а вот
+        # после ответа, таблицы или trace пустая строка нужна: иначе в видео
+        # реплики сливаются и «agent>» трудно найти.
+        if out and out[-1][2].endswith("\n\n"):
+            return ""
+        return "\n"
+
     for kind, name, text in events:
         if kind == "user":
-            out.append((round(t, 3), "o", f"agent> {text}\n\n"))
+            out.append((round(t, 3), "o", f"{prompt_lead()}agent> {text}\n"))
             t += 1.0
         elif kind == "assistant":
             out.append((round(t, 3), "o", f"{text}\n"))
@@ -192,7 +211,7 @@ def convert(in_path, out_path, commands_path=""):
             t += 0.8
         elif kind == "command":
             body = wrap_text(text, COLS - len("agent> "))
-            out.append((round(t, 3), "o", f"agent> {body}\n\n"))
+            out.append((round(t, 3), "o", f"{prompt_lead()}agent> {body}\n"))
             t += 0.9
         elif kind == "command_out":
             body = wrap_text(text, COLS - 2)
