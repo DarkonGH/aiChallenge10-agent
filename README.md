@@ -57,6 +57,50 @@ export OPENAI_API_KEY="..."
 используется — шаги идут последовательно, чтобы результат одного инструмента
 мог стать аргументом следующего.
 
+## MCP: внешние инструменты
+
+Помимо локальных инструментов агент умеет подключать MCP-серверы. Это общая
+настройка, не привязанная к демо: `mcp.json` ищется по `-mcp-config` →
+`MCP_CONFIG` → `./mcp.json` → `~/.config/goagent/mcp.json` → `<data>/mcp.json`,
+а `-no-mcp` выключает MCP полностью.
+
+```json
+{
+  "version": 1,
+  "approval": "ask",
+  "servers": [
+    {
+      "name": "fs",
+      "command": "uvx",
+      "args": ["--from", "filesystem-mcp", "filesystem-mcp", "${MCP_FS_ROOT}"],
+      "allow": ["read_file", "list_directory", "list_allowed_directories"],
+      "approval": {"list_allowed_directories": "allow", "read_file": "ask"},
+      "rules": {"read_file": {"path_under": "${MCP_FS_ROOT}"}}
+    }
+  ]
+}
+```
+
+Инструмент сервера регистрируется как `mcp_<server>_<tool>` и уходит в модель
+обычной функцией — в схеме нет поля «источник». Код маршрутизирует вызов по
+префиксу: локальные имена идут в `Run`, MCP-имена — в `ClientSession.CallTool`.
+
+Апрув выполняется кодом до вызова: `allow` — сразу, `deny` — запрет, `ask` —
+вопрос `y/n/a` в TTY. В `-script` по умолчанию `deny`; для демо нужен
+`-mcp-approval=allow`. Аргументы проверяются отдельно: путь не выходит за
+`path_under`, URL — только http/https и домены из `url_hosts`.
+
+`-dump-request <path>` пишет NDJSON с телами запросов к модели: видно, что
+локальные и MCP-схемы ушли в одном `tools`. Подробнее — `MCP.md`.
+
+Ответ MCP считается недоверенным. По умолчанию `-mcp-guard=heuristic` убирает
+управляющие символы и оборачивает результат в
+`<untrusted_tool_output …>`, помечая типовые инъекции. `-mcp-guard=model`
+дополнительно спрашивает модель сжатия, безопасен ли текст; при отказе
+результат не попадает в промпт. `-mcp-action-guard=model` проверяет ещё и
+намерение вызова перед апрувом. Это снижение риска, а не гарантия: основную
+защиту дают allowlist, проверка путей/URL и подтверждение пользователя.
+
 ## Цикл агента
 
 ```
@@ -420,7 +464,7 @@ summary-фазы, в `window`/`facts` хранится в журнале, но �
 
 `/help`, `/exit`, `/new`, `/session [id]`, `/model [id]`, `/system`, `/tools`,
 `/history`, `/tokens`, `/compact`, `/recall <текст>`, `/invariant [list | add |
-change | remove | history]`. `/session` без аргумента
+change | remove | history]`, `/mcp [status | approvals | reset]`. `/session` без аргумента
 показывает список сессий (текущая помечена `*`), `/session <id>` переключает на
 другую сессию; `/model` без аргумента показывает список моделей, `/model <id>` меняет
 чат-модель. `/strategy [имя [N]]` — стратегия контекста (см. раздел выше),

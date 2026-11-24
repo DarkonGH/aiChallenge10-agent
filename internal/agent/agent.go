@@ -15,6 +15,22 @@ import (
 	"strings"
 )
 
+// ApprovalRequest is one MCP tool call waiting for the user's decision.
+type ApprovalRequest struct {
+	Name   string
+	Server string
+	Source string
+	Args   string
+}
+
+// Approver asks the user whether an MCP tool call may run. Returning false
+// rejects the call; the model then sees a tool result explaining the refusal.
+type Approver func(ApprovalRequest) (bool, error)
+
+// ActionGuard is the optional model check of an intended MCP call. Returning
+// false rejects the call before the user approval prompt.
+type ActionGuard func(ctx context.Context, userText string, req ApprovalRequest) (bool, string, error)
+
 // Agent owns the whole loop: request → tool call → tool result → answer.
 // main only feeds it user text and renders the result.
 type Agent struct {
@@ -27,6 +43,11 @@ type Agent struct {
 	temperature        float64
 	maxToolPromptChars int
 	trace              func(string)
+	// approve is the MCP approval gate. nil means "allow" (tests and
+	// non-interactive code paths that do not set it).
+	approve Approver
+	// actionGuard is the optional model check of an MCP call. nil means off.
+	actionGuard ActionGuard
 
 	// Streaming callbacks (nil = plain non-stream requests): onMessageStart
 	// before each model request, onContent per streamed delta of the answer,
@@ -80,6 +101,12 @@ func (a *Agent) SetTrace(fn func(string)) {
 	a.trace = fn
 	a.Comp.SetTrace(fn)
 }
+
+// SetApprover installs the MCP approval gate. Local tools never call it.
+func (a *Agent) SetApprover(fn Approver) { a.approve = fn }
+
+// SetActionGuard installs the optional model check of an intended MCP call.
+func (a *Agent) SetActionGuard(fn ActionGuard) { a.actionGuard = fn }
 
 // SetStreamUI installs the streaming callbacks. Until it is called the agent
 // uses plain non-stream requests (tests, benchmarks).
@@ -316,6 +343,30 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 		}
 
 		for _, call := range resp.ToolCalls {
+			actionOK, actionReason, err := a.checkAction(ctx, userText, call)
+			if err != nil {
+				return "", err
+			}
+			if !actionOK {
+				msg := "guard счёл действие небезопасным"
+				if strings.TrimSpace(actionReason) != "" {
+					msg = strings.TrimSpace(actionReason)
+				}
+				out := fmt.Sprintf("⛔ действие %s отклонено guard: %s; не повторяй его без новой просьбы", call.Function.Name, msg)
+				a.tracef("%s — действие отклонено guard: %s", call.Function.Name, config.OneLine(msg))
+				a.hist.AppendTool(call.ID, call.Function.Name, out)
+				continue
+			}
+			allowed, err := a.approveCall(call)
+			if err != nil {
+				return "", err
+			}
+			if !allowed {
+				out := fmt.Sprintf("⛔ вызов %s отклонён пользователем; не повторяй его без новой просьбы", call.Function.Name)
+				a.tracef("%s — вызов отклонён пользователем", call.Function.Name)
+				a.hist.AppendTool(call.ID, call.Function.Name, out)
+				continue
+			}
 			out := a.tools.Execute(call)
 			a.tracef("%s(%s) → %s", call.Function.Name, call.Function.Arguments, config.OneLine(out))
 			a.hist.AppendTool(call.ID, call.Function.Name, out)
@@ -323,6 +374,43 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	}
 
 	return "", fmt.Errorf("агент: превышен лимит шагов (%d), модель продолжает вызывать инструменты", a.maxSteps)
+}
+
+// approveCall applies the MCP approval policy before the tool runs. Local
+// tools and tools explicitly marked allow skip the gate. A nil approver means
+// allow: only main installs the interactive gate.
+func (a *Agent) approveCall(call llm.ToolCall) (bool, error) {
+	meta, ok := a.tools.Meta(call.Function.Name)
+	if !ok || meta.Source != "mcp" || meta.Approval == "allow" || a.approve == nil {
+		return true, nil
+	}
+	if meta.Approval == "deny" {
+		return false, nil
+	}
+	return a.approve(ApprovalRequest{
+		Name:   call.Function.Name,
+		Server: meta.Server,
+		Source: meta.Source,
+		Args:   call.Function.Arguments,
+	})
+}
+
+// checkAction runs the optional model check before the approval gate. It only
+// covers MCP tools: local tools are already bounded by their implementation.
+func (a *Agent) checkAction(ctx context.Context, userText string, call llm.ToolCall) (bool, string, error) {
+	if a.actionGuard == nil {
+		return true, "", nil
+	}
+	meta, ok := a.tools.Meta(call.Function.Name)
+	if !ok || meta.Source != "mcp" {
+		return true, "", nil
+	}
+	return a.actionGuard(ctx, userText, ApprovalRequest{
+		Name:   call.Function.Name,
+		Server: meta.Server,
+		Source: meta.Source,
+		Args:   call.Function.Arguments,
+	})
 }
 
 // activeInvariants returns the set only when it has rules to enforce.
@@ -424,6 +512,10 @@ func (a *Agent) updateMemory(ctx context.Context, userText string) {
 	if perr != nil {
 		a.tracef("память: %s — остаётся прежняя", perr)
 		return
+	}
+	upd, isolated := compact.IsolateMemoryUpdate(a.mem, userText, upd)
+	if len(isolated) > 0 {
+		a.tracef("память: пропущено, чтобы не смешать объекты: %s", strings.Join(isolated, "; "))
 	}
 	if upd.Empty() {
 		return // nothing durable in this message

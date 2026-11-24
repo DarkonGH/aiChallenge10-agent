@@ -71,6 +71,8 @@ internal/memory/      модель памяти: Store, слои, Relevant, ре
 internal/history/     event-sourced session.jsonl: события message/compact/
                       evict/facts/memory/fork, реплей при загрузке
 internal/llm/         HTTP-клиент OpenAI-совместимого API, SSE-стрим, reasoning
+internal/mcp/         MCP-клиент: mcp.json, stdio-транспорт, tools/list и
+                      tools/call, allow-фильтр, path/url-политика, апрув
 internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt),
                       task_transition — запрос перехода задачи (день 13)
 internal/task/        конечный автомат задачи: этапы, таблица переходов,
@@ -82,7 +84,8 @@ internal/readline/    строчный редактор с ANSI; Ctrl-C в от�
 testdata/             сценарии прогонов (checks-day9.txt, day11-*.txt,
                       day12-*: профили, вопрос, устойчивость, демо, карточки,
                       day13-*: сценарий и карточки автомата задачи,
-                      day15-*: сценарий старения памяти, команды и карточки)
+                      day15-*: сценарий старения памяти, команды и карточки,
+                      day16-*: сценарий MCP + локальный calc, карточки)
 scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
                       cascade.sh — каскадная проверка памяти,
                       check_memory.py — проверка ответов по журналу,
@@ -97,6 +100,8 @@ scripts/              render_cast.py — сборка демо-видео из a
                       day15-demo.sh — демо устаревания памяти,
                       check_memory_conflicts.py — замены, устаревшие ответы,
                       очистка working после done,
+                      day16-demo.sh — MCP filesystem + локальный calc,
+                      check_mcp.py — вызовы MCP/calc, схемы в дампе запроса,
                       run_to_cast.py — детерминированная сборка каста из
                       session.jsonl (для видео, без вызовов модели),
                       log_to_cast.py — каст из настоящего stdout-лога консоли:
@@ -104,7 +109,8 @@ scripts/              render_cast.py — сборка демо-видео из a
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
-TASK.md               отчёт дня 15: устаревание и конфликты памяти
+MCP.md                отчёт дня 16: MCP, конфиг, апрув, политика
+TASK.md               отчёт дня 16: MCP + локальный calc
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
 ```
 
@@ -148,6 +154,44 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 трогаются. `/memory prompt` печатает ровно `Compactor.MemoryBlock()` — блок,
 который уходит в системный промпт, поэтому отсутствие старых значений можно
 проверить напрямую, а не спрашивать модель.
+
+## MCP (день 16)
+
+MCP — общая настройка агента, а не только демо. `mcp.json` ищется по
+`-mcp-config` → `MCP_CONFIG` → `./mcp.json` → `~/.config/goagent/mcp.json` →
+`<data>/mcp.json`; `-no-mcp` выключает. Серверы запускаются до первой сессии,
+их инструменты регистрируются как `mcp_<server>_<tool>` и попадают в
+`/tools`, `-script` и после `/new`/`/session`.
+
+`internal/mcp/client.go` подключается через официальный
+`github.com/modelcontextprotocol/go-sdk` (`CommandTransport`, stdio),
+вызывает `tools/list` с курсором и `tools/call`. `allow` — белый список
+инструментов; `write_file` у filesystem-сервера не регистрируется. Схема
+`InputSchema` превращается в `map[string]any`, описание можно перекрыть
+`descriptions`.
+
+Апрув стоит в коде до `ToolRegistry.Execute`, а не в промпте: `Tool.Approval`
+(`allow/ask/deny`) и `Agent.SetApprover`. `y` — один раз, `n` — отказ
+(модель получает результат «отклонён» и продолжает), `a` — до конца сессии;
+`/mcp approvals` и `/mcp reset` управляют списком. В TTY по умолчанию `ask`,
+в `-script`/пайпе `auto` и `ask` работают как `deny`; `-mcp-approval=allow`
+нужен для неинтерактивного демо.
+
+`internal/mcp/policy.go` проверяет `path_under` (Abs/Clean/Rel/EvalSymlinks) и
+`url_hosts` (http/https, домен/поддомен, блокировка localhost/private/
+link-local). `-dump-request <path>` пишет NDJSON тел запросов к чат-модели;
+в демо в одном теле видны и `calc`, и `mcp_fs_read_file`.
+
+Ответ MCP не считается доверенным: `internal/mcp/guard.go` убирает ANSI,
+управляющие и невидимые символы, ограничивает размер и оборачивает результат
+в `<untrusted_tool_output source="mcp:server/tool">`. `-mcp-guard`:
+`heuristic` (по умолчанию, без вызова модели, помечает типовые инъекции) или
+`model` (отдельный вызов модели сжатия, JSON `safe/reason`; небезопасный
+результат блокируется и до основной модели не доходит). `-mcp-guard-model`
+переопределяет модель. `-mcp-action-guard=model` дополнительно проверяет
+намерение перед апрувом; по умолчанию `off`, потому что это ещё один вызов на
+каждый MCP-инструмент. Решения guard пишутся событием `guard` в
+`session.jsonl`.
 
 ## Персонализация (день 12)
 
@@ -229,12 +273,16 @@ stdin и `-script` не спрашивают и без флага. Провер�
 /memory clear <слой> /memory add <слой> ключ=значение
 /profile /profile list /profile use <имя> /profile set ключ=значение
 /profile clear /branch /system /tools /history /context /tokens /compact
-/recall /invariant [list | add | change | remove | history]`
+/recall /invariant [list | add | change | remove | history]
+/mcp [status | approvals | reset]`
 
 Флаги офлайна (без сети): `-print-session <id|last>`, `-memory-report
 <id|last>`, `-list-sessions`, `-list-models`, `-import-memory <сессия>
 -session <новая>`. Профиль: `-profile <имя>`. Инварианты: `-invariants
-<path>`, `-invariant-check llm|keywords`, `-invariant-model <id>`.
+<path>`, `-invariant-check llm|keywords`, `-invariant-model <id>`. MCP: `-mcp-config <path>`, `-no-mcp`,
+`-mcp-approval auto|allow|ask|deny`, `-mcp-guard off|heuristic|model`,
+`-mcp-guard-model <id>`, `-mcp-action-guard off|model`, `-dump-request <path>`.
+`-no-memory` — не обновлять слоистую память (история и `/memory` остаются).
 
 ## Соглашения по коммитам и артефактам
 
