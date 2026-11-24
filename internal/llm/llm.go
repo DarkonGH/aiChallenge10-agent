@@ -175,6 +175,7 @@ type ChatClient struct {
 	maxTokens    int
 	extraHeaders map[string]string
 	stats        ClientStats
+	requestHook  func(model string, payload []byte)
 }
 
 // NewChatClient builds a client from LLM_BASE_URL and OPENAI_API_KEY.
@@ -266,6 +267,10 @@ func (c *ChatClient) SetMaxTokens(n int) {
 	}
 }
 
+// SetRequestHook installs a callback that receives every marshaled chat
+// request. It is used by -dump-request; nil disables it.
+func (c *ChatClient) SetRequestHook(fn func(model string, payload []byte)) { c.requestHook = fn }
+
 // Stats returns a snapshot of accumulated usage.
 func (c *ChatClient) Stats() ClientStats {
 	s := c.stats
@@ -344,6 +349,9 @@ func (c *ChatClient) Chat(ctx context.Context, model string, messages []Message,
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
+	}
+	if c.requestHook != nil {
+		c.requestHook(model, payload)
 	}
 
 	start := time.Now()
@@ -453,6 +461,9 @@ func (c *ChatClient) ChatStream(ctx context.Context, model string, messages []Me
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
+	}
+	if c.requestHook != nil {
+		c.requestHook(model, payload)
 	}
 
 	start := time.Now()

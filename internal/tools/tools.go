@@ -23,6 +23,19 @@ type Tool struct {
 	// call for a hidden tool is still answered with an error text instead
 	// of a provider-side "unknown tool".
 	Visible func() bool
+	// Source is "" for a local tool and "mcp" for a tool from an external
+	// MCP server. Server names the MCP server; Approval is allow/ask/deny.
+	Source   string
+	Server   string
+	Approval string
+}
+
+// ToolMeta is what the agent needs to know before executing a call.
+type ToolMeta struct {
+	Name     string
+	Source   string
+	Server   string
+	Approval string
 }
 
 // ToolRegistry maps names to tools and builds their JSON schemas.
@@ -291,6 +304,34 @@ func (r *ToolRegistry) add(t *Tool) {
 	r.order = append(r.order, t.Name)
 }
 
+// Add registers a local tool. MCP tools should use AddMCP.
+func (r *ToolRegistry) Add(t *Tool) { r.add(t) }
+
+// AddMCP registers a tool that came from an MCP server. The "mcp_" prefix is
+// added by the caller; Source/Server let the agent route approval and trace.
+func (r *ToolRegistry) AddMCP(server string, t *Tool) {
+	t.Source = "mcp"
+	t.Server = server
+	if t.Approval == "" {
+		t.Approval = "ask"
+	}
+	r.add(t)
+}
+
+// Meta returns the tool metadata used by the approval gate.
+func (r *ToolRegistry) Meta(name string) (ToolMeta, bool) {
+	t, ok := r.tools[name]
+	if !ok {
+		return ToolMeta{}, false
+	}
+	return ToolMeta{
+		Name:     t.Name,
+		Source:   t.Source,
+		Server:   t.Server,
+		Approval: t.Approval,
+	}, true
+}
+
 // Schemas returns the tool schemas for the API request. Tools with a Visible
 // gate that currently evaluates false are left out: the model pays tokens
 // only for the tools it can actually use right now.
@@ -323,7 +364,11 @@ func (r *ToolRegistry) Describe() []string {
 	out := make([]string, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
-		out = append(out, fmt.Sprintf("%s — %s", t.Name, t.Description))
+		line := fmt.Sprintf("%s — %s", t.Name, t.Description)
+		if t.Source == "mcp" {
+			line = fmt.Sprintf("%s [MCP %s] — %s", t.Name, t.Server, t.Description)
+		}
+		out = append(out, line)
 	}
 	return out
 }

@@ -224,3 +224,34 @@ func TestTaskDoneHook(t *testing.T) {
 		t.Fatalf("hook повторно сработал на запрещённом переходе: %d", done)
 	}
 }
+
+func TestAddMCPMetaAndDescribe(t *testing.T) {
+	r := NewToolRegistry(nil)
+	r.AddMCP("fs", &Tool{
+		Name:        "mcp_fs_read_file",
+		Description: "Read a file",
+		Parameters:  map[string]any{"type": "object"},
+		Run: func(json.RawMessage) (string, error) {
+			return "ok", nil
+		},
+	})
+	meta, ok := r.Meta("mcp_fs_read_file")
+	if !ok {
+		t.Fatal("meta not found")
+	}
+	if meta.Source != "mcp" || meta.Server != "fs" || meta.Approval != "ask" {
+		t.Fatalf("meta = %+v", meta)
+	}
+	found := false
+	for _, line := range r.Describe() {
+		if strings.Contains(line, "mcp_fs_read_file [MCP fs]") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("describe has no MCP marker: %v", r.Describe())
+	}
+	if got := r.Execute(call("mcp_fs_read_file", `{}`)); got != "ok" {
+		t.Fatalf("execute = %q", got)
+	}
+}

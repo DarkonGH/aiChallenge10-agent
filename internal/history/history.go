@@ -52,6 +52,19 @@ type Event struct {
 	// before and after. Memory still reconstructs the store; Changes explains
 	// the replacement to a human reading the log.
 	Changes []memory.Change `json:"changes,omitempty"`
+	// Guard is the day-16 injection-screen verdict for one MCP result. It is
+	// audit only: replaying it changes no prompt state.
+	Guard *GuardRecord `json:"guard,omitempty"`
+}
+
+// GuardRecord mirrors the MCP guard verdict in the session log.
+type GuardRecord struct {
+	Server     string   `json:"server,omitempty"`
+	Tool       string   `json:"tool,omitempty"`
+	Suspicious bool     `json:"suspicious,omitempty"`
+	Blocked    bool     `json:"blocked,omitempty"`
+	Reasons    []string `json:"reasons,omitempty"`
+	Model      string   `json:"model,omitempty"`
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -240,6 +253,9 @@ func (h *History) apply(ev *Event) {
 		if len(ev.Covers) == 2 {
 			h.applyEvict(ev.Covers[0], ev.Covers[1])
 		}
+	case "guard":
+		// Audit only: the verdict explains a tool result but does not alter
+		// the reconstructed prompt.
 	case "fork":
 		h.forkOf = ev.Fork
 		if len(ev.Covers) == 2 {
@@ -330,6 +346,13 @@ const NoticePrefix = "[проверка кода · инварианты] "
 // visible why the answer was not released.
 func (h *History) AppendNotice(content string) *llm.Message {
 	return h.appendMsg(&llm.Message{Role: "user", Content: NoticePrefix + content})
+}
+
+// AppendGuard records the MCP guard verdict for one tool result. It is a
+// separate event because the result itself is already in a tool message; the
+// verdict must not change how that message is replayed.
+func (h *History) AppendGuard(rec GuardRecord) error {
+	return h.writeEvent(Event{Type: "guard", Guard: &rec})
 }
 
 // Compact moves messages with seq in [from,to] out of the prompt and replaces

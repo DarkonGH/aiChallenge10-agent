@@ -13,6 +13,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/mcp"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
@@ -37,6 +38,7 @@ type app struct {
 	temperature  float64
 	maxToolChars int
 	noCompact    bool
+	noMemory     bool
 	compactEvery int
 	strategy     compact.Strategy
 	window       int
@@ -46,6 +48,14 @@ type app struct {
 	scriptDelay  time.Duration // pause between dialogue turns in -script (rate limits)
 
 	summary *llm.ChatClient // client for compaction; nil means the chat client
+
+	// MCP is an optional runtime layer: one manager for every session. The
+	// approval map is per session, because /new and /session start a new trust
+	// scope even though the MCP server process stays alive.
+	mcpClient   *mcp.Manager
+	mcpApproval string
+	mcpAlways   map[string]bool
+	stdin       *bufio.Reader
 
 	hist  *history.History
 	agent *agent.Agent
@@ -267,6 +277,75 @@ func (u *ui) trace(s string) {
 	u.mu.Unlock()
 }
 
+// pauseSpinner stops the spinner and closes a streamed line before an
+// interactive prompt. The approval question must not be overwritten by the
+// spinner goroutine or glued to the end of a streamed answer.
+func (u *ui) pauseSpinner() {
+	u.mu.Lock()
+	if u.spinning {
+		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
+		u.spinning = false
+	}
+	u.closeReasoningLocked()
+	if u.streamed {
+		fmt.Println()
+		u.streamed = false
+	}
+	u.mu.Unlock()
+}
+
+// approveMCP is the code-level gate for external tools. The model proposes a
+// call, this method decides whether it may run. In auto mode a real terminal
+// gets asked; scripts and pipes deny by default unless -mcp-approval=allow.
+func (a *app) approveMCP(req agent.ApprovalRequest) (bool, error) {
+	switch a.mcpApproval {
+	case "allow":
+		return true, nil
+	case "deny":
+		return false, nil
+	case "auto", "ask":
+		if !isTerminal(os.Stdin) {
+			return false, nil
+		}
+	default:
+		return false, fmt.Errorf("неизвестная политика MCP %q", a.mcpApproval)
+	}
+
+	key := req.Server + "/" + req.Name
+	if a.mcpAlways[key] {
+		return true, nil
+	}
+
+	pretty := req.Args
+	if pretty == "" {
+		pretty = "{}"
+	}
+	var parsed any
+	if json.Unmarshal([]byte(pretty), &parsed) == nil {
+		if b, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+			pretty = string(b)
+		}
+	}
+	pretty = strings.ReplaceAll(pretty, "\n", "\n     ")
+	short := strings.TrimPrefix(req.Name, "mcp_"+req.Server+"_")
+
+	a.ui.pauseSpinner()
+	fmt.Printf("\n  ⛓ MCP %s · %s\n     %s\n     разрешить? [y] да / [n] нет / [a] всегда в этой сессии: ", req.Server, short, pretty)
+	line, err := a.stdin.ReadString('\n')
+	if err != nil {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes", "д", "да":
+		return true, nil
+	case "a", "always", "в", "всегда":
+		a.mcpAlways[key] = true
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 func main() {
 	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или opencode-go/deepseek-v4.1-flash)")
 	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или самая дешёвая в списке)")
@@ -282,6 +361,7 @@ func main() {
 	maxTokens := flag.Int("max-tokens", 4096, "лимит токенов ответа (включая рассуждения reasoning-моделей)")
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
+	noMemory := flag.Bool("no-memory", false, "не обновлять слоистую память (история и /memory остаются)")
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
 	strategyFlag := flag.String("strategy", string(compact.StrategySummary), "стратегия контекста: summary (конспект), window (последние N сообщений), facts (ключ-значение + окно)")
 	windowFlag := flag.Int("window", 0, "размер окна для стратегий window и facts (обязателен для них)")
@@ -299,7 +379,24 @@ func main() {
 	invariantsFlag := flag.String("invariants", "", "файл инвариантов проекта (по умолчанию <data>/invariants.json)")
 	invariantCheck := flag.String("invariant-check", "llm", "проверка текста ответа: llm (локальная модель + ключевые слова) или keywords")
 	invariantModel := flag.String("invariant-model", "", "модель семантической проверки (по умолчанию LLM_INVARIANT_MODEL / LLM_SUMMARY_MODEL)")
+	mcpConfig := flag.String("mcp-config", "", "путь к mcp.json (по умолчанию MCP_CONFIG, ./mcp.json, ~/.config/goagent/mcp.json, <data>/mcp.json)")
+	noMCP := flag.Bool("no-mcp", false, "не подключать MCP-серверы")
+	mcpApproval := flag.String("mcp-approval", "auto", "подтверждение MCP-инструментов: auto (ask в TTY, deny в script), allow или deny")
+	mcpGuard := flag.String("mcp-guard", "heuristic", "проверка результата MCP: off, heuristic (эвристики) или model (модель сжатия)")
+	mcpGuardModel := flag.String("mcp-guard-model", "", "модель проверки MCP (по умолчанию модель сжатия)")
+	mcpActionGuard := flag.String("mcp-action-guard", "off", "проверка намерения MCP моделью: off или model")
+	dumpRequest := flag.String("dump-request", "", "писать тела запросов к чат-модели в NDJSON-файл")
 	flag.Parse()
+
+	if *mcpApproval != "auto" && *mcpApproval != "allow" && *mcpApproval != "deny" && *mcpApproval != "ask" {
+		fatalf("-mcp-approval: допустимо auto, allow, ask или deny, получено %q", *mcpApproval)
+	}
+	if _, err := mcp.ParseGuardMode(*mcpGuard); err != nil {
+		fatalf("-mcp-guard: %v", err)
+	}
+	if *mcpActionGuard != "off" && *mcpActionGuard != "model" {
+		fatalf("-mcp-action-guard: допустимо off или model, получено %q", *mcpActionGuard)
+	}
 
 	if *invariantCheck != "llm" && *invariantCheck != "keywords" {
 		fatalf("-invariant-check: допустимо llm или keywords, получено %q", *invariantCheck)
@@ -406,6 +503,50 @@ func main() {
 	}
 	client.SetMaxTokens(*maxTokens)
 
+	// MCP is discovered and connected after the offline branches: listing
+	// sessions or printing a log must not spawn external processes. A missing
+	// config simply means "local tools only"; an explicit broken config is an
+	// error, and -no-mcp always wins.
+	var mcpManager *mcp.Manager
+	if !*noMCP {
+		configPath, err := mcp.FindConfig(*mcpConfig, dataDir)
+		if err != nil {
+			fatalf("%v (отключить MCP: -no-mcp)", err)
+		}
+		if configPath != "" {
+			cfg, err := mcp.Load(configPath)
+			if err != nil {
+				fatalf("%v (отключить MCP: -no-mcp)", err)
+			}
+			mcpManager, err = mcp.Start(context.Background(), cfg)
+			if err != nil {
+				fatalf("%v (отключить MCP: -no-mcp)", err)
+			}
+			defer mcpManager.Close()
+			for _, line := range mcpManager.StatusLines() {
+				fmt.Println(line)
+			}
+			for _, warning := range mcpManager.Warnings() {
+				fmt.Fprintf(os.Stderr, "MCP: %s\n", warning)
+			}
+		}
+	}
+
+	if *dumpRequest != "" {
+		f, err := os.Create(*dumpRequest)
+		if err != nil {
+			fatalf("dump-request: %v", err)
+		}
+		defer f.Close()
+		var dumpMu sync.Mutex
+		client.SetRequestHook(func(model string, payload []byte) {
+			dumpMu.Lock()
+			defer dumpMu.Unlock()
+			_, _ = f.Write(payload)
+			_, _ = f.Write([]byte("\n"))
+		})
+	}
+
 	// Compaction may live on another endpoint (local Ollama). Without
 	// LLM_SUMMARY_BASE_URL this is the same client as chat.
 	summaryClient := llm.NewSummaryClient()
@@ -424,6 +565,7 @@ func main() {
 		temperature:  *temp,
 		maxToolChars: *maxToolChars,
 		noCompact:    *noCompact,
+		noMemory:     *noMemory,
 		compactEvery: *compactEvery,
 		noReasoning:  *noReasoning,
 		strategy:     strategy,
@@ -434,7 +576,14 @@ func main() {
 		summary:      summaryClient,
 		inv:          inv,
 		invPath:      invariantsPath,
+		mcpClient:    mcpManager,
+		mcpApproval:  *mcpApproval,
+		mcpAlways:    map[string]bool{},
+		stdin:        bufio.NewReader(os.Stdin),
 		ui:           &ui{tty: isTerminal(os.Stdout)},
+	}
+	if mcpManager != nil {
+		mcpManager.Register(a.tools)
 	}
 	// The task machine is per-session, so the registry holds a provider, not
 	// a pointer: the task_transition tool always acts on the current session.
@@ -480,6 +629,44 @@ func main() {
 	}
 	defer a.hist.Close()
 
+	if mcpManager != nil {
+		guardMode, _ := mcp.ParseGuardMode(*mcpGuard)
+		if guardMode == mcp.GuardModel && !summaryClient.Configured() {
+			fatalf("MCP guard: для -mcp-guard=model нужен настроенный эндпоинт модели сжатия")
+		}
+		guardModel := *mcpGuardModel
+		if guardModel == "" {
+			guardModel = a.hist.SummaryModel()
+		}
+		guard, err := mcp.NewGuard(*mcpGuard, summaryClient, guardModel)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		guard.ActionGuard = *mcpActionGuard == "model"
+		if guard.ActionGuard && !summaryClient.Configured() {
+			fatalf("MCP action guard: нужен настроенный эндпоинт модели сжатия")
+		}
+		guard.OnResult = func(rec mcp.GuardRecord) {
+			if a.hist == nil {
+				return
+			}
+			_ = a.hist.AppendGuard(history.GuardRecord{
+				Server:     rec.Server,
+				Tool:       rec.Tool,
+				Suspicious: rec.Suspicious,
+				Blocked:    rec.Blocked,
+				Reasons:    rec.Reasons,
+				Model:      rec.Model,
+			})
+		}
+		mcpManager.SetGuard(guard)
+		if guard.ActionGuard {
+			a.agent.SetActionGuard(func(ctx context.Context, userText string, req agent.ApprovalRequest) (bool, string, error) {
+				return guard.CheckAction(ctx, userText, req.Server, req.Name, req.Args)
+			})
+		}
+	}
+
 	if *scriptFlag != "" {
 		if err := a.runScript(*scriptFlag); err != nil {
 			fatalf("%v", err)
@@ -518,7 +705,9 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	}
 	a.task = tsk
 	a.agent = agent.NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
-	a.agent.SetMemory(mem)
+	if !a.noMemory {
+		a.agent.SetMemory(mem)
+	}
 	a.agent.SetTask(func() *task.Machine { return a.task })
 	a.agent.SetInvariants(func() *invariant.Set { return a.inv })
 	a.agent.SetInvariantChecker(a.invChecker)
@@ -529,6 +718,10 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetSummaryClient(a.summary)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
+	// A new session is a new trust scope: "always" answers from the previous
+	// session must not silently authorise MCP calls in this one.
+	a.mcpAlways = map[string]bool{}
+	a.agent.SetApprover(a.approveMCP)
 	if !a.noReasoning {
 		a.agent.SetReasoningUI(a.ui.reasoning)
 	}
@@ -960,6 +1153,37 @@ func (a *app) command(line string) (bool, error) {
 			fmt.Println("•", s)
 		}
 
+	case "/mcp":
+		sub := strings.ToLower(strings.TrimSpace(arg))
+		switch sub {
+		case "", "status":
+			if a.mcpClient == nil {
+				fmt.Println("MCP не подключён (нет mcp.json или включён -no-mcp)")
+				return false, nil
+			}
+			for _, line := range a.mcpClient.StatusLines() {
+				fmt.Println("•", line)
+			}
+			for _, warning := range a.mcpClient.Warnings() {
+				fmt.Println("  предупреждение:", warning)
+			}
+			fmt.Printf("подтверждение MCP: %s; постоянные разрешения: /mcp approvals\n", a.mcpApproval)
+		case "approvals":
+			if len(a.mcpAlways) == 0 {
+				fmt.Println("постоянных разрешений MCP в этой сессии нет")
+				return false, nil
+			}
+			fmt.Println("постоянные разрешения MCP в этой сессии:")
+			for key := range a.mcpAlways {
+				fmt.Println("  •", key)
+			}
+		case "reset":
+			a.mcpAlways = map[string]bool{}
+			fmt.Println("постоянные разрешения MCP сброшены")
+		default:
+			return false, fmt.Errorf("использование: /mcp [status | approvals | reset]")
+		}
+
 	case "/history":
 		a.printHistory()
 
@@ -1339,6 +1563,9 @@ const helpText = `Команды:
                    /branch <существующее имя> — переключение
   /system          показать системный промпт
   /tools           список инструментов
+  /mcp [status | approvals | reset]
+                   MCP-серверы: какие подключены и какие инструменты дали;
+                   approvals — постоянные разрешения этой сессии; reset — сбросить
   /history         последние сообщения активного окна
   /context         что реально уходит в модель: system, память, хвост, tools
   /tokens          токены, архив, память, расходы API

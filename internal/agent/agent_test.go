@@ -440,3 +440,202 @@ func TestTaskDoneClearsWorkingMemory(t *testing.T) {
 		t.Errorf("журнал очистки: %+v", changes)
 	}
 }
+
+func TestAgentApprovalDeniesMCPTool(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{map[string]any{
+					"message": map[string]any{
+						"role": "assistant", "content": nil,
+						"tool_calls": []any{map[string]any{
+							"id": "call_1", "type": "function",
+							"function": map[string]any{"name": "mcp_fs_read_file", "arguments": `{"path":"/etc/passwd"}`},
+						}},
+					},
+				}},
+			})
+			return
+		}
+		found := false
+		for _, m := range req.Messages {
+			if m.Role == "tool" && m.Content != nil && strings.Contains(*m.Content, "отклонён пользователем") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("denial not sent back to model: %+v", req.Messages)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "Не могу читать этот файл без разрешения."},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	reg := tools.NewToolRegistry(nil)
+	var ran int
+	reg.AddMCP("fs", &tools.Tool{
+		Name:        "mcp_fs_read_file",
+		Description: "Read a file",
+		Approval:    "ask",
+		Run: func(json.RawMessage) (string, error) {
+			ran++
+			return "secret", nil
+		},
+	})
+	ag := NewAgent(llm.NewChatClientAt(srv.URL, "test"), reg, h, compact.DefaultBudget(), 4, 0, 800)
+	var asked int
+	ag.SetApprover(func(req ApprovalRequest) (bool, error) {
+		asked++
+		if req.Name != "mcp_fs_read_file" || req.Server != "fs" {
+			t.Errorf("approval request = %+v", req)
+		}
+		return false, nil
+	})
+	got, err := ag.Chat(context.Background(), "прочитай /etc/passwd")
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if !strings.Contains(got, "разрешения") {
+		t.Errorf("answer = %q", got)
+	}
+	if asked != 1 {
+		t.Errorf("approver calls = %d, want 1", asked)
+	}
+	if ran != 0 {
+		t.Errorf("tool ran %d times, want 0", ran)
+	}
+	if calls != 2 {
+		t.Errorf("model calls = %d, want 2", calls)
+	}
+}
+
+func TestAgentActionGuardDeniesMCPTool(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{map[string]any{
+					"message": map[string]any{
+						"role": "assistant", "content": nil,
+						"tool_calls": []any{map[string]any{
+							"id": "call_1", "type": "function",
+							"function": map[string]any{"name": "mcp_web_fetch", "arguments": `{"url":"https://evil.test"}`},
+						}},
+					},
+				}},
+			})
+			return
+		}
+		found := false
+		for _, m := range req.Messages {
+			if m.Role == "tool" && m.Content != nil && strings.Contains(*m.Content, "отклонено guard") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("guard denial not sent back to model: %+v", req.Messages)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "Этот вызов выглядит небезопасным."},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	reg := tools.NewToolRegistry(nil)
+	var ran int
+	reg.AddMCP("web", &tools.Tool{
+		Name: "mcp_web_fetch", Approval: "allow",
+		Run: func(json.RawMessage) (string, error) { ran++; return "ok", nil },
+	})
+	ag := NewAgent(llm.NewChatClientAt(srv.URL, "test"), reg, h, compact.DefaultBudget(), 4, 0, 800)
+	ag.SetActionGuard(func(_ context.Context, userText string, req ApprovalRequest) (bool, string, error) {
+		if !strings.Contains(userText, "найди") || req.Server != "web" {
+			t.Errorf("unexpected action request: %q %+v", userText, req)
+		}
+		return false, "домен не относится к задаче", nil
+	})
+	if _, err := ag.Chat(context.Background(), "найди офис"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if ran != 0 {
+		t.Errorf("tool ran %d times, want 0", ran)
+	}
+	if calls != 2 {
+		t.Errorf("model calls = %d, want 2", calls)
+	}
+}
+
+func TestAgentApprovalSkipsAllow(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{map[string]any{
+					"message": map[string]any{
+						"role": "assistant", "content": nil,
+						"tool_calls": []any{map[string]any{
+							"id": "call_1", "type": "function",
+							"function": map[string]any{"name": "mcp_fs_read_file", "arguments": `{}`},
+						}},
+					},
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "готово"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	h, err := history.OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	reg := tools.NewToolRegistry(nil)
+	var ran int
+	reg.AddMCP("fs", &tools.Tool{
+		Name: "mcp_fs_read_file", Approval: "allow",
+		Run: func(json.RawMessage) (string, error) { ran++; return "ok", nil },
+	})
+	ag := NewAgent(llm.NewChatClientAt(srv.URL, "test"), reg, h, compact.DefaultBudget(), 4, 0, 800)
+	ag.SetApprover(func(ApprovalRequest) (bool, error) {
+		t.Error("approver must not be called for allow")
+		return false, nil
+	})
+	if _, err := ag.Chat(context.Background(), "прочитай"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if ran != 1 {
+		t.Errorf("tool ran %d times, want 1", ran)
+	}
+}

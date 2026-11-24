@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "approval": "ask",
+  "servers": [
+    {
+      "name": "fs",
+      "command": "uvx",
+      "args": ["--from", "filesystem-mcp", "filesystem-mcp", "${MCP_FS_ROOT}"],
+      "required": false,
+      "allow": ["read_file", "list_directory", "list_allowed_directories"],
+      "approval": {
+        "list_allowed_directories": "allow",
+        "list_directory": "ask",
+        "read_file": "ask"
+      },
+      "descriptions": {
+        "list_allowed_directories": "Показать каталоги, разрешённые filesystem-серверу",
+        "list_directory": "Показать файлы и подкаталоги в разрешённом каталоге",
+        "read_file": "Прочитать текстовый файл внутри разрешённого каталога"
+      },
+      "rules": {
+        "read_file": {"path_under": "${MCP_FS_ROOT}"},
+        "list_directory": {"path_under": "${MCP_FS_ROOT}"}
+      }
+    },
+    {
+      "name": "web",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "required": false,
+      "allow": ["fetch"],
+      "approval": {
+        "fetch": "ask"
+      },
+      "descriptions": {
+        "fetch": "Загрузить URL из интернета; домен проверяется правилом url_hosts"
+      },
+      "rules": {
+        "fetch": {"url_hosts": ["*"]}
+      }
+    }
+  ]
+}

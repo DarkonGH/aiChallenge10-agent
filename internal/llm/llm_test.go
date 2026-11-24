@@ -1,7 +1,11 @@
 package llm
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +84,63 @@ func TestRecordChargesCacheRate(t *testing.T) {
 	fresh.record("opencode-go/deepseek-v4.1-flash", usage{PromptTokens: 1_000_000})
 	if got, want := fresh.Stats().Cost, 0.30; got != want {
 		t.Fatalf("no-cache Cost = %v, want %v", got, want)
+	}
+}
+
+func TestRequestHookChat(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		if len(req.Tools) != 1 || req.Tools[0].Function.Name != "calc" {
+			t.Errorf("tools = %+v", req.Tools)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv)
+	var gotModel string
+	var gotBody []byte
+	client.SetRequestHook(func(model string, payload []byte) {
+		gotModel = model
+		gotBody = append([]byte(nil), payload...)
+	})
+	_, err := client.Chat(context.Background(), "test-model",
+		[]Message{{Role: "user", Content: "2+2"}},
+		[]ToolSchema{{Type: "function", Function: ToolFunction{Name: "calc", Parameters: map[string]any{"type": "object"}}}}, 0)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if gotModel != "test-model" {
+		t.Errorf("hook model = %q", gotModel)
+	}
+	if !strings.Contains(string(gotBody), `"calc"`) {
+		t.Errorf("hook body has no calc schema: %s", gotBody)
+	}
+}
+
+func TestRequestHookStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseBody(
+			map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": "ok"}, "finish_reason": "stop"}}},
+		)))
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv)
+	var calls int
+	client.SetRequestHook(func(string, []byte) { calls++ })
+	if _, err := client.ChatStream(context.Background(), "m", []Message{{Role: "user", Content: "x"}}, nil, 0, nil, nil); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("hook calls = %d, want 1", calls)
 	}
 }

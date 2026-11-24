@@ -42,7 +42,7 @@ def wrap_line(line, width=COLS):
                          break_long_words=False, break_on_hyphens=False)
 
 
-def convert(in_path, out_path):
+def convert(in_path, out_path, line_delay=0.06, prompt_delay=0.9, blank_delay=0.15):
     raw = open(in_path, encoding="utf-8").read().splitlines()
 
     # Хвост shell-обёртки: «EXIT=0» печатает не агент, а скрипт запуска.
@@ -60,16 +60,16 @@ def convert(in_path, out_path):
             # Приглашение в консоли отделено от предыдущего вывода пустой
             # строкой; в логе её нет, потому что prompt печатается сразу после
             # последней строки ответа.
-            if piece.startswith("agent> ") and last != "\n":
+            if piece.startswith("agent> ") and last and last != "\n":
                 lead = "\n"
             out.append((round(t, 3), "o", f"{lead}{piece}\n"))
             last = f"{lead}{piece}\n"
             if piece.startswith("agent> "):
-                t += 0.9      # пользователь набирает команду
+                t += prompt_delay  # пользователь набирает команду
             elif piece == "":
-                t += 0.15
+                t += blank_delay
             else:
-                t += 0.06     # строки вывода идут потоком
+                t += line_delay    # строки вывода идут потоком
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"version": 2, "width": WIDTH, "height": HEIGHT,
@@ -85,5 +85,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="синтез asciicast из stdout-лога")
     ap.add_argument("log", help="stdout-лог консольного прогона")
     ap.add_argument("out", help="куда записать .cast")
+    ap.add_argument("--line-delay", type=float, default=0.06,
+                    help="пауза между строками вывода, секунды")
+    ap.add_argument("--prompt-delay", type=float, default=0.9,
+                    help="пауза после приглашения agent>, секунды")
+    ap.add_argument("--blank-delay", type=float, default=0.15,
+                    help="пауза на пустой строке, секунды")
     args = ap.parse_args()
-    convert(args.log, args.out)
+    convert(args.log, args.out, args.line_delay, args.prompt_delay, args.blank_delay)
