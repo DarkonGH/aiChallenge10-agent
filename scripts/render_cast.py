@@ -24,15 +24,38 @@ DIM = (130, 130, 140)
 ACCENT = (120, 190, 255)
 
 FONT_PATH = "/System/Library/Fonts/Menlo.ttc"
+FALLBACK_FONT_PATH = "/System/Library/Fonts/Supplemental/STIXTwoMath.otf"
 FONT_SIZE = 15
 LINE_H = 19
 PAD = 10
+# Menlo моноширинный: одна ячейка — ровно 9 px при размере 15. По этой
+# ширине считается и размер кадра, поэтому fallback-глифы нельзя рисовать
+# «как получится»: они центрируются внутри той же ячейки.
+CELL_W = 9
+# Символы, которых нет в Menlo: он рисует для них пустой квадрат.
+# ⛓ и ↳ встречаются в trace MCP, ⛔ — в отказе апрува. Apple Symbols
+# показывает ⛓ квадратом, поэтому fallback — STIX Two Math.
+FALLBACK_CHARS = "⛓↳⛔"
+FALLBACK_DY = 2
 
 SPINNER = re.compile(r"\A\r[ \t]*[\\/|-]?[ \t]*\Z")
 
 
 def font(size=FONT_SIZE, bold=False):
     return ImageFont.truetype(FONT_PATH, size, index=1 if bold else 0)
+
+
+def fallback_font(size=FONT_SIZE):
+    """Шрифт для символов, отсутствующих в Menlo.
+
+    Apple Symbols содержит ⛓, ↳ и ⛔. Если файла нет, возвращаем Menlo:
+    видео останется работоспособным, хотя редкие глифы снова станут
+    квадратами.
+    """
+    try:
+        return ImageFont.truetype(FALLBACK_FONT_PATH, size)
+    except OSError:
+        return font(size)
 
 
 class Screen:
@@ -164,12 +187,34 @@ def video_times(snaps, fast=0.05, cap=0.45, pause=1.8, read=0.14, read_max=3.0, 
     return times
 
 
-def draw_screen(draw, snap, f, fdim):
+def draw_line(draw, x, y, line, f, ffallback):
+    """Рисует строку, подменяя отсутствующие в Menlo глифы.
+
+    Обычный текст идёт одним run: Menlo моноширинный, его advance равен
+    CELL_W. Для ⛓, ↳ и ⛔ рисуем отдельный символ Apple Symbols и
+    центрируем его в той же ячейке — иначе строка «поедет» и сломает
+    таблицы/trace, набранные пробелами.
+    """
+    run_start = 0
+    for i, ch in enumerate(line):
+        if ch not in FALLBACK_CHARS:
+            continue
+        if i > run_start:
+            draw.text((x + run_start * CELL_W, y), line[run_start:i], font=f, fill=FG)
+        w = draw.textlength(ch, font=ffallback)
+        draw.text((x + i * CELL_W + (CELL_W - w) / 2, y + FALLBACK_DY),
+                  ch, font=ffallback, fill=FG)
+        run_start = i + 1
+    if run_start < len(line):
+        draw.text((x + run_start * CELL_W, y), line[run_start:], font=f, fill=FG)
+
+
+def draw_screen(draw, snap, f, fdim, ffallback):
     text, cursor_row, status = snap
     y = PAD
     for line in text.split("\n"):
         if line:
-            draw.text((PAD, y), line, font=f, fill=FG)
+            draw_line(draw, PAD, y, line, f, ffallback)
         y += LINE_H
     if status:
         draw.text((PAD, PAD + cursor_row * LINE_H), status, font=f, fill=DIM)
@@ -237,6 +282,7 @@ def main():
                     default="слои, которые попадают в промпт по разным правилам")
     ap.add_argument("--no-cards", action="store_true")
     ap.add_argument("--cards", default="", help="JSON с карточками результатов вместо стандартных дня 11")
+    ap.add_argument("--hold", type=float, default=1.5, help="сколько секунд держать последний кадр")
     args = ap.parse_args()
 
     header, snaps = snapshots(args.cast)
@@ -248,6 +294,7 @@ def main():
 
     f = font()
     fdim = font()
+    ffallback = fallback_font()
 
     proc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y",
@@ -270,10 +317,10 @@ def main():
 
     cur = Image.new("RGB", (width, height), BG)
     for i, (t_v, (t, snap)) in enumerate(zip(times, snaps)):
-        next_t = times[i + 1] if i + 1 < len(times) else t_v + 1.5
+        next_t = times[i + 1] if i + 1 < len(times) else t_v + args.hold
         cur = Image.new("RGB", (width, height), BG)
         draw = ImageDraw.Draw(cur)
-        draw_screen(draw, snap, f, fdim)
+        draw_screen(draw, snap, f, fdim, ffallback)
         n = max(1, round((next_t - t_v) * fps))
         for _ in range(n):
             emit(cur)

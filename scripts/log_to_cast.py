@@ -60,7 +60,7 @@ def convert(in_path, out_path, line_delay=0.06, prompt_delay=0.9, blank_delay=0.
             # Приглашение в консоли отделено от предыдущего вывода пустой
             # строкой; в логе её нет, потому что prompt печатается сразу после
             # последней строки ответа.
-            if piece.startswith("agent> ") and last != "\n":
+            if piece.startswith("agent> ") and last and last != "\n":
                 lead = "\n"
             out.append((round(t, 3), "o", f"{lead}{piece}\n"))
             last = f"{lead}{piece}\n"

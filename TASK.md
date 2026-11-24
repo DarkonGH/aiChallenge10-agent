@@ -42,20 +42,28 @@
 - **Дамп тела запроса.** Флаг `-dump-request <path>` пишет NDJSON: по одному
   телу запроса к чат-модели на строку. В дампе видно `tools[].function.name`,
   сообщения и модель.
-- **`-no-memory`.** Демо дня 16 запускается без обновления слоистой памяти:
-  задача про MCP, и посторонний вызов экстрактора в кадре не нужен. История и
+- **`-no-memory`.** Флаг отключает обновление слоистой памяти, если нужен
+  чистый прогон только про MCP. В сдаточном сценарии `test16.csv` память
+  включена: в логе видно `↳ память: working следующий шаг ...`. История и
   команда `/memory` при этом остаются.
 
 ## Смешанный набор: local + MCP
 
-Демо читает `expenses.csv` через MCP и считает сумму локальным `calc`:
+Сдаточный прогон: модель ищет `test16.csv` через MCP и считает сумму
+локальным `calc`:
 
 ```text
-mcp_fs_list_allowed_directories({}) → ...
-mcp_fs_list_directory({"path":"/private/tmp/day16-fs/data"}) → ...
-mcp_fs_read_file({"path":"/private/tmp/day16-fs/data/expenses.csv"}) → ...
-calc({"expr":"12000+4000+9000"}) → 25000
+agent> найди файл test16.csv и посчитай сумму всех значений в первом столбце
+mcp_fs_list_directory({"path":".../agent/data"}) → test16.csv
+mcp_fs_list_directory({"path":".../agent/files"}) → отклонён пользователем
+mcp_fs_read_file({"path":".../agent/test16.csv"}) → файла нет
+mcp_fs_read_file({"path":".../agent/data/test16.csv"}) → 11100;33222;88811;9999999
+calc({"expr":"11100+33222+88811+9999999"}) → 10133132
 ```
+
+Итог: `10 133 132`. В логе остаются реальные особенности прогона: `data`
+модель угадала (каталог существует), `files` выдумала и получила отказ,
+чтение из корня вернуло ошибку.
 
 В теле запроса к модели 7 инструментов: три локальных и четыре MCP.
 
@@ -211,26 +219,21 @@ guard до запуска инструмента. Демо проходит и �
 # сборка
 go build -o agent .
 
-# демо: filesystem MCP + локальный calc
-scripts/day16-demo.sh 2>&1 | tee /tmp/day16-demo.log
+# тот же сценарий, что в видео (интерактивно):
+#   найди файл test16.csv и посчитай сумму всех значений в первом столбце
 
-# строгая проверка результата и намерения моделью
-GUARD=model ACTION_GUARD=model scripts/day16-demo.sh
-
-# независимая проверка
-python3 scripts/check_mcp.py /tmp/day16-fs/sessions /tmp/day16-fs/requests.ndjson
-
-# каст из настоящего stdout-лога и видео
-python3 scripts/log_to_cast.py /tmp/day16-demo.log /tmp/day16-demo.cast \
+# лог начинается с /mcp и /tools, затем идёт реальный stdout сценария test16.csv
+python3 scripts/log_to_cast.py /tmp/day16-test16-cards.log /tmp/day16-test16-cards.cast \
   --line-delay 0.5 --prompt-delay 1.6 --blank-delay 0.3
-python3 scripts/render_cast.py --cast /tmp/day16-demo.cast \
+python3 scripts/render_cast.py --cast /tmp/day16-test16-cards.cast \
   --out video/подключение-mcp-день-16.mp4 \
   --title "День 16 · MCP: внешние инструменты" \
-  --subtitle "filesystem MCP + локальный calc в одном запросе" \
-  --cards testdata/day16-cards.json
+  --subtitle "filesystem MCP + локальный calc; /mcp, /tools и test16.csv" \
+  --cards testdata/day16-test16-cards.json --hold 4
 ```
 
-Видео: 82 с, 1352x970, 8 fps, h264, без аудио. Каст собран из stdout-лога,
-поэтому в нём ровно то, что было в консоли: `/mcp`, `/tools`, строки вызовов,
-обёртки `<untrusted_tool_output …>`, ответ и футер. Карточки объясняют guard
-результата MCP.
+Видео: 85 с, 1352x970, 8 fps, h264, без аудио. В начале показаны `/mcp` и
+`/tools`; затем идёт stdout-лог сценария test16.csv: `↳ память`, три апрува
+(`data` — да, `files` — нет, корень — да), ошибка чтения из корня, строка
+сжатия, чтение `data/test16.csv`, `calc`, ответ и футер. После терминала —
+шесть карточек про MCP, апрув, guard и результат `10 133 132`.
