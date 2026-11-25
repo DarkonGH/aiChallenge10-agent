@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "fetch-local",
+      "command": "./bin/mcp-fetch",
+      "args": [],
+      "required": false,
+      "allow": [
+        "fetch_url"
+      ],
+      "approval": {
+        "fetch_url": "ask"
+      }
+    }
+  ]
+}
