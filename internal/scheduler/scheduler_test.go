@@ -167,6 +167,31 @@ func TestRunAddsSummaryToReport(t *testing.T) {
 	}
 }
 
+func TestRunDurationUsesFixedStart(t *testing.T) {
+	caller := &fakeCaller{}
+	var logs []string
+	err := Run(context.Background(), caller, Config{
+		Server:       "forex",
+		Base:         "USD",
+		Quote:        "RUB",
+		Interval:     5 * time.Millisecond,
+		Duration:     25 * time.Millisecond,
+		SummaryEvery: 50 * time.Millisecond,
+		Runs:         5,
+		Log:          func(s string) { logs = append(logs, s) },
+		Summarize:    func(context.Context, forex.Report) (string, error) { return "", nil },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(caller.ticks) != 5 {
+		t.Fatalf("ticks = %d, want 5: пауза должна считаться от общего старта", len(caller.ticks))
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "[запуск 5/5]") {
+		t.Fatalf("нет последнего запуска 5/5:\n%s", strings.Join(logs, "\n"))
+	}
+}
+
 func TestRunValidatesConfig(t *testing.T) {
 	if err := Run(context.Background(), &fakeCaller{}, Config{}); err == nil {
 		t.Fatal("ожидалась ошибка для пустого интервала")

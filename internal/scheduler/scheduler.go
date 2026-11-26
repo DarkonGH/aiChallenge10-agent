@@ -86,25 +86,40 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 			cfg.Interval, runLimit(cfg.Runs), cfg.ReportEvery, cfg.Base, cfg.Quote))
 	}
 
+	// В режиме Duration число запусков считается заранее: 600 с / 10 с = 60.
+	// Паузу отсчитываем от общего старта, а не от конца предыдущего вызова.
+	// Иначе накладные расходы fetch/save (доли секунды) накапливаются, и
+	// шестьдесят первый старт выходит за границу — в логе получается 59/60.
+	durationRuns := 0
+	if cfg.Duration > 0 {
+		durationRuns = int(cfg.Duration / cfg.Interval)
+		if durationRuns < 1 {
+			durationRuns = 1
+		}
+	}
+
 	attempts, success, reported, total := 0, 0, 0, 0
 	var lastErr error
 	var summaryWG sync.WaitGroup
 	for {
 		if cfg.Duration > 0 {
-			if time.Since(started) >= cfg.Duration {
+			if attempts >= durationRuns {
 				break
 			}
 		} else if cfg.Runs > 0 && attempts >= cfg.Runs {
 			break
 		}
 		if attempts > 0 {
-			if err := wait(ctx, cfg.Interval); err != nil {
+			if cfg.Duration > 0 {
+				next := started.Add(time.Duration(attempts) * cfg.Interval)
+				if err := waitUntil(ctx, next); err != nil {
+					return err
+				}
+				if time.Now().After(started.Add(cfg.Duration)) {
+					break
+				}
+			} else if err := wait(ctx, cfg.Interval); err != nil {
 				return err
-			}
-			// Проверяем время ещё раз после паузы: иначе последний запуск
-			// делается уже за границей duration, и в логе появляется 5/4.
-			if cfg.Duration > 0 && time.Since(started) >= cfg.Duration {
-				break
 			}
 		}
 		attempts++
@@ -292,4 +307,13 @@ func wait(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// waitUntil ждёт абсолютный момент. Если он уже прошёл, запуск выполняется
+// сразу: лучше выдержать общую длительность, чем накапливать отставание.
+func waitUntil(ctx context.Context, at time.Time) error {
+	if d := time.Until(at); d > 0 {
+		return wait(ctx, d)
+	}
+	return nil
 }

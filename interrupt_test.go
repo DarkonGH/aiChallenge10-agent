@@ -14,7 +14,7 @@ func TestInterruptTurnCancels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	a.armInterrupt(cancel)
+	a.armInterrupt(ctx, cancel)
 	if !a.interruptTurn() {
 		t.Fatal("interruptTurn() = false with an armed turn")
 	}

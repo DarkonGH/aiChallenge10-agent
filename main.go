@@ -76,6 +76,7 @@ type app struct {
 	// during a request reaches the signal handler (the line editor is not in
 	// raw mode then) and cancels this context; Ctrl-D remains the exit command.
 	turnMu     sync.Mutex
+	turnCtx    context.Context
 	turnCancel context.CancelFunc
 }
 
@@ -654,9 +655,8 @@ func main() {
 					},
 					"duration_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Сколько секунд работать, по умолчанию 120",
+						"description": "Сколько секунд работать, по умолчанию 120; верхнего предела нет, остановить можно Ctrl-C",
 						"minimum":     10,
-						"maximum":     600,
 					},
 					"summary_every_seconds": map[string]any{
 						"type":        "integer",
@@ -698,9 +698,8 @@ func main() {
 				},
 				"duration_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Сколько секунд работать, по умолчанию 120",
+					"description": "Сколько секунд работать, по умолчанию 120; верхнего предела нет, остановить можно Ctrl-C",
 					"minimum":     10,
-					"maximum":     600,
 				},
 				"report_every_seconds": map[string]any{
 					"type":        "integer",
@@ -913,16 +912,30 @@ func (a *app) repl() {
 // armInterrupt makes the current turn cancellable from the SIGINT handler.
 // Only one turn runs at a time (the REPL is sequential), so a single slot is
 // enough; disarmInterrupt must be called before the next prompt.
-func (a *app) armInterrupt(cancel context.CancelFunc) {
+func (a *app) armInterrupt(ctx context.Context, cancel context.CancelFunc) {
 	a.turnMu.Lock()
+	a.turnCtx = ctx
 	a.turnCancel = cancel
 	a.turnMu.Unlock()
 }
 
 func (a *app) disarmInterrupt() {
 	a.turnMu.Lock()
+	a.turnCtx = nil
 	a.turnCancel = nil
 	a.turnMu.Unlock()
+}
+
+// turnContext is the context of the turn currently running. Scheduler tools
+// derive their own context from it, so Ctrl-C stops a long schedule instead of
+// leaving it running in the background until duration expires.
+func (a *app) turnContext() context.Context {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	if a.turnCtx != nil {
+		return a.turnCtx
+	}
+	return context.Background()
 }
 
 // interruptTurn is called by readline when Ctrl-C arrives while a request is
@@ -949,16 +962,16 @@ func (a *app) turnError(err error) {
 	fmt.Println("ошибка:", err)
 }
 
+// ask has no fixed turn deadline: a schedule may legitimately run for hours.
+// Each HTTP call to the model still has its own client timeout, and Ctrl-C
+// cancels the turn and every scheduler derived from it.
 func (a *app) ask(text string) {
-	// The day-14 gate adds a local-model check after the main answer; with a
-	// 14B model on CPU that can take tens of seconds. The old 180 s cap was
-	// enough for the chat call alone, not for chat + semantic re-check.
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Ctrl-C during the request cancels this context instead of killing the
 	// process. At the prompt the line editor handles Ctrl-C itself, and Ctrl-D
 	// on an empty line remains the exit command.
-	a.armInterrupt(cancel)
+	a.armInterrupt(ctx, cancel)
 	defer a.disarmInterrupt()
 
 	done := make(chan struct{})
@@ -1781,8 +1794,12 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 	if args.IntervalSec < 1 {
 		return "", fmt.Errorf("run_tool_schedule: interval_seconds должен быть не меньше 1")
 	}
-	if args.DurationSec < 10 || args.DurationSec > 600 {
-		return "", fmt.Errorf("run_tool_schedule: duration_seconds должен быть от 10 до 600")
+	if args.DurationSec < 10 {
+		return "", fmt.Errorf("run_tool_schedule: duration_seconds должен быть не меньше 10")
+	}
+	duration, err := secondsDuration(args.DurationSec)
+	if err != nil {
+		return "", fmt.Errorf("run_tool_schedule: duration_seconds: %w", err)
 	}
 	if args.ReportEvery <= 0 {
 		args.ReportEvery = 60
@@ -1813,15 +1830,14 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(args.DurationSec)*time.Second+30*time.Second)
+	ctx, cancel := context.WithCancel(a.turnContext())
 	defer cancel()
 
 	results, err := scheduler.RunTool(ctx, a, scheduler.ToolConfig{
 		Tool:        args.Tool,
 		Args:        callArgs,
 		Interval:    time.Duration(args.IntervalSec) * time.Second,
-		Duration:    time.Duration(args.DurationSec) * time.Second,
+		Duration:    duration,
 		ReportEvery: time.Duration(args.ReportEvery) * time.Second,
 		Log:         a.ui.trace,
 	})
@@ -1897,8 +1913,12 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	if args.IntervalSeconds < 1 {
 		return "", fmt.Errorf("run_forex_schedule: interval_seconds должен быть не меньше 1")
 	}
-	if args.DurationSeconds < 10 || args.DurationSeconds > 600 {
-		return "", fmt.Errorf("run_forex_schedule: duration_seconds должен быть от 10 до 600")
+	if args.DurationSeconds < 10 {
+		return "", fmt.Errorf("run_forex_schedule: duration_seconds должен быть не меньше 10")
+	}
+	duration, err := secondsDuration(args.DurationSeconds)
+	if err != nil {
+		return "", fmt.Errorf("run_forex_schedule: duration_seconds: %w", err)
 	}
 	if args.SummaryEverySecond < 10 || args.SummaryEverySecond > args.DurationSeconds {
 		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть от 10 до duration_seconds")
@@ -1914,8 +1934,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	runs := 0
 	var summaries []string
 	var summaryMu sync.Mutex
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(args.DurationSeconds)*time.Second+30*time.Second)
+	ctx, cancel := context.WithCancel(a.turnContext())
 	defer cancel()
 
 	cfg := scheduler.Config{
@@ -1923,7 +1942,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 		Base:         base,
 		Quote:        quote,
 		Interval:     time.Duration(args.IntervalSeconds) * time.Second,
-		Duration:     time.Duration(args.DurationSeconds) * time.Second,
+		Duration:     duration,
 		SummaryEvery: time.Duration(args.SummaryEverySecond) * time.Second,
 		// Runs не ограничивает цикл в режиме Duration, но даёт прогрессу
 		// ожидаемый знаменатель: [запуск 1/24], а не [запуск 1].
@@ -2008,6 +2027,20 @@ func (a *app) summarizeForexReport(ctx context.Context, rep forex.Report) (strin
 		return "", fmt.Errorf("сводка: пустой ответ модели")
 	}
 	return strings.Join(strings.Fields(text), " "), nil
+}
+
+// secondsDuration converts a user-provided number of seconds without
+// silently overflowing time.Duration. There is deliberately no upper limit
+// beyond the type's own range: a schedule may run for hours.
+func secondsDuration(n int) (time.Duration, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("должно быть больше нуля")
+	}
+	const maxSeconds = int64(^uint64(0)>>1) / int64(time.Second)
+	if int64(n) > maxSeconds {
+		return 0, fmt.Errorf("слишком большая длительность")
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 func parsePair(value string) (string, string, error) {

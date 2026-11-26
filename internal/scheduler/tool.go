@@ -71,17 +71,24 @@ func RunTool(ctx context.Context, caller ToolCaller, cfg ToolConfig) ([]ToolResu
 	var lastErr error
 	results := make([]ToolResult, 0)
 
+	// Как и в forex-планировщике, число запусков считаем от длительности, а
+	// паузу — от общего старта. Иначе время, потраченное на сам инструмент,
+	// сдвигает каждый следующий запуск и последний не успевает.
+	limit := int(cfg.Duration / cfg.Interval)
+	if limit < 1 {
+		limit = 1
+	}
+
 	for {
-		if time.Since(started) >= cfg.Duration {
+		if attempts >= limit {
 			break
 		}
 		if attempts > 0 {
-			if err := wait(ctx, cfg.Interval); err != nil {
+			next := started.Add(time.Duration(attempts) * cfg.Interval)
+			if err := waitUntil(ctx, next); err != nil {
 				return results, err
 			}
-			// Проверяем время после паузы: иначе последний запуск
-			// происходит уже за границей duration.
-			if time.Since(started) >= cfg.Duration {
+			if time.Now().After(started.Add(cfg.Duration)) {
 				break
 			}
 		}

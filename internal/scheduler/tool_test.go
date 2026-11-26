@@ -40,8 +40,8 @@ func TestRunToolCollectsResultsAndReports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunTool: %v", err)
 	}
-	if len(results) < 2 {
-		t.Fatalf("ожидалось несколько запусков, получено %d", len(results))
+	if len(results) != 6 {
+		t.Fatalf("ожидалось 6 запусков (30ms / 5ms), получено %d", len(results))
 	}
 	if results[0].Run != 1 || results[0].Output == "" {
 		t.Fatalf("некорректный первый результат: %+v", results[0])
