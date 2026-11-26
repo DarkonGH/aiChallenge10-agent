@@ -30,4 +30,7 @@ if [ -z "${LLM_SUMMARY_BASE_URL:-}" ] &&
 fi
 
 go build -o agent .
+mkdir -p bin
+go build -o bin/mcp-cbr ./cmd/mcp-cbr
+go build -o bin/mcp-forex ./cmd/mcp-forex
 exec ./agent "$@"

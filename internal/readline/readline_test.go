@@ -87,6 +87,22 @@ func TestRuneBuf(t *testing.T) {
 	}
 }
 
+func TestEraseUpUsesCursorRow(t *testing.T) {
+	cases := []struct {
+		row  int
+		want string
+	}{
+		{0, ""},
+		{1, "\x1b[1A"},
+		{3, "\x1b[3A"},
+	}
+	for _, tc := range cases {
+		if got := eraseUp(tc.row); got != tc.want {
+			t.Errorf("eraseUp(%d) = %q, хотим %q", tc.row, got, tc.want)
+		}
+	}
+}
+
 func TestWrapLayout(t *testing.T) {
 	cases := []struct {
 		name           string

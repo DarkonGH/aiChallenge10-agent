@@ -19,13 +19,16 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
 
 - `internal/mcp/config.go` — поиск и разбор `mcp.json`, `${VAR}`, политика
   апрува.
-- `internal/mcp/client.go` — `Start`, `listTools`, `Register`, `Call`, `Close`.
+- `internal/mcp/client.go` — `Start`, `listTools`, `Register`, `Call`,
+  `CallTrusted`, `Close`.
 - `internal/mcp/policy.go` — проверка `path_under` и `url_hosts` до вызова.
 - `internal/mcp/guard.go` — санитизация и проверка результата MCP, опциональная
   проверка намерения перед вызовом.
 - `internal/tools/tools.go` — `Tool.Source/Server/Approval`, `AddMCP`, `Meta`.
 - `internal/agent/agent.go` — `Approver` и отказ до `Execute`.
-- `main.go` — флаги, запуск MCP до первой сессии, `/mcp`, интерактивный апрув.
+- `cmd/mcp-cbr`, `cmd/mcp-forex`, `cmd/mcp-fetch` — свои MCP-серверы на Go SDK.
+- `main.go` — флаги, запуск MCP до первой сессии, `/mcp`, интерактивный апрув,
+  режим планировщика.
 
 ## Конфиг
 
@@ -92,6 +95,12 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
 ```bash
 MCP_FS_ROOT=/tmp/day16-fs/data ./agent ...
 ```
+
+В `mcp.json` проекта кроме `fs` и `web` есть свои серверы: `rates`
+(`./bin/mcp-cbr`, курс ЦБ РФ) и `forex` (`./bin/mcp-forex`, Coinbase spot и
+JSONL-журнал). Для демо дня 18 используется отдельный минимальный
+`testdata/day18-mcp.json` только с `forex`, чтобы не поднимать лишние
+процессы.
 
 ## Апрув
 
@@ -165,6 +174,21 @@ MCP_FS_ROOT=/tmp/day16-fs/data ./agent ...
 MCP-инструмент; по умолчанию выключено. Каждое решение guard пишется событием
 `guard` в `session.jsonl`.
 
+## Фоновый вызов без модели
+
+Планировщику нужен результат инструмента как данные, а не как текст для
+модели. Поэтому `internal/scheduler` вызывает `Manager.CallTrusted`, а не
+`Call`: аргументы проходят `path_under`/`url_hosts` и проверку JSON, но guard
+не применяется и обёртка `<untrusted_tool_output>` не добавляется. Это
+безопасно только для **доверенного** сервера вроде `forex`; для внешнего
+сервера, который отдаёт чужие страницы, нужен обычный `Call` с guard.
+
+Универсальный `run_tool_schedule` тоже использует `CallTrusted`, но только для
+жёстко перечисленных read-only инструментов: `mcp_rates_currency_rate` и
+`mcp_forex_fetch_fx`. `calc` вызывается локально. Имя инструмента приходит от
+модели, но проверяется по map в коде; произвольный сервер или destructive-
+инструмент подставить нельзя.
+
 ## Дамп запроса
 
 ```bash
@@ -189,6 +213,44 @@ GUARD=model ACTION_GUARD=model scripts/day16-demo.sh
 `12000+4000+9000=25000`. Checker проверяет оба вызова, результат, наличие схем
 в дампе и отсутствие `write_file`. С `GUARD=model` в выводе появляются
 `<untrusted_tool_output …>`, а в `session.jsonl` — события `guard`.
+
+День 18 — планировщик из чата и фоновый режим:
+
+```bash
+bash scripts/day18-chat.sh
+```
+
+Модель вызывает локальный инструмент `run_forex_schedule`, тот — MCP
+`forex/fetch_fx` → `save_tick` каждые 5 секунд. Раз в минуту `read_period`
+читает все замеры с начала, код строит отчёт, а локальная модель добавляет
+текстовую сводку. Через 2 минуты печатается финальный отчёт `count=24`.
+`check_day18_chat.py` проверяет аргументы, 24 запуска, две сводки и отчёт по
+всем записям.
+
+Старый фоновый режим без чата — `scripts/day18-demo.sh`: шесть запусков,
+отчёты после 3-го и 6-го, `check_day18.py`.
+
+## Если MCP-сервер завершился
+
+Сервер — отдельный процесс, поэтому он может умереть уже после `tools/list`:
+например, если терминал послал `SIGINT` всему foreground-процессу при
+прерывании хода модели. Раньше в этом случае агент продолжал показывать
+`MCP forex: 3 инструмента`, а каждый вызов падал с
+`client is closing: EOF`.
+
+Теперь:
+
+- дочерние MCP-процессы запускаются в своей process group
+  (`SysProcAttr.Setpgid`), поэтому `Ctrl-C` в агенте не убивает их;
+- если сессия всё же закрылась, `Manager.Call` один раз перезапускает сервер
+  по его `ServerConfig` и повторяет вызов;
+- если перезапуск не удался, к ошибке добавляется `stderr` сервера;
+- планировщик возвращает последнюю ошибку, а не только «ни одного успешного
+  запуска».
+
+`Manager.CallTrusted` использует тот же путь перезапуска: это важно для
+фонового планировщика, который не должен терять сессию после случайного
+`SIGINT`.
 
 ## Ограничения
 
