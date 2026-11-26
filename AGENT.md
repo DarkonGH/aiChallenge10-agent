@@ -61,6 +61,9 @@ export LLM_SUMMARY_BASE_URL=http://localhost:11434/v1
 
 ```
 main.go               CLI: флаги, REPL, команды, printContext, офлайн-ветки
+cmd/mcp-cbr/          MCP-сервер курсов ЦБ РФ (день 17)
+cmd/mcp-forex/        MCP-сервер Coinbase spot и JSONL-журнала (день 18)
+cmd/mcp-fetch/        локальный HTTP-fetch MCP (день 17)
 memory_cmd.go         /memory, -memory-report, -import-memory
 profile_cmd.go        /profile: именованные профили, переключение, правка
 internal/agent/       цикл агента: Chat, стриминг, вызовы инструментов
@@ -73,6 +76,10 @@ internal/history/     event-sourced session.jsonl: события message/compac
 internal/llm/         HTTP-клиент OpenAI-совместимого API, SSE-стрим, reasoning
 internal/mcp/         MCP-клиент: mcp.json, stdio-транспорт, tools/list и
                       tools/call, allow-фильтр, path/url-политика, апрув
+internal/forex/       Coinbase spot, append-only JSONL-журнал и отчёт
+                      (день 18)
+internal/scheduler/   фоновый цикл fetch → save → read_period → отчёт,
+                      а также повторение разрешённого инструмента (день 18)
 internal/tools/       реестр инструментов: now, calc, find_riddle (tasks.txt),
                       task_transition — запрос перехода задачи (день 13)
 internal/task/        конечный автомат задачи: этапы, таблица переходов,
@@ -85,7 +92,9 @@ testdata/             сценарии прогонов (checks-day9.txt, day11-
                       day12-*: профили, вопрос, устойчивость, демо, карточки,
                       day13-*: сценарий и карточки автомата задачи,
                       day15-*: сценарий старения памяти, команды и карточки,
-                      day16-*: сценарий MCP + локальный calc, карточки)
+                      day16-*: сценарий MCP + локальный calc, карточки,
+                      day17-*: MCP ЦБ РФ, демо и карточки,
+                      day18-*: планировщик forex, MCP-конфиг, карточки)
 scripts/              render_cast.py — сборка демо-видео из asciinema-каста,
                       cascade.sh — каскадная проверка памяти,
                       check_memory.py — проверка ответов по журналу,
@@ -102,6 +111,12 @@ scripts/              render_cast.py — сборка демо-видео из a
                       очистка working после done,
                       day16-demo.sh — MCP filesystem + локальный calc,
                       check_mcp.py — вызовы MCP/calc, схемы в дампе запроса,
+                      day17-demo.sh — MCP ЦБ РФ + локальный calc,
+                      check_day17.py — курс, calc, схемы в запросе,
+                      day18-demo.sh — планировщик forex на 6 запусков,
+                      check_day18.py — JSONL, накопление и отчёт по всем,
+                      day18-chat.sh — чат-сценарий: 24 запуска и сводки,
+                      check_day18_chat.py — аргументы, 24 запуска, отчёт,
                       run_to_cast.py — детерминированная сборка каста из
                       session.jsonl (для видео, без вызовов модели),
                       log_to_cast.py — каст из настоящего stdout-лога консоли:
@@ -109,8 +124,8 @@ scripts/              render_cast.py — сборка демо-видео из a
 video/                mp4-демо — в .gitignore, в репозиторий не попадает
 MEMORY.md             отчёт дня 11: модель памяти, токены, ablation
 PROFILE.md            отчёт дня 12: профиль, персонализация, проверки
-MCP.md                отчёт дня 16: MCP, конфиг, апрув, политика
-TASK.md               отчёт дня 16: MCP + локальный calc
+MCP.md                MCP: протокол, конфиг, апрув, политика, guard
+TASK.md               отчёт дня 18: планировщик, MCP forex, накопление
 ANALYSIS.md           отчёт дня 10: сравнение стратегий
 ```
 
@@ -155,7 +170,7 @@ ANALYSIS.md           отчёт дня 10: сравнение стратеги�
 который уходит в системный промпт, поэтому отсутствие старых значений можно
 проверить напрямую, а не спрашивать модель.
 
-## MCP (день 16)
+## MCP (дни 16–18)
 
 MCP — общая настройка агента, а не только демо. `mcp.json` ищется по
 `-mcp-config` → `MCP_CONFIG` → `./mcp.json` → `~/.config/goagent/mcp.json` →
@@ -192,6 +207,75 @@ link-local). `-dump-request <path>` пишет NDJSON тел запросов к
 намерение перед апрувом; по умолчанию `off`, потому что это ещё один вызов на
 каждый MCP-инструмент. Решения guard пишутся событием `guard` в
 `session.jsonl`.
+
+Свой MCP-сервер — обычный бинарник в `cmd/`: `mcp-cbr` (курсы ЦБ РФ),
+`mcp-forex` (Coinbase spot + JSONL), `mcp-fetch` (локальный HTTP). Он
+запускается как дочерний процесс по `mcp.json`, общается по stdio и не
+является частью бинаря `agent`. Планировщик вызывает такие серверы через
+`Manager.CallTrusted`: аргументы проходят ту же политику, но guard не
+применяется, потому что результат нужен коду, а не модели; это допустимо
+только для доверенного сервера.
+
+MCP-серверы запускаются в отдельной process group, чтобы `Ctrl-C` в агенте не
+убивал их вместе с прерванным ходом. Если сессия всё же закрылась, `Manager`
+перезапускает сервер по его конфигу и повторяет вызов; в ошибку попадает
+`stderr` сервера.
+
+## Планировщик и накопление (день 18)
+
+Планировщик работает в двух режимах. В чате модель вызывает локальный
+инструмент `run_forex_schedule`: пользователь формулирует расписание словами,
+код проверяет аргументы и запускает блокирующий цикл. Второй режим — CLI без
+чат-модели, для фоновых прогонов и старого демо. MCP-серверы поднимаются до
+настройки LLM, затем `internal/scheduler` вызывает `forex/fetch_fx`,
+`forex/save_tick` и по времени `forex/read_period`.
+
+Чат-сценарий:
+
+```text
+Запусти проверку USD/RUB каждые 5 секунд, сохраняй результаты,
+каждую минуту выводи сводку, заверши через 2 минуты.
+```
+
+Модель вызывает `run_forex_schedule` с `interval_seconds`, `duration_seconds`,
+`summary_every_seconds` и `pair`. Числа считает `internal/forex`, а текстовую
+сводку — локальная модель через `LLM_SUMMARY_*`. Сводка идёт параллельно
+сборам: медленный ответ qwen не сдвигает следующий замер. Ошибка сводки не
+отменяет числовой отчёт.
+
+Для повторяющихся вызовов без сохранения и сводки есть второй инструмент —
+`run_tool_schedule`. Он принимает `tool`, `args`, `interval_seconds`,
+`duration_seconds` и `report_every_seconds`, но набор инструментов закрыт
+кодом: `calc`, `mcp_rates_currency_rate` (ЦБ РФ) и `mcp_forex_fetch_fx`
+(Coinbase spot). Модель не может подставить произвольный MCP-инструмент.
+Результаты всех запусков возвращаются в JSON, а ход диалога блокируется до
+конца расписания.
+
+```json
+run_tool_schedule({
+  "tool": "calc",
+  "args": {"expr": "2+2"},
+  "interval_seconds": 2,
+  "duration_seconds": 10
+})
+```
+
+CLI-режим:
+
+```bash
+FOREX_STORE=/tmp/day18-demo/forex.jsonl \
+  ./agent -mcp-config testdata/day18-mcp.json -mcp-approval=allow \
+  -schedule-interval 10s -schedule-runs 6 -schedule-report-every 3 \
+  -schedule-pair USD/RUB
+```
+
+`-schedule-runs 0` — работать до Ctrl-C; сигнал отменяет контекст. Ошибка
+отдельного запуска логируется, цикл продолжается. `internal/forex/store.go`
+пишет append-only JSONL (`FOREX_STORE` или `data/day18/forex.jsonl`), поэтому
+накопление переживает перезапуск; `report.BuildReport` считает
+min/max/avg/delta по **всем** замерам периода, а не по последнему. Демо и
+проверка — `scripts/day18-chat.sh` / `scripts/check_day18_chat.py` и
+`scripts/day18-demo.sh` / `scripts/check_day18.py`.
 
 ## Персонализация (день 12)
 
@@ -282,6 +366,8 @@ stdin и `-script` не спрашивают и без флага. Провер�
 <path>`, `-invariant-check llm|keywords`, `-invariant-model <id>`. MCP: `-mcp-config <path>`, `-no-mcp`,
 `-mcp-approval auto|allow|ask|deny`, `-mcp-guard off|heuristic|model`,
 `-mcp-guard-model <id>`, `-mcp-action-guard off|model`, `-dump-request <path>`.
+Планировщик: `-schedule-interval <dur>`, `-schedule-runs N`,
+`-schedule-report-every N`, `-schedule-pair BASE/QUOTE` (0 запусков — до Ctrl-C).
 `-no-memory` — не обновлять слоистую память (история и `/memory` остаются).
 
 ## Соглашения по коммитам и артефактам

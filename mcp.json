@@ -74,6 +74,30 @@
       "descriptions": {
         "currency_rate": "Курс валюты ЦБ РФ на дату. Аргументы: currency (USD, EUR, CNY, ...), date (ДД.ММ.ГГГГ или пусто — сегодня)."
       }
+    },
+    {
+      "name": "forex",
+      "command": "./bin/mcp-forex",
+      "args": [],
+      "required": false,
+      "env": {
+        "FOREX_STORE": "${FOREX_STORE}"
+      },
+      "allow": [
+        "fetch_fx",
+        "save_tick",
+        "read_period"
+      ],
+      "approval": {
+        "fetch_fx": "allow",
+        "save_tick": "ask",
+        "read_period": "allow"
+      },
+      "descriptions": {
+        "fetch_fx": "Текущий spot-курс валютной пары (Coinbase). Аргументы base и quote, по умолчанию USD/RUB.",
+        "save_tick": "Сохранить замер курса в append-only JSONL-журнал; возвращает общее число записей.",
+        "read_period": "Прочитать накопленные замеры за период [from, to], с фильтром по quote."
+      }
     }
   ]
 }

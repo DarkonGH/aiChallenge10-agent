@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -19,11 +22,39 @@ import (
 const callTimeout = 60 * time.Second
 
 // Server — подключённый MCP-сервер.
+//
+// Команда и stderr хранятся рядом с сессией: если сервер завершится уже
+// после успешного tools/list, по ним можно понять причину и перезапустить
+// процесс, а не показывать модели невнятное «client is closing: EOF».
 type Server struct {
 	Name    string
 	Config  ServerConfig
 	Session *sdk.ClientSession
 	Tools   []*sdk.Tool
+
+	cmd    *exec.Cmd
+	stderr *lockedBuffer
+	mu     sync.Mutex
+}
+
+// lockedBuffer — stderr дочернего MCP-процесса. Писать в него может
+// дочерний процесс в любой момент, а читать мы будем при ошибке; обычный
+// bytes.Buffer здесь дал бы гонку.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 // Status — итог подключения одного сервера для строки старта.
@@ -42,6 +73,7 @@ type Manager struct {
 	warnings []string
 	guard    *Guard
 	mu       sync.Mutex
+	closed   atomic.Bool
 }
 
 // SetGuard installs the output/action guard used by Call. It is separate from
@@ -89,12 +121,15 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 
 func startServer(ctx context.Context, sc ServerConfig) (*Server, error) {
 	cmd := exec.Command(sc.Command, sc.Args...)
+	// Не даём Ctrl-C в терминале убить MCP-серверы вместе с прерванным ходом
+	// модели: агент переживает SIGINT, а дочерние серверы должны тоже.
+	isolateProcess(cmd)
 	cmd.Env = os.Environ()
 	for k, v := range sc.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := &lockedBuffer{}
+	cmd.Stderr = stderr
 
 	client := sdk.NewClient(&sdk.Implementation{
 		Name:    "goagent",
@@ -118,7 +153,7 @@ func startServer(ctx context.Context, sc ServerConfig) (*Server, error) {
 	for _, name := range sc.Allow {
 		allowed[name] = true
 	}
-	srv := &Server{Name: sc.Name, Config: sc, Session: session}
+	srv := &Server{Name: sc.Name, Config: sc, Session: session, cmd: cmd, stderr: stderr}
 	for _, tool := range toolsList {
 		if len(allowed) > 0 && !allowed[tool.Name] {
 			continue
@@ -168,8 +203,21 @@ func (m *Manager) Register(reg *tools.ToolRegistry) {
 	}
 }
 
-// Call вызывает инструмент MCP после проверки аргументов.
+// Call вызывает инструмент MCP после проверки аргументов и прогоняет
+// результат через guard: это путь для модели и обычных инструментов агента.
 func (m *Manager) Call(ctx context.Context, server, tool string, raw json.RawMessage) (string, error) {
+	return m.call(ctx, server, tool, raw, true)
+}
+
+// CallTrusted — путь для внутреннего кода, который сам знает, что делает:
+// планировщик вызывает им MCP-инструменты по расписанию. Проверка аргументов
+// остаётся, guard результата не применяется, иначе обёртка сломала бы JSON,
+// который планировщик разбирает.
+func (m *Manager) CallTrusted(ctx context.Context, server, tool string, raw json.RawMessage) (string, error) {
+	return m.call(ctx, server, tool, raw, false)
+}
+
+func (m *Manager) call(ctx context.Context, server, tool string, raw json.RawMessage, useGuard bool) (string, error) {
 	srv := m.server(server)
 	if srv == nil {
 		return "", fmt.Errorf("MCP-сервер %q не подключён", server)
@@ -185,9 +233,39 @@ func (m *Manager) Call(ctx context.Context, server, tool string, raw json.RawMes
 		}
 	}
 
+	text, err := m.callSession(ctx, srv, tool, args, useGuard)
+	if err == nil {
+		return text, nil
+	}
+	// MCP-сервер — отдельный процесс: он мог умереть уже после tools/list.
+	// В этом случае SDK отдаёт «client is closing: EOF», и раньше планировщик
+	// повторял этот же мёртвый вызов 24 раза. Перезапускаем один раз и
+	// повторяем вызов; stderr сервера добавляем к ошибке, если и это не помогло.
+	if !isTransportError(err) {
+		return "", err
+	}
+	if rerr := m.restartServer(ctx, srv); rerr != nil {
+		return "", fmt.Errorf("%w; MCP-сервер %s не перезапустился: %v%s", err, server, rerr, m.stderrTail(srv))
+	}
+	text, err = m.callSession(ctx, srv, tool, args, useGuard)
+	if err != nil {
+		return "", fmt.Errorf("%w%s", err, m.stderrTail(srv))
+	}
+	return text, nil
+}
+
+// callSession выполняет один вызов на текущей сессии сервера.
+func (m *Manager) callSession(ctx context.Context, srv *Server, tool string, args any, useGuard bool) (string, error) {
+	srv.mu.Lock()
+	session := srv.Session
+	srv.mu.Unlock()
+	if session == nil {
+		return "", fmt.Errorf("MCP-сервер %s закрыт", srv.Name)
+	}
+
 	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	res, err := srv.Session.CallTool(callCtx, &sdk.CallToolParams{Name: tool, Arguments: args})
+	res, err := session.CallTool(callCtx, &sdk.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		return "", fmt.Errorf("вызов %s: %w", tool, err)
 	}
@@ -202,26 +280,97 @@ func (m *Manager) Call(ctx context.Context, server, tool string, raw json.RawMes
 		if text == "" {
 			text = "инструмент вернул ошибку без описания"
 		}
-		if g := m.currentGuard(); g != nil {
-			guarded, err := g.Check(ctx, server, tool, text)
-			if err != nil {
-				return "", err
+		if useGuard {
+			if g := m.currentGuard(); g != nil {
+				guarded, err := g.Check(ctx, srv.Name, tool, text)
+				if err != nil {
+					return "", err
+				}
+				text = guarded
 			}
-			text = guarded
 		}
 		return "", fmt.Errorf("%s", text)
 	}
 	if text == "" {
 		text = "инструмент выполнен, но не вернул содержимого"
 	}
-	if g := m.currentGuard(); g != nil {
-		guarded, err := g.Check(ctx, server, tool, text)
-		if err != nil {
-			return "", err
+	if useGuard {
+		if g := m.currentGuard(); g != nil {
+			guarded, err := g.Check(ctx, srv.Name, tool, text)
+			if err != nil {
+				return "", err
+			}
+			text = guarded
 		}
-		text = guarded
 	}
 	return text, nil
+}
+
+// Has сообщает, подключён ли сервер с таким именем. Регистрация инструмента
+// и живая сессия — разные вещи, поэтому вызывающий код может проверить это
+// до запуска длинной операции.
+func (m *Manager) Has(name string) bool {
+	return m.server(name) != nil
+}
+
+// restartServer закрывает старую сессию и поднимает процесс заново по тому
+// же конфигу. Инструменты в реестре не перерегистрируются: они вызывают
+// Manager.Call по имени и автоматически увидят новую сессию.
+func (m *Manager) restartServer(ctx context.Context, srv *Server) error {
+	if m.closed.Load() {
+		return fmt.Errorf("MCP уже закрыт")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.Session != nil {
+		_ = srv.Session.Close()
+		srv.Session = nil
+	}
+	fresh, err := startServer(ctx, srv.Config)
+	if err != nil {
+		return err
+	}
+	srv.Session = fresh.Session
+	srv.Tools = fresh.Tools
+	srv.cmd = fresh.cmd
+	srv.stderr = fresh.stderr
+	return nil
+}
+
+func (m *Manager) stderrTail(srv *Server) string {
+	if srv == nil {
+		return ""
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.stderr == nil {
+		return ""
+	}
+	return stderrTail(srv.stderr.String())
+}
+
+// isTransportError отличает смерть процесса/сессии от обычной ошибки
+// инструмента. Только в этом случае имеет смысл перезапускать сервер.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"connection closed",
+		"client is closing",
+		"broken pipe",
+		"eof",
+		"transport",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) server(name string) *Server {
@@ -267,13 +416,16 @@ func (m *Manager) Warnings() []string {
 
 // Close закрывает все сессии.
 func (m *Manager) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.closed.Swap(true) {
+		return
+	}
 	for _, srv := range m.servers {
+		srv.mu.Lock()
 		if srv.Session != nil {
 			_ = srv.Session.Close()
 			srv.Session = nil
 		}
+		srv.mu.Unlock()
 	}
 }
 

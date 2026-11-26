@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "approval": "allow",
+  "servers": [
+    {
+      "name": "forex",
+      "command": "./bin/mcp-forex",
+      "args": [],
+      "required": true,
+      "env": {
+        "FOREX_STORE": "${FOREX_STORE}"
+      },
+      "allow": [
+        "fetch_fx",
+        "save_tick",
+        "read_period"
+      ],
+      "approval": {
+        "fetch_fx": "allow",
+        "save_tick": "allow",
+        "read_period": "allow"
+      }
+    }
+  ]
+}

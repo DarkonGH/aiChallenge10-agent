@@ -10,20 +10,24 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/agent"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/compact"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/config"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/forex"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/history"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/invariant"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/llm"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/mcp"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/memory"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/readline"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/scheduler"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -46,6 +50,7 @@ type app struct {
 	profile      string        // active named profile; "" is the shared default
 	skipProfile  bool          // no onboarding dialogue at startup (scripts, runs)
 	scriptDelay  time.Duration // pause between dialogue turns in -script (rate limits)
+	scriptMode   bool          // -script: suppress the non-TTY wait ticker
 
 	summary *llm.ChatClient // client for compaction; nil means the chat client
 
@@ -385,6 +390,10 @@ func main() {
 	mcpGuard := flag.String("mcp-guard", "heuristic", "проверка результата MCP: off, heuristic (эвристики) или model (модель сжатия)")
 	mcpGuardModel := flag.String("mcp-guard-model", "", "модель проверки MCP (по умолчанию модель сжатия)")
 	mcpActionGuard := flag.String("mcp-action-guard", "off", "проверка намерения MCP моделью: off или model")
+	scheduleInterval := flag.Duration("schedule-interval", 0, "интервал планировщика (0 — обычный интерактивный режим)")
+	scheduleRuns := flag.Int("schedule-runs", 0, "сколько запусков планировщика сделать (0 — бесконечно)")
+	scheduleReportEvery := flag.Int("schedule-report-every", 3, "собирать отчёт после каждых N успешных запусков")
+	schedulePair := flag.String("schedule-pair", "USD/RUB", "валютная пара для планировщика")
 	dumpRequest := flag.String("dump-request", "", "писать тела запросов к чат-модели в NDJSON-файл")
 	flag.Parse()
 
@@ -497,12 +506,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
 	}
 
-	client := llm.NewChatClient()
-	if !client.Configured() {
-		fatalf("нужны переменные окружения LLM_BASE_URL и OPENAI_API_KEY")
-	}
-	client.SetMaxTokens(*maxTokens)
-
 	// MCP is discovered and connected after the offline branches: listing
 	// sessions or printing a log must not spawn external processes. A missing
 	// config simply means "local tools only"; an explicit broken config is an
@@ -531,6 +534,45 @@ func main() {
 			}
 		}
 	}
+
+	// The scheduler is a separate background mode: it needs MCP, not the chat
+	// model. Therefore it branches before LLM configuration and runs on the
+	// same binary, without a dialogue and without API keys.
+	if *scheduleInterval > 0 {
+		if mcpManager == nil {
+			fatalf("-schedule-interval: MCP не подключён; нужен mcp.json с сервером forex")
+		}
+		base, quote, err := parsePair(*schedulePair)
+		if err != nil {
+			fatalf("-schedule-pair: %v", err)
+		}
+		if *scheduleRuns < 0 {
+			fatalf("-schedule-runs не может быть отрицательным")
+		}
+		if *scheduleReportEvery <= 0 {
+			fatalf("-schedule-report-every должен быть больше нуля")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		err = scheduler.Run(ctx, mcpManager, scheduler.Config{
+			Server:      "forex",
+			Base:        base,
+			Quote:       quote,
+			Interval:    *scheduleInterval,
+			Runs:        *scheduleRuns,
+			ReportEvery: *scheduleReportEvery,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			fatalf("планировщик: %v", err)
+		}
+		return
+	}
+
+	client := llm.NewChatClient()
+	if !client.Configured() {
+		fatalf("нужны переменные окружения LLM_BASE_URL и OPENAI_API_KEY")
+	}
+	client.SetMaxTokens(*maxTokens)
 
 	if *dumpRequest != "" {
 		f, err := os.Create(*dumpRequest)
@@ -573,6 +615,7 @@ func main() {
 		profile:      *profileFlag,
 		skipProfile:  *skipProfile,
 		scriptDelay:  *scriptDelay,
+		scriptMode:   *scriptFlag != "",
 		summary:      summaryClient,
 		inv:          inv,
 		invPath:      invariantsPath,
@@ -584,7 +627,92 @@ func main() {
 	}
 	if mcpManager != nil {
 		mcpManager.Register(a.tools)
+		// Day 18: the chat model does not have a shell, so a schedule is a
+		// local tool. It blocks the current turn, prints each run live and
+		// returns the final report over all ticks. MCP calls inside use
+		// CallTrusted: the user asked for this job explicitly, and the tool
+		// itself is the trusted orchestrator.
+		a.tools.Add(&tools.Tool{
+			Name: "run_forex_schedule",
+			Description: "Запускает проверку курса по расписанию: каждые interval_seconds " +
+				"получает курс через MCP forex и сохраняет его, каждые summary_every_seconds " +
+				"строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку. " +
+				"Работает duration_seconds и блокирует диалог до завершения. " +
+				"Используй этот инструмент, когда пользователь просит запустить проверку " +
+				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pair": map[string]any{
+						"type":        "string",
+						"description": "Валютная пара, по умолчанию USD/RUB",
+					},
+					"interval_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Интервал между проверками в секундах, по умолчанию 5",
+						"minimum":     1,
+					},
+					"duration_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Сколько секунд работать, по умолчанию 120",
+						"minimum":     10,
+						"maximum":     600,
+					},
+					"summary_every_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Как часто выводить сводку в секундах, по умолчанию 60",
+						"minimum":     10,
+					},
+				},
+				"additionalProperties": false,
+			},
+			Run: a.runForexSchedule,
+		})
 	}
+	// Универсальный планировщик намеренно ограничен безопасными инструментами:
+	// арифметикой и двумя read-only источниками курсов. Он не даёт модели
+	// запускать в фоне произвольный MCP-инструмент.
+	a.tools.Add(&tools.Tool{
+		Name: "run_tool_schedule",
+		Description: "Повторяет один разрешённый инструмент по расписанию и возвращает " +
+			"все успешные результаты. Разрешены: calc, mcp_rates_currency_rate " +
+			"(курс ЦБ РФ) и mcp_forex_fetch_fx (рыночный курс USD/RUB). " +
+			"Для сохранения каждого замера forex и текстовой сводки используй " +
+			"run_forex_schedule. Блокирует диалог до завершения.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tool": map[string]any{
+					"type":        "string",
+					"description": "Какой инструмент вызывать по расписанию",
+					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx"},
+				},
+				"args": map[string]any{
+					"type":        "object",
+					"description": "Аргументы инструмента: для calc — {\"expr\":\"...\"}, для rates — {\"currency\":\"USD\",\"date\":\"20.11.2026\"}, для forex — {\"base\":\"USD\",\"quote\":\"RUB\"}",
+				},
+				"interval_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Интервал между вызовами в секундах, по умолчанию 5",
+					"minimum":     1,
+				},
+				"duration_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Сколько секунд работать, по умолчанию 120",
+					"minimum":     10,
+					"maximum":     600,
+				},
+				"report_every_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Как часто печатать промежуточный отчёт в секундах, по умолчанию 60",
+					"minimum":     10,
+				},
+			},
+			"required":             []string{"tool"},
+			"additionalProperties": false,
+		},
+		Run: a.runToolSchedule,
+	})
 	// The task machine is per-session, so the registry holds a provider, not
 	// a pointer: the task_transition tool always acts on the current session.
 	a.tools.SetTaskProvider(func() *task.Machine { return a.task })
@@ -860,23 +988,26 @@ func (a *app) ask(text string) {
 	}
 
 	// Non-TTY (script mode): no spinner, deltas still stream to stdout; the
-	// ticker only speaks while nothing has arrived yet.
-	go func() {
-		t := time.NewTicker(10 * time.Second)
-		defer t.Stop()
-		start := time.Now()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if a.ui.didStream() {
-					continue
+	// ticker only speaks while nothing has arrived yet. In -script the log is
+	// a transcript, not a live console, so the ticker would add noise.
+	if !a.scriptMode {
+		go func() {
+			t := time.NewTicker(10 * time.Second)
+			defer t.Stop()
+			start := time.Now()
+			for {
+				select {
+				case <-done:
+					return
+				case <-t.C:
+					if a.ui.didStream() {
+						continue
+					}
+					fmt.Printf("  … ждём ответа (%d с)\n", int(time.Since(start).Seconds()))
 				}
-				fmt.Printf("  … ждём ответа (%d с)\n", int(time.Since(start).Seconds()))
 			}
-		}
-	}()
+		}()
+	}
 
 	answer, err := a.agent.Chat(ctx, text)
 	close(done)
@@ -1603,6 +1734,293 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// scheduledTool maps a model-facing name to the local registry or MCP server.
+// Empty server means a local tool.
+type scheduledTool struct {
+	Server string
+	Remote string
+}
+
+var scheduledTools = map[string]scheduledTool{
+	"calc":                    {},
+	"mcp_rates_currency_rate": {Server: "rates", Remote: "currency_rate"},
+	"mcp_forex_fetch_fx":      {Server: "forex", Remote: "fetch_fx"},
+}
+
+// runToolSchedule is the generic, deliberately narrow scheduler: the model may
+// repeat only arithmetic and read-only rate tools. It never accepts an
+// arbitrary tool name, and MCP calls use CallTrusted because the tool list is
+// fixed by code, not by the model.
+func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
+	args := struct {
+		Tool        string          `json:"tool"`
+		Args        json.RawMessage `json:"args"`
+		IntervalSec int             `json:"interval_seconds"`
+		DurationSec int             `json:"duration_seconds"`
+		ReportEvery int             `json:"report_every_seconds"`
+	}{
+		IntervalSec: 5,
+		DurationSec: 120,
+		ReportEvery: 60,
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("run_tool_schedule: %w", err)
+		}
+	}
+	args.Tool = strings.TrimSpace(args.Tool)
+	if args.Tool == "" {
+		return "", fmt.Errorf("run_tool_schedule: tool обязателен")
+	}
+	meta, ok := scheduledTools[args.Tool]
+	if !ok {
+		return "", fmt.Errorf("run_tool_schedule: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx", args.Tool)
+	}
+	if args.IntervalSec < 1 {
+		return "", fmt.Errorf("run_tool_schedule: interval_seconds должен быть не меньше 1")
+	}
+	if args.DurationSec < 10 || args.DurationSec > 600 {
+		return "", fmt.Errorf("run_tool_schedule: duration_seconds должен быть от 10 до 600")
+	}
+	if args.ReportEvery <= 0 {
+		args.ReportEvery = 60
+	}
+	if args.ReportEvery < 10 {
+		return "", fmt.Errorf("run_tool_schedule: report_every_seconds должен быть не меньше 10")
+	}
+	if args.ReportEvery > args.DurationSec {
+		args.ReportEvery = args.DurationSec
+	}
+	callArgs := args.Args
+	if len(callArgs) == 0 || string(callArgs) == "null" {
+		callArgs = json.RawMessage("{}")
+	}
+	var argObject map[string]any
+	if err := json.Unmarshal(callArgs, &argObject); err != nil {
+		return "", fmt.Errorf("run_tool_schedule: args должен быть JSON-объектом: %w", err)
+	}
+	if meta.Server == "" && args.Tool != "calc" {
+		return "", fmt.Errorf("run_tool_schedule: локальный инструмент %q не поддержан", args.Tool)
+	}
+	if meta.Server != "" {
+		if a.mcpClient == nil {
+			return "", fmt.Errorf("run_tool_schedule: MCP не подключён")
+		}
+		if !a.mcpClient.Has(meta.Server) {
+			return "", fmt.Errorf("run_tool_schedule: MCP-сервер %s не подключён; проверьте mcp.json", meta.Server)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(args.DurationSec)*time.Second+30*time.Second)
+	defer cancel()
+
+	results, err := scheduler.RunTool(ctx, a, scheduler.ToolConfig{
+		Tool:        args.Tool,
+		Args:        callArgs,
+		Interval:    time.Duration(args.IntervalSec) * time.Second,
+		Duration:    time.Duration(args.DurationSec) * time.Second,
+		ReportEvery: time.Duration(args.ReportEvery) * time.Second,
+		Log:         a.ui.trace,
+	})
+	if err != nil {
+		return "", fmt.Errorf("run_tool_schedule: %w", err)
+	}
+
+	out, err := json.Marshal(struct {
+		Tool            string                 `json:"tool"`
+		Runs            int                    `json:"runs"`
+		DurationSeconds int                    `json:"duration_seconds"`
+		Results         []scheduler.ToolResult `json:"results"`
+	}{
+		Tool:            args.Tool,
+		Runs:            len(results),
+		DurationSeconds: args.DurationSec,
+		Results:         results,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// CallTool implements scheduler.ToolCaller. The allowed set is checked again
+// here, so even an internal caller cannot expand it by passing another name.
+func (a *app) CallTool(ctx context.Context, name string, raw json.RawMessage) (string, error) {
+	meta, ok := scheduledTools[name]
+	if !ok {
+		return "", fmt.Errorf("инструмент %q не разрешён для планировщика", name)
+	}
+	if meta.Server == "" {
+		call := llm.ToolCall{ID: "schedule", Type: "function"}
+		call.Function.Name = name
+		call.Function.Arguments = string(raw)
+		out := a.tools.Execute(call)
+		if strings.HasPrefix(out, "ошибка инструмента ") {
+			return "", fmt.Errorf("%s", out)
+		}
+		return out, nil
+	}
+	if a.mcpClient == nil {
+		return "", fmt.Errorf("MCP не подключён")
+	}
+	return a.mcpClient.CallTrusted(ctx, meta.Server, meta.Remote, raw)
+}
+
+// runForexSchedule is the chat-facing wrapper around scheduler.Run. The model
+// chooses the schedule from the user's words; the code validates it, runs the
+// blocking loop and returns the final report. Numbers are computed by forex
+// and scheduler, never by the model.
+func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
+	args := struct {
+		Pair               string `json:"pair"`
+		IntervalSeconds    int    `json:"interval_seconds"`
+		DurationSeconds    int    `json:"duration_seconds"`
+		SummaryEverySecond int    `json:"summary_every_seconds"`
+	}{
+		Pair:               "USD/RUB",
+		IntervalSeconds:    5,
+		DurationSeconds:    120,
+		SummaryEverySecond: 60,
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("run_forex_schedule: %w", err)
+		}
+	}
+	base, quote, err := parsePair(args.Pair)
+	if err != nil {
+		return "", fmt.Errorf("run_forex_schedule: %w", err)
+	}
+	if args.IntervalSeconds < 1 {
+		return "", fmt.Errorf("run_forex_schedule: interval_seconds должен быть не меньше 1")
+	}
+	if args.DurationSeconds < 10 || args.DurationSeconds > 600 {
+		return "", fmt.Errorf("run_forex_schedule: duration_seconds должен быть от 10 до 600")
+	}
+	if args.SummaryEverySecond < 10 || args.SummaryEverySecond > args.DurationSeconds {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть от 10 до duration_seconds")
+	}
+	if a.mcpClient == nil {
+		return "", fmt.Errorf("run_forex_schedule: MCP не подключён")
+	}
+	if !a.mcpClient.Has("forex") {
+		return "", fmt.Errorf("run_forex_schedule: MCP-сервер forex не подключён; проверьте mcp.json и bin/mcp-forex")
+	}
+
+	var last forex.Report
+	runs := 0
+	var summaries []string
+	var summaryMu sync.Mutex
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(args.DurationSeconds)*time.Second+30*time.Second)
+	defer cancel()
+
+	cfg := scheduler.Config{
+		Server:       "forex",
+		Base:         base,
+		Quote:        quote,
+		Interval:     time.Duration(args.IntervalSeconds) * time.Second,
+		Duration:     time.Duration(args.DurationSeconds) * time.Second,
+		SummaryEvery: time.Duration(args.SummaryEverySecond) * time.Second,
+		// Runs не ограничивает цикл в режиме Duration, но даёт прогрессу
+		// ожидаемый знаменатель: [запуск 1/24], а не [запуск 1].
+		Runs: args.DurationSeconds / args.IntervalSeconds,
+		Log:  a.ui.trace,
+		Summarize: func(ctx context.Context, rep forex.Report) (string, error) {
+			text, err := a.summarizeForexReport(ctx, rep)
+			if err == nil {
+				summaryMu.Lock()
+				summaries = append(summaries, text)
+				summaryMu.Unlock()
+			}
+			return text, err
+		},
+		OnReport: func(success int, rep forex.Report) {
+			runs = success
+			last = rep
+		},
+	}
+	if err := scheduler.Run(ctx, a.mcpClient, cfg); err != nil {
+		return "", fmt.Errorf("run_forex_schedule: %w", err)
+	}
+	if runs == 0 {
+		return "", fmt.Errorf("run_forex_schedule: не собрано ни одного замера")
+	}
+
+	out, err := json.Marshal(struct {
+		Runs            int          `json:"runs"`
+		DurationSeconds int          `json:"duration_seconds"`
+		Report          forex.Report `json:"report"`
+		Summaries       []string     `json:"summaries"`
+	}{
+		Runs:            runs,
+		DurationSeconds: args.DurationSeconds,
+		Report:          last,
+		Summaries:       summaries,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// summarizeForexReport asks the local summary model to describe a report that
+// has already been calculated. The prompt forbids inventing or recalculating
+// numbers: the model is a writer here, not an accountant.
+func (a *app) summarizeForexReport(ctx context.Context, rep forex.Report) (string, error) {
+	if a.summary == nil || !a.summary.Configured() {
+		return "", fmt.Errorf("модель сводки не настроена")
+	}
+	model := config.DefaultSummaryModel()
+	if a.hist != nil && a.hist.SummaryModel() != "" {
+		model = a.hist.SummaryModel()
+	}
+	payload, err := json.Marshal(map[string]any{
+		"pair":  rep.Base + "/" + rep.Quote,
+		"count": rep.Count,
+		"min":   rep.Min,
+		"max":   rep.Max,
+		"avg":   rep.Avg,
+		"delta": rep.Delta,
+		"first": map[string]any{"rate": rep.First.Rate, "at": rep.First.FetchedAt},
+		"last":  map[string]any{"rate": rep.Last.Rate, "at": rep.Last.FetchedAt},
+	})
+	if err != nil {
+		return "", err
+	}
+	system := "Ты — аналитик валютного курса. По готовым агрегатам напиши short summary " +
+		"на русском: 2–3 предложения. Используй только числа из JSON, не пересчитывай их " +
+		"и не выдумывай новых. Скажи направление движения, диапазон и заметность тренда. " +
+		"Не давай инвестиционных рекомендаций и не добавляй заголовков."
+	user := "Агрегаты по всем замерам с начала проверки:\n" + string(payload)
+	resp, err := a.summary.Chat(ctx, model, []llm.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}, nil, 0.2)
+	if err != nil {
+		return "", fmt.Errorf("сводка: %w", err)
+	}
+	text := strings.TrimSpace(resp.Content)
+	if text == "" {
+		return "", fmt.Errorf("сводка: пустой ответ модели")
+	}
+	return strings.Join(strings.Fields(text), " "), nil
+}
+
+func parsePair(value string) (string, string, error) {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("ожидается пара вида USD/RUB, получено %q", value)
+	}
+	base := strings.ToUpper(strings.TrimSpace(parts[0]))
+	quote := strings.ToUpper(strings.TrimSpace(parts[1]))
+	if len(base) < 2 || len(quote) < 2 {
+		return "", "", fmt.Errorf("ожидается пара вида USD/RUB, получено %q", value)
+	}
+	return base, quote, nil
 }
 
 func fatalf(format string, args ...any) {
