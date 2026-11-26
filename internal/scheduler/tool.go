@@ -20,6 +20,7 @@ type ToolConfig struct {
 	Tool        string
 	Args        json.RawMessage
 	Interval    time.Duration
+	Delay       time.Duration
 	Duration    time.Duration
 	ReportEvery time.Duration
 	Log         func(string)
@@ -31,6 +32,49 @@ type ToolResult struct {
 	Run    int       `json:"run"`
 	At     time.Time `json:"at"`
 	Output string    `json:"output"`
+}
+
+// RunOnce выполняет инструмент один раз, при необходимости после задержки.
+// Это отдельный путь для просьб «через 30 секунд» и «собери отчёт один раз»:
+// у него нет interval/duration/report, поэтому модели не нужно заполнять
+// расписание, которого пользователь не просил.
+func RunOnce(ctx context.Context, caller ToolCaller, cfg ToolConfig) (ToolResult, error) {
+	if caller == nil {
+		return ToolResult{}, fmt.Errorf("планировщик: нет вызывающей стороны")
+	}
+	if strings.TrimSpace(cfg.Tool) == "" {
+		return ToolResult{}, fmt.Errorf("планировщик: не задан инструмент")
+	}
+	if cfg.Delay < 0 {
+		return ToolResult{}, fmt.Errorf("планировщик: задержка не может быть отрицательной")
+	}
+	if len(cfg.Args) == 0 || string(cfg.Args) == "null" {
+		cfg.Args = json.RawMessage("{}")
+	}
+
+	logf := cfg.Log
+	if logf == nil {
+		logf = func(s string) { fmt.Println(s) }
+	}
+
+	logf(fmt.Sprintf("[разовый запуск] инструмент %s", cfg.Tool))
+	if cfg.Delay > 0 {
+		logf(fmt.Sprintf("[разовый запуск] старт через %s", cfg.Delay))
+	}
+	if err := wait(ctx, cfg.Delay); err != nil {
+		return ToolResult{}, err
+	}
+
+	out, err := caller.CallTool(ctx, cfg.Tool, cfg.Args)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ToolResult{}, ctx.Err()
+		}
+		return ToolResult{}, fmt.Errorf("планировщик: %w", err)
+	}
+	res := ToolResult{Run: 1, At: time.Now().UTC(), Output: out}
+	logf(fmt.Sprintf("[разовый запуск] %s → %s", cfg.Tool, shortLine(out, 220)))
+	return res, nil
 }
 
 // RunTool выполняет инструмент по расписанию и возвращает все успешные
@@ -46,6 +90,9 @@ func RunTool(ctx context.Context, caller ToolCaller, cfg ToolConfig) ([]ToolResu
 	}
 	if cfg.Interval <= 0 {
 		return nil, fmt.Errorf("планировщик: интервал должен быть больше нуля")
+	}
+	if cfg.Delay < 0 {
+		return nil, fmt.Errorf("планировщик: задержка не может быть отрицательной")
 	}
 	if cfg.Duration <= 0 {
 		return nil, fmt.Errorf("планировщик: длительность должна быть больше нуля")
@@ -64,6 +111,12 @@ func RunTool(ctx context.Context, caller ToolCaller, cfg ToolConfig) ([]ToolResu
 
 	logf(fmt.Sprintf("[планировщик] инструмент %s, интервал %s, длительность %s, отчёт каждые %s",
 		cfg.Tool, cfg.Interval, cfg.Duration, cfg.ReportEvery))
+	if cfg.Delay > 0 {
+		logf(fmt.Sprintf("[планировщик] старт через %s", cfg.Delay))
+	}
+	if err := wait(ctx, cfg.Delay); err != nil {
+		return nil, err
+	}
 
 	started := time.Now().UTC()
 	lastReport := started

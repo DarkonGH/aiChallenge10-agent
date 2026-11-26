@@ -639,6 +639,7 @@ func main() {
 				"получает курс через MCP forex и сохраняет его, каждые summary_every_seconds " +
 				"строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку. " +
 				"Работает duration_seconds и блокирует диалог до завершения. " +
+				"delay_seconds откладывает первый запуск, если просят подождать. " +
 				"Используй этот инструмент, когда пользователь просит запустить проверку " +
 				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария.",
 			Parameters: map[string]any{
@@ -652,6 +653,11 @@ func main() {
 						"type":        "integer",
 						"description": "Интервал между проверками в секундах, по умолчанию 5",
 						"minimum":     1,
+					},
+					"delay_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Подождать перед первым запуском, секунд; 0 — сразу",
+						"minimum":     0,
 					},
 					"duration_seconds": map[string]any{
 						"type":        "integer",
@@ -675,35 +681,43 @@ func main() {
 	a.tools.Add(&tools.Tool{
 		Name: "run_tool_schedule",
 		Description: "Повторяет один разрешённый инструмент по расписанию и возвращает " +
-			"все успешные результаты. Разрешены: calc, mcp_rates_currency_rate " +
-			"(курс ЦБ РФ) и mcp_forex_fetch_fx (рыночный курс USD/RUB). " +
-			"Для сохранения каждого замера forex и текстовой сводки используй " +
-			"run_forex_schedule. Блокирует диалог до завершения.",
+			"все успешные результаты. Используй только для повторяющихся действий; " +
+			"для одного вызова через N секунд или разовой сборки отчёта используй " +
+			"run_tool_once. Разрешены: calc, mcp_rates_currency_rate " +
+			"(курс ЦБ РФ), mcp_forex_fetch_fx (рыночный курс), mcp_forex_read_period " +
+			"(summary:true даёт агрегат по журналу) и mcp_forex_list_periods (серии журнала). " +
+			"delay_seconds откладывает первый запуск. Для сохранения каждого замера forex " +
+			"и текстовой сводки используй run_forex_schedule. Блокирует диалог до завершения.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"tool": map[string]any{
 					"type":        "string",
 					"description": "Какой инструмент вызывать по расписанию",
-					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx"},
+					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx", "mcp_forex_read_period", "mcp_forex_list_periods"},
 				},
 				"args": map[string]any{
 					"type":        "object",
-					"description": "Аргументы инструмента: для calc — {\"expr\":\"...\"}, для rates — {\"currency\":\"USD\",\"date\":\"20.11.2026\"}, для forex — {\"base\":\"USD\",\"quote\":\"RUB\"}",
+					"description": "Аргументы инструмента: для calc — {\"expr\":\"...\"}, для rates — {\"currency\":\"USD\",\"date\":\"20.11.2026\"}, для forex — {\"base\":\"USD\",\"quote\":\"RUB\"}, для read_period — {\"from\":\"...\",\"to\":\"...\",\"quote\":\"RUB\",\"summary\":true}",
 				},
 				"interval_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Интервал между вызовами в секундах, по умолчанию 5",
+					"description": "Интервал между повторными вызовами, секунд; только для повторяющегося сценария",
 					"minimum":     1,
+				},
+				"delay_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Подождать перед первым запуском, секунд; 0 — сразу",
+					"minimum":     0,
 				},
 				"duration_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Сколько секунд работать, по умолчанию 120; верхнего предела нет, остановить можно Ctrl-C",
+					"description": "Сколько секунд повторять вызовы; только для повторяющегося сценария, верхнего предела нет",
 					"minimum":     10,
 				},
 				"report_every_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Как часто печатать промежуточный отчёт в секундах, по умолчанию 60",
+					"description": "Как часто печатать промежуточный отчёт, секунд; только для повторяющегося сценария",
 					"minimum":     10,
 				},
 			},
@@ -711,6 +725,39 @@ func main() {
 			"additionalProperties": false,
 		},
 		Run: a.runToolSchedule,
+	})
+	// One-shot path for «сделай это через 30 секунд» and «собери отчёт один
+	// раз». Without it the model used run_tool_schedule with a fake calc timer
+	// or filled interval/duration/report that the user never asked for.
+	a.tools.Add(&tools.Tool{
+		Name: "run_tool_once",
+		Description: "Выполняет один разрешённый инструмент один раз, при необходимости " +
+			"после delay_seconds. Используй для просьб «через N секунд», «один раз», " +
+			"«собери отчёт сейчас/через N секунд». Для повторяющихся вызовов используй " +
+			"run_tool_schedule. Разрешены: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, " +
+			"mcp_forex_read_period (summary:true) и mcp_forex_list_periods.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tool": map[string]any{
+					"type":        "string",
+					"description": "Какой инструмент вызвать один раз",
+					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx", "mcp_forex_read_period", "mcp_forex_list_periods"},
+				},
+				"args": map[string]any{
+					"type":        "object",
+					"description": "Аргументы инструмента: для read_period — {\"from\":\"...\",\"to\":\"...\",\"quote\":\"RUB\",\"summary\":true}",
+				},
+				"delay_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Подождать перед единственным вызовом, секунд; 0 — сразу",
+					"minimum":     0,
+				},
+			},
+			"required":             []string{"tool"},
+			"additionalProperties": false,
+		},
+		Run: a.runToolOnce,
 	})
 	// The task machine is per-session, so the registry holds a provider, not
 	// a pointer: the task_transition tool always acts on the current session.
@@ -1760,6 +1807,86 @@ var scheduledTools = map[string]scheduledTool{
 	"calc":                    {},
 	"mcp_rates_currency_rate": {Server: "rates", Remote: "currency_rate"},
 	"mcp_forex_fetch_fx":      {Server: "forex", Remote: "fetch_fx"},
+	"mcp_forex_read_period":   {Server: "forex", Remote: "read_period"},
+	"mcp_forex_list_periods":  {Server: "forex", Remote: "list_periods"},
+}
+
+// runToolOnce is the one-shot wrapper: «через 30 секунд», «собери отчёт один
+// раз». It intentionally has no interval/duration/report — those belong to
+// run_tool_schedule, not to a single delayed call.
+func (a *app) runToolOnce(raw json.RawMessage) (string, error) {
+	args := struct {
+		Tool         string          `json:"tool"`
+		Args         json.RawMessage `json:"args"`
+		DelaySeconds int             `json:"delay_seconds"`
+	}{}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("run_tool_once: %w", err)
+		}
+	}
+	args.Tool = strings.TrimSpace(args.Tool)
+	if args.Tool == "" {
+		return "", fmt.Errorf("run_tool_once: tool обязателен")
+	}
+	meta, ok := scheduledTools[args.Tool]
+	if !ok {
+		return "", fmt.Errorf("run_tool_once: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, mcp_forex_read_period, mcp_forex_list_periods", args.Tool)
+	}
+	delay, err := optionalSecondsDuration(args.DelaySeconds)
+	if err != nil {
+		return "", fmt.Errorf("run_tool_once: delay_seconds: %w", err)
+	}
+	callArgs := args.Args
+	if len(callArgs) == 0 || string(callArgs) == "null" {
+		callArgs = json.RawMessage("{}")
+	}
+	var argObject map[string]any
+	if err := json.Unmarshal(callArgs, &argObject); err != nil {
+		return "", fmt.Errorf("run_tool_once: args должен быть JSON-объектом: %w", err)
+	}
+	if meta.Server == "" && args.Tool != "calc" {
+		return "", fmt.Errorf("run_tool_once: локальный инструмент %q не поддержан", args.Tool)
+	}
+	if meta.Server != "" {
+		if a.mcpClient == nil {
+			return "", fmt.Errorf("run_tool_once: MCP не подключён")
+		}
+		if !a.mcpClient.Has(meta.Server) {
+			return "", fmt.Errorf("run_tool_once: MCP-сервер %s не подключён; проверьте mcp.json", meta.Server)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(a.turnContext())
+	defer cancel()
+
+	res, err := scheduler.RunOnce(ctx, a, scheduler.ToolConfig{
+		Tool:  args.Tool,
+		Args:  callArgs,
+		Delay: delay,
+		Log:   a.ui.trace,
+	})
+	if err != nil {
+		return "", fmt.Errorf("run_tool_once: %w", err)
+	}
+
+	out, err := json.Marshal(struct {
+		Tool         string    `json:"tool"`
+		Run          int       `json:"run"`
+		DelaySeconds int       `json:"delay_seconds"`
+		At           time.Time `json:"at"`
+		Output       string    `json:"output"`
+	}{
+		Tool:         args.Tool,
+		Run:          res.Run,
+		DelaySeconds: args.DelaySeconds,
+		At:           res.At,
+		Output:       res.Output,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // runToolSchedule is the generic, deliberately narrow scheduler: the model may
@@ -1771,6 +1898,7 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 		Tool        string          `json:"tool"`
 		Args        json.RawMessage `json:"args"`
 		IntervalSec int             `json:"interval_seconds"`
+		DelaySec    int             `json:"delay_seconds"`
 		DurationSec int             `json:"duration_seconds"`
 		ReportEvery int             `json:"report_every_seconds"`
 	}{
@@ -1789,10 +1917,14 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 	}
 	meta, ok := scheduledTools[args.Tool]
 	if !ok {
-		return "", fmt.Errorf("run_tool_schedule: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx", args.Tool)
+		return "", fmt.Errorf("run_tool_schedule: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, mcp_forex_read_period, mcp_forex_list_periods", args.Tool)
 	}
 	if args.IntervalSec < 1 {
 		return "", fmt.Errorf("run_tool_schedule: interval_seconds должен быть не меньше 1")
+	}
+	delay, err := optionalSecondsDuration(args.DelaySec)
+	if err != nil {
+		return "", fmt.Errorf("run_tool_schedule: delay_seconds: %w", err)
 	}
 	if args.DurationSec < 10 {
 		return "", fmt.Errorf("run_tool_schedule: duration_seconds должен быть не меньше 10")
@@ -1837,6 +1969,7 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 		Tool:        args.Tool,
 		Args:        callArgs,
 		Interval:    time.Duration(args.IntervalSec) * time.Second,
+		Delay:       delay,
 		Duration:    duration,
 		ReportEvery: time.Duration(args.ReportEvery) * time.Second,
 		Log:         a.ui.trace,
@@ -1893,6 +2026,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	args := struct {
 		Pair               string `json:"pair"`
 		IntervalSeconds    int    `json:"interval_seconds"`
+		DelaySeconds       int    `json:"delay_seconds"`
 		DurationSeconds    int    `json:"duration_seconds"`
 		SummaryEverySecond int    `json:"summary_every_seconds"`
 	}{
@@ -1912,6 +2046,10 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	}
 	if args.IntervalSeconds < 1 {
 		return "", fmt.Errorf("run_forex_schedule: interval_seconds должен быть не меньше 1")
+	}
+	delay, err := optionalSecondsDuration(args.DelaySeconds)
+	if err != nil {
+		return "", fmt.Errorf("run_forex_schedule: delay_seconds: %w", err)
 	}
 	if args.DurationSeconds < 10 {
 		return "", fmt.Errorf("run_forex_schedule: duration_seconds должен быть не меньше 10")
@@ -1942,6 +2080,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 		Base:         base,
 		Quote:        quote,
 		Interval:     time.Duration(args.IntervalSeconds) * time.Second,
+		Delay:        delay,
 		Duration:     duration,
 		SummaryEvery: time.Duration(args.SummaryEverySecond) * time.Second,
 		// Runs не ограничивает цикл в режиме Duration, но даёт прогрессу
@@ -2041,6 +2180,18 @@ func secondsDuration(n int) (time.Duration, error) {
 		return 0, fmt.Errorf("слишком большая длительность")
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+// optionalSecondsDuration разрешает 0 (без задержки) и проверяет верхнюю
+// границу time.Duration для остальных значений.
+func optionalSecondsDuration(n int) (time.Duration, error) {
+	if n < 0 {
+		return 0, fmt.Errorf("не может быть отрицательной")
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	return secondsDuration(n)
 }
 
 func parsePair(value string) (string, string, error) {

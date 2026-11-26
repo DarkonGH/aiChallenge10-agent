@@ -22,8 +22,13 @@
   планировщик. Тот же бинарь сохраняет и старый CLI-режим `-schedule-*`.
 - `main.go` — второй инструмент `run_tool_schedule`: повторяет один из
   разрешённых инструментов (`calc`, `mcp_rates_currency_rate`,
-  `mcp_forex_fetch_fx`) и возвращает результаты всех запусков. Набор закрыт
-  кодом, произвольный MCP-инструмент подставить нельзя.
+  `mcp_forex_fetch_fx`, `mcp_forex_read_period`, `mcp_forex_list_periods`)
+  и возвращает результаты всех запусков. Набор закрыт кодом, произвольный
+  MCP-инструмент подставить нельзя.
+- `main.go` — `run_tool_once`: один вызов разрешённого инструмента с
+  необязательной задержкой. Отдельный инструмент нужен, чтобы модель не
+  заполняла `interval_seconds`/`duration_seconds`/`report_every_seconds`
+  для просьбы «через 30 секунд собери отчёт один раз».
 - `internal/mcp/client.go` — `Manager.CallTrusted`: внутренний вызов MCP без
   guard, чтобы планировщик получал чистый JSON, а не обёртку
   `<untrusted_tool_output>`. Проверка аргументов и allowlist остаются.
@@ -54,11 +59,19 @@ Forex-терминал; значение может не меняться каж
 |---|---|---|
 | `fetch_fx` | `base`, `quote` (по умолчанию USD/RUB) | `base`, `quote`, `rate`, `fetched_at`, `source` |
 | `save_tick` | замер (`base`, `quote`, `rate`, `fetched_at`, `source`) | `saved`, `total` |
-| `read_period` | `from`, `to`, `quote` | `count`, `ticks` |
+| `read_period` | `from`, `to`, `quote`, `summary`, `limit`, `offset` | `count`, `ticks`; при `summary=true` — `count`, `summary` |
+| `list_periods` | `from`, `to`, `quote` | `count`, `first`, `last`, `runs` (`from`, `to`, `count`) |
+
+`read_period` с `summary=true` не выгружает сотни сырых тиков: он возвращает
+`count`, `first`, `last`, `min`, `max`, `avg`, `delta` и `runs` — непрерывные
+серии замеров. `list_periods` делает то же без агрегатов и без тиков, а
+`limit`/`offset` позволяют читать сырой журнал порциями.
 
 Хранилище — append-only JSONL. Каждый запуск добавляет одну строку; старые
 замеры не перезаписываются. Путь задаётся `FOREX_STORE`, по умолчанию
-`data/day18/forex.jsonl`.
+`~/.local/share/goagent/forex/forex.jsonl` (или
+`$XDG_DATA_HOME/goagent/forex/forex.jsonl`). Демо-скрипты по-прежнему
+переопределяют путь на `/tmp/.../forex.jsonl`.
 
 ## Чат-сценарий
 
@@ -89,8 +102,8 @@ run_forex_schedule({
 
 1. `fetch_fx` получает курс.
 2. `save_tick` добавляет замер в журнал и возвращает общее число записей.
-3. По времени (раз в `summary_every_seconds`) `read_period` читает замеры
-   от времени старта планировщика.
+3. По времени (раз в `summary_every_seconds`) `read_period` с `summary=true`
+   читает агрегаты и серии замеров от времени старта планировщика.
 4. `forex.BuildReport` считает `count`, `min`, `max`, `avg`, `delta` и
    первый/последний замер. В отчёт попадают все запуски, а не последний.
 5. Числовой отчёт сразу печатается, а текстовая сводка считается
@@ -108,6 +121,23 @@ run_forex_schedule({
 уже посчитанные агрегаты и пишет 2–3 предложения; она не пересчитывает
 числа. Если сводка недоступна, числовой отчёт всё равно остаётся.
 
+## Разовый запуск и планировщик
+
+Для просьбы «через 30 секунд собери отчёт один раз» используется
+`run_tool_once`:
+
+```json
+{
+  "tool": "mcp_forex_read_period",
+  "args": {"from": "...", "to": "...", "quote": "RUB", "summary": true},
+  "delay_seconds": 30
+}
+```
+
+У него нет `interval_seconds`, `duration_seconds` и `report_every_seconds`:
+один вызов после задержки. Это убирает лишние параметры, которые модель
+раньше придумывала сама, и не маскирует паузу вызовом `calc`.
+
 ## Универсальный планировщик для разрешённых инструментов
 
 `run_tool_schedule` — более узкий вариант для повторяющихся вызовов, когда
@@ -117,19 +147,23 @@ run_forex_schedule({
 {
   "tool": "calc",
   "args": {"expr": "2+2"},
+  "delay_seconds": 30,
   "interval_seconds": 2,
   "duration_seconds": 10,
   "report_every_seconds": 10
 }
 ```
 
-Разрешены только три инструмента:
+`delay_seconds` откладывает первый запуск; без него первый вызов идёт сразу.
+Разрешены только пять инструментов:
 
 | `tool` | Что вызывает | Аргументы |
 |---|---|---|
 | `calc` | локальный калькулятор | `{"expr":"..."}` |
 | `mcp_rates_currency_rate` | MCP `rates/currency_rate` | `{"currency":"USD","date":"20.11.2026"}` |
 | `mcp_forex_fetch_fx` | MCP `forex/fetch_fx` | `{"base":"USD","quote":"RUB"}` |
+| `mcp_forex_read_period` | MCP `forex/read_period` | `{"quote":"RUB","summary":true}` |
+| `mcp_forex_list_periods` | MCP `forex/list_periods` | `{"quote":"RUB"}` |
 
 Список задан map в `main.go`, а `CallTool` повторно проверяет имя. Модель не
 может подставить произвольный сервер или destructive-инструмент. Для MCP

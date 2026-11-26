@@ -86,17 +86,20 @@
       "allow": [
         "fetch_fx",
         "save_tick",
-        "read_period"
+        "read_period",
+        "list_periods"
       ],
       "approval": {
         "fetch_fx": "allow",
         "save_tick": "ask",
-        "read_period": "allow"
+        "read_period": "allow",
+        "list_periods": "allow"
       },
       "descriptions": {
         "fetch_fx": "Текущий spot-курс валютной пары (Coinbase). Аргументы base и quote, по умолчанию USD/RUB.",
         "save_tick": "Сохранить замер курса в append-only JSONL-журнал; возвращает общее число записей.",
-        "read_period": "Прочитать накопленные замеры за период [from, to], с фильтром по quote."
+        "read_period": "Прочитать замеры за период [from, to]. summary=true — count, first/last, min/max/avg/delta и серии runs без сырых тиков; limit/offset — порционный вывод.",
+        "list_periods": "Показать серии замеров за период [from, to] без сырых тиков: count, first, last, runs [{from,to,count}]."
       }
     }
   ]

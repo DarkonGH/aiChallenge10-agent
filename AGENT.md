@@ -228,7 +228,9 @@ MCP-серверы запускаются в отдельной process group, �
 код проверяет аргументы и запускает блокирующий цикл. Второй режим — CLI без
 чат-модели, для фоновых прогонов и старого демо. MCP-серверы поднимаются до
 настройки LLM, затем `internal/scheduler` вызывает `forex/fetch_fx`,
-`forex/save_tick` и по времени `forex/read_period`.
+`forex/save_tick` и по времени `forex/read_period`. У `read_period` есть
+`summary=true` (агрегаты и `runs` без сырых тиков) и `limit`/`offset`; отдельный
+`list_periods` возвращает только серии журнала.
 
 Чат-сценарий:
 
@@ -243,13 +245,20 @@ MCP-серверы запускаются в отдельной process group, �
 сборам: медленный ответ qwen не сдвигает следующий замер. Ошибка сводки не
 отменяет числовой отчёт.
 
+Для одиночного отложенного действия есть `run_tool_once`: он принимает
+только `tool`, `args` и `delay_seconds` и вызывает инструмент ровно один раз.
+Его используем для «через 30 секунд собери отчёт» — без выдуманных
+`interval_seconds`, `duration_seconds` и `report_every_seconds`.
+
 Для повторяющихся вызовов без сохранения и сводки есть второй инструмент —
-`run_tool_schedule`. Он принимает `tool`, `args`, `interval_seconds`,
-`duration_seconds` и `report_every_seconds`, но набор инструментов закрыт
-кодом: `calc`, `mcp_rates_currency_rate` (ЦБ РФ) и `mcp_forex_fetch_fx`
-(Coinbase spot). Модель не может подставить произвольный MCP-инструмент.
-Результаты всех запусков возвращаются в JSON, а ход диалога блокируется до
-конца расписания.
+`run_tool_schedule`. Он принимает `tool`, `args`, `delay_seconds`,
+`interval_seconds`, `duration_seconds` и `report_every_seconds`, но набор
+инструментов закрыт кодом: `calc`, `mcp_rates_currency_rate` (ЦБ РФ),
+`mcp_forex_fetch_fx` (Coinbase spot), `mcp_forex_read_period` (сырые тики
+или `summary:true`) и `mcp_forex_list_periods` (серии журнала). Модель не
+может подставить произвольный MCP-инструмент. `delay_seconds` откладывает
+первый запуск. Результаты всех запусков возвращаются в JSON, а ход диалога
+блокируется до конца расписания.
 
 ```json
 run_tool_schedule({
@@ -257,6 +266,16 @@ run_tool_schedule({
   "args": {"expr": "2+2"},
   "interval_seconds": 2,
   "duration_seconds": 10
+})
+```
+
+Один отложенный вызов:
+
+```json
+run_tool_once({
+  "tool": "mcp_forex_read_period",
+  "args": {"quote": "RUB", "summary": true},
+  "delay_seconds": 30
 })
 ```
 
@@ -271,7 +290,8 @@ FOREX_STORE=/tmp/day18-demo/forex.jsonl \
 
 `-schedule-runs 0` — работать до Ctrl-C; сигнал отменяет контекст. Ошибка
 отдельного запуска логируется, цикл продолжается. `internal/forex/store.go`
-пишет append-only JSONL (`FOREX_STORE` или `data/day18/forex.jsonl`), поэтому
+пишет append-only JSONL (`FOREX_STORE` или
+`~/.local/share/goagent/forex/forex.jsonl`), поэтому
 накопление переживает перезапуск; `report.BuildReport` считает
 min/max/avg/delta по **всем** замерам периода, а не по последнему. Демо и
 проверка — `scripts/day18-chat.sh` / `scripts/check_day18_chat.py` и

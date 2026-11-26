@@ -13,6 +13,7 @@ import (
 type fakeToolCaller struct {
 	mu    sync.Mutex
 	calls []string
+	times []time.Time
 	err   error
 }
 
@@ -20,6 +21,7 @@ func (f *fakeToolCaller) CallTool(_ context.Context, tool string, raw json.RawMe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, tool+" "+string(raw))
+	f.times = append(f.times, time.Now())
 	if f.err != nil {
 		return "", f.err
 	}
@@ -86,5 +88,65 @@ func TestRunToolRejectsEmptyTool(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "не задан инструмент") {
 		t.Fatalf("ожидалась ошибка про инструмент, получено %v", err)
+	}
+}
+
+func TestRunOnceDelaysAndCallsOnce(t *testing.T) {
+	caller := &fakeToolCaller{}
+	var logs []string
+	start := time.Now()
+	res, err := RunOnce(context.Background(), caller, ToolConfig{
+		Tool:  "calc",
+		Args:  json.RawMessage(`{"expr":"1+1"}`),
+		Delay: 40 * time.Millisecond,
+		Log:   func(s string) { logs = append(logs, s) },
+	})
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("вызов не ждал задержку: %s", elapsed)
+	}
+	if len(caller.calls) != 1 {
+		t.Fatalf("ожидался один вызов, получено %d", len(caller.calls))
+	}
+	if res.Run != 1 || res.Output != `{"value":42}` {
+		t.Fatalf("некорректный результат: %+v", res)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, want := range []string{"[разовый запуск] инструмент calc", "старт через 40ms"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("в логе нет %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestRunOnceRejectsEmptyTool(t *testing.T) {
+	_, err := RunOnce(context.Background(), &fakeToolCaller{}, ToolConfig{})
+	if err == nil || !strings.Contains(err.Error(), "не задан инструмент") {
+		t.Fatalf("ожидалась ошибка про инструмент, получено %v", err)
+	}
+}
+
+func TestRunToolDelaysFirstCall(t *testing.T) {
+	caller := &fakeToolCaller{}
+	start := time.Now()
+	results, err := RunTool(context.Background(), caller, ToolConfig{
+		Tool:        "calc",
+		Args:        json.RawMessage(`{"expr":"1+1"}`),
+		Interval:    10 * time.Millisecond,
+		Delay:       40 * time.Millisecond,
+		Duration:    10 * time.Millisecond,
+		ReportEvery: 10 * time.Millisecond,
+		Log:         func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("RunTool: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("ожидался 1 запуск, получено %d", len(results))
+	}
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("первый запуск не ждал задержку: %s", elapsed)
 	}
 }

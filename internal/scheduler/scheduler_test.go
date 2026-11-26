@@ -17,12 +17,14 @@ type fakeCaller struct {
 	mu    sync.Mutex
 	ticks []forex.Tick
 	calls []string
+	times []time.Time
 }
 
 func (f *fakeCaller) CallTrusted(_ context.Context, server, tool string, raw json.RawMessage) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, server+"/"+tool)
+	f.times = append(f.times, time.Now())
 	switch tool {
 	case "fetch_fx":
 		var args map[string]string
@@ -225,4 +227,28 @@ type failingCaller struct{}
 
 func (f *failingCaller) CallTrusted(context.Context, string, string, json.RawMessage) (string, error) {
 	return "", errors.New("client is closing: EOF")
+}
+
+func TestRunDelaysFirstCollection(t *testing.T) {
+	caller := &fakeCaller{}
+	start := time.Now()
+	err := Run(context.Background(), caller, Config{
+		Server:      "forex",
+		Base:        "USD",
+		Quote:       "RUB",
+		Interval:    10 * time.Millisecond,
+		Delay:       40 * time.Millisecond,
+		Runs:        1,
+		ReportEvery: 1,
+		Log:         func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(caller.ticks) != 1 {
+		t.Fatalf("ticks = %d, want 1", len(caller.ticks))
+	}
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("первый замер не ждал задержку: %s", elapsed)
+	}
 }

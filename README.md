@@ -112,18 +112,26 @@ export OPENAI_API_KEY="..."
 5 секунд, сохранять замеры и раз в минуту выводить сводку. Модель вызывает
 инструмент `run_forex_schedule`, а тот — MCP-инструменты `fetch_fx` →
 `save_tick`. Каждый замер складывается в append-only JSONL; раз в минуту
-`read_period` читает **все** замеры с начала и строит отчёт по ним, а не по
-последнему.
+`read_period` с `summary=true` читает **все** замеры с начала и строит отчёт
+по ним, а не по последнему; `list_periods` показывает только серии, а
+`limit`/`offset` читают сырой журнал порциями.
 
 Числа считает код, текстовую сводку пишет локальная модель (qwen) и не
 пересчитывает значения. Сводка идёт параллельно сборам, поэтому не сдвигает
 следующий замер.
 
-Есть и более узкий универсальный вариант — `run_tool_schedule`. Он повторяет
-один из разрешённых инструментов: `calc`, `mcp_rates_currency_rate` или
-`mcp_forex_fetch_fx`. Список закрыт кодом; произвольный MCP-инструмент
-подставить нельзя. Параметры: `tool`, `args`, `interval_seconds`,
-`duration_seconds`, `report_every_seconds`. Все успешные результаты
+Для одного отложенного действия есть `run_tool_once`: только `tool`, `args`
+и `delay_seconds`, ровно один вызов. Это путь для «через 30 секунд собери
+отчёт», без лишних `interval_seconds`, `duration_seconds` и
+`report_every_seconds`.
+
+Есть и более узкий универсальный вариант для повторяющихся действий —
+`run_tool_schedule`. Он повторяет один из разрешённых инструментов: `calc`,
+`mcp_rates_currency_rate`, `mcp_forex_fetch_fx`, `mcp_forex_read_period` или
+`mcp_forex_list_periods`. Список закрыт кодом; произвольный MCP-инструмент
+подставить нельзя. Параметры: `tool`, `args`, `delay_seconds`,
+`interval_seconds`, `duration_seconds`, `report_every_seconds`.
+`delay_seconds` откладывает первый запуск. Все успешные результаты
 возвращаются в JSON.
 
 ```text
