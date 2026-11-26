@@ -69,7 +69,6 @@ func (ed *lineEditor) Read(prompt string) (string, error) {
 	cur := 0 // позиция курсора в рунах
 	promptLen := len([]rune(prompt))
 	cols := TerminalWidth() // ширина экрана; обновляется при каждой отрисовке
-	prevRows := 1           // сколько экранных строк заняла прошлая отрисовка
 	curRow := 0             // строка экрана, на которой курсор оставлен
 	draw := func() {
 		cols = TerminalWidth()
@@ -77,10 +76,12 @@ func (ed *lineEditor) Read(prompt string) (string, error) {
 		rows, tRow, tCol := wrapLayout(all, promptLen+cur, cols)
 
 		// Стереть прошлую отрисовку: подняться на её первую экранную строку
-		// (строка ввода могло переноситься) и очистить всё ниже курсора.
-		if prevRows > 1 {
-			fmt.Printf("\x1b[%dA", prevRows-1)
-		}
+		// (строка ввода могла переноситься) и очистить всё ниже курсора.
+		// Подниматься надо от текущей строки курсора, а не от количества
+		// строк: если курсор уже перешёл на предыдущую экранную строку,
+		// старый вариант поднимался на одну строку лишней и съедал вывод
+		// над вводом.
+		fmt.Print(eraseUp(curRow))
 		fmt.Print("\r\x1b[J")
 		// Напечатать заново; на экранные строки текст раскладывает сам
 		// терминал авто-переносом — все перемещения ниже относительные, поэтому
@@ -95,7 +96,7 @@ func (ed *lineEditor) Read(prompt string) (string, error) {
 		if tCol > 0 {
 			fmt.Printf("\x1b[%dC", tCol)
 		}
-		prevRows, curRow = rows, tRow
+		curRow = tRow
 	}
 	// finish ставит курсор в самый конец отрисованного ввода (на последнюю его
 	// экранную строку), чтобы перевод строки ушёл ниже всего перенесённого
@@ -186,9 +187,7 @@ func (ed *lineEditor) Read(prompt string) (string, error) {
 		case 0x03: // Ctrl-C — отменить строку, вернуться к пустому промпту
 			// Стереть весь (возможно перенесённый) ввод, а не только текущую
 			// экранную строку.
-			if prevRows > 1 {
-				fmt.Printf("\x1b[%dA", prevRows-1)
-			}
+			fmt.Print(eraseUp(curRow))
 			fmt.Print("\r\x1b[J^C")
 			rb.reset()
 			return "", nil
@@ -234,6 +233,17 @@ func (ed *lineEditor) Read(prompt string) (string, error) {
 			draw()
 		}
 	}
+}
+
+// eraseUp возвращает escape-последовательность, поднимающую курсор с текущей
+// экранной строки на первую строку прошлой отрисовки. Именно curRow, а не
+// общее число строк: курсор мог уже уйти на предыдущую строку при движении
+// влево, и лишний подъём стёр бы строку над вводом.
+func eraseUp(curRow int) string {
+	if curRow <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("\x1b[%dA", curRow)
 }
 
 // wrapLayout — раскладка текста длиной total руны на экране шириной cols:
