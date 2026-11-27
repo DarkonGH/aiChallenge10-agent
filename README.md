@@ -188,8 +188,9 @@ mcp_pipeline_save_to_file({"path": "mcp-summary.md", "content": "..."})
 каталогу, запись — только в `reports/`. Секреты (`.env*`, `*.pem`, `*.key`,
 `id_rsa*`, `credentials*`), скрытые файлы и бинарники пропускаются.
 `PIPELINE_SEARCH_ROOT` и `PIPELINE_OUT_DIR` выставляются из workdir; старый
-`PIPELINE_NOTES_DIR` остаётся алиасом. Демо — `scripts/day19-demo.sh`,
-проверка — `scripts/check_day19.py` (34 проверки).
+`PIPELINE_NOTES_DIR` остаётся алиасом. Демо — `scripts/day19-demo.sh`:
+четыре сценария forex + pipeline; проверка — `scripts/check_day19.py`
+(35 проверок).
 
 ## Цикл агента
 

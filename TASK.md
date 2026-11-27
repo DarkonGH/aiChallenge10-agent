@@ -161,47 +161,27 @@ mcp_pipeline_save_to_file({
 модель объясняет пользователю, где именно оборвалась цепочка, не придумывая
 документы, резюме или файл.
 
-## Демо
+## Демо (четыре сценария)
 
 ```bash
 bash scripts/day19-demo.sh
 ```
 
-Скрипт собирает `bin/mcp-pipeline` и `goagent`, копирует заметки из
-`testdata/day19-notes` в `/tmp/day19-demo/work/notes`, запускает агента с
-`-workdir /tmp/day19-demo/work` и `testdata/day19-mcp.json`, а отчёт пишет в
-`/tmp/day19-demo/work/reports`, затем запускает checker.
+Скрипт собирает `goagent`, `bin/mcp-forex`, `bin/mcp-pipeline`, создаёт
+временный workdir `/tmp/day19-demo/work`, запускает агента с
+`testdata/day19-mcp.json` (forex + pipeline) и пишет лог в
+`/tmp/day19-demo.log`, затем запускает checker.
 
-Ключевые строки успешного хода:
+Сценарии:
 
-```text
-goagent> Найди в рабочем каталоге материалы про MCP, сделай краткое резюме и сохрани его в mcp-summary.md.
-  ↳ mcp_pipeline_search({"query":"MCP","limit":5}) → ... {"count":2,...}
-  ↳ mcp_pipeline_summarize({"items":[...],"max_sentences":5}) → ... {"count":2,"summary":"Резюме по 2 документам:...
-  ↳ mcp_pipeline_save_to_file({"path":"mcp-summary.md",...}) → ... {"saved":true,...}
-Готово. Цепочка: search → summarize → save_to_file.
-```
-
-Пустой поиск:
-
-```text
-  ↳ mcp_pipeline_search({"query":"MCP","empty":true}) → ... {"count":0,"items":[]}
-Шаги 2–3 (summarize, save_to_file): не вызывались.
-```
-
-Ошибка второго шага:
-
-```text
-  ↳ mcp_pipeline_search({"query":"MCP","limit":5}) → ... {"count":3,...}
-  ↳ mcp_pipeline_summarize({"fail":true,"items":[...]}) → ошибка инструмента mcp_pipeline_summarize: ...
-Цепочка остановилась на втором шаге.
-```
-
-В демо модель сама вызывает `mcp_pipeline_search`, `mcp_pipeline_summarize`
-и `mcp_pipeline_save_to_file`, без локального макроса. В первом сценарии
-она один раз находит два документа, передаёт их в резюме и сохраняет
-`mcp-summary.md` (772 байта). Во втором и третьем не пытается подставить
-выдуманные данные и объясняет остановку.
+1. `USD/RUB` каждые 3 секунды, 30 секунд: 10 замеров → среднее →
+   `usd_rub_avg.md` в рабочем каталоге.
+2. `USD/ZZZ` → Coinbase 404; `calc` и `save_to_file` не вызываются,
+   файла нет.
+3. Сумма замеров → `calc` с делением на ноль → «деление на ноль»,
+   `save_to_file` не вызывается, `zero.md` нет.
+4. `mcp_pipeline_save_to_file` с `path:"~/secret/report.md"` → ошибка
+   «путь начинается с ~», файл не создан.
 
 ## Проверки
 
@@ -210,47 +190,42 @@ gofmt -l .
 GOTOOLCHAIN=local go vet ./...
 GOTOOLCHAIN=local go test -count=1 ./...
 GOTOOLCHAIN=local go build -o goagent .
+GOTOOLCHAIN=local go build -o bin/mcp-forex ./cmd/mcp-forex
 GOTOOLCHAIN=local go build -o bin/mcp-pipeline ./cmd/mcp-pipeline
 bash scripts/day19-demo.sh
 ```
 
-Checker: **34 проверки `ok`**. Он проверяет:
+Checker: **35 проверок `ok`**. Он проверяет:
 
-- в сессии три хода и ни одного вызова `run_pipeline`;
-- в каждом сценарии есть `mcp_pipeline_search`;
-- в успешном сценарии порядок `search → summarize → save_to_file`,
-  непустые `items` у `summarize`, путь `mcp-summary.md` у `save_to_file`;
-- `search.count >= 2`, `summary` непустой, `saved=true`, а `content`
-  содержит хотя бы один пункт из настоящего резюме;
-- пустой сценарий: `empty=true`, `count=0`, `items=[]`, нет `summarize` и
+- в сессии четыре сценария и ни одного вызова `run_pipeline`;
+- успешную цепочку `USD/RUB`: аргументы планировщика, `save_to_file`
+  с `usd_rub_avg.md`, файл и среднее;
+- ошибку первого шага `USD/ZZZ`: 404/not found, нет `calc` и
   `save_to_file`;
-- ошибочный сценарий: `summarize` после `search`, `fail=true`, нет
-  `save_to_file`, текст ошибки содержит «тестовый сбой»;
-- файл `mcp-summary.md` существует, содержит «Резюме» и «MCP»; в
-  `reports/` ровно один файл;
-- в логе есть вызовы всех трёх инструментов и нет `run_pipeline`.
+- деление на ноль: есть `calc` с `/0`, ошибка «деление на ноль», нет
+  `save_to_file` и `zero.md`;
+- ошибку сохранения: `path:"~/secret/report.md"` без замены, ошибка
+  «начинается с ~», файла в `~/secret` нет;
+- в `reports/` только `usd_rub_avg.md`, текстовых сводок нет.
 
 ## Видео
 
-`video/композиция-mcp-день-19.mp4`
+`video/четыре-сценария-день-19.mp4`
 
-- 75,8 секунды, 1352x970, 8 fps, h264, без аудио;
-- `/mcp`, `/tools`, успешная ручная цепочка, пустой поиск, ошибка
-  `summarize`;
-- первый сценарий сформулирован без имён инструментов: модель сама выбирает
-  `search` → `summarize` → `save_to_file` по описаниям; в сценариях сбоев
-  `empty`/`fail` названы явно, чтобы проверка была воспроизводимой;
-- шесть карточек: один сервер и три инструмента, `search`, `summarize`,
-  `save_to_file`, «модель строит цепочку», предсказуемая остановка.
+- 91,75 секунды, 1352x970, 8 fps, h264, без аудио;
+- четыре сценария: успешная цепочка, 404, деление на ноль, отказ
+  `~/secret`;
+- шесть карточек: успех, ошибка первого шага, ошибка деления, ошибка
+  сохранения, предсказуемая остановка.
 
 Каст собран из настоящего stdout-лога:
 
 ```bash
 python3 scripts/log_to_cast.py /tmp/day19-demo.log /tmp/day19-demo.cast
 python3 scripts/render_cast.py --cast /tmp/day19-demo.cast \
-  --out video/композиция-mcp-день-19.mp4 \
-  --title "День 19 · Композиция MCP" \
-  --subtitle "search → summarize → saveToFile" \
+  --out video/четыре-сценария-день-19.mp4 \
+  --title "День 19 · Четыре сценария" \
+  --subtitle "forex → расчёт → файл" \
   --cards testdata/day19-cards.json
 ```
 
