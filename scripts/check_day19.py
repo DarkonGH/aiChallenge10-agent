@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Проверка демо дня 19: модель сама строит MCP-цепочку.
-
-Оркестратора run_pipeline больше нет. Модель должна сама вызвать
-search -> summarize -> save_to_file, передать items и summary и
-остановиться на пустом результате или ошибке.
-"""
+"""Проверка четырёх сценариев дня 20: forex + save_to_file."""
 
 import glob
 import json
@@ -25,6 +20,13 @@ def check(condition, text):
         print(f"FAIL {text}")
 
 
+def parse_args(raw):
+    try:
+        return json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
 def load_turns(data_dir):
     paths = glob.glob(f"{data_dir}/*/session.jsonl")
     if not paths:
@@ -36,18 +38,18 @@ def load_turns(data_dir):
             line = line.strip()
             if not line:
                 continue
-            event = json.loads(line)
-            message = event.get("message") or {}
+            message = (json.loads(line).get("message") or {})
             role = message.get("role")
             if role == "user":
-                current = {"user": message.get("content") or "",
-                           "calls": [], "results": []}
+                current = {"calls": [], "results": [], "text": ""}
                 turns.append(current)
             elif role == "assistant" and current is not None:
+                text = message.get("content") or ""
+                if text:
+                    current["text"] += text + "\n"
                 for call in message.get("tool_calls") or []:
                     fn = call.get("function") or {}
                     current["calls"].append({
-                        "id": call.get("id"),
                         "name": fn.get("name") or "",
                         "args": parse_args(fn.get("arguments")),
                     })
@@ -59,184 +61,130 @@ def load_turns(data_dir):
     return turns
 
 
-def parse_args(raw):
-    if isinstance(raw, dict):
-        return raw
-    try:
-        value = json.loads(raw or "{}")
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
+def calls_named(turn, name):
+    return [c for c in turn["calls"] if c["name"] == name]
 
 
-def extract_json(content):
-    start = content.find("{")
-    end = content.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        value = json.loads(content[start:end + 1])
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def names(turn):
-    return [call["name"] for call in turn["calls"]]
-
-
-def first_index(turn, tool):
-    for i, call in enumerate(turn["calls"]):
-        if call["name"] == tool:
-            return i
-    return -1
-
-
-def results(turn, tool):
-    out = []
+def result_for(turn, name):
     for result in turn["results"]:
-        if result["name"] == tool:
-            value = extract_json(result["content"])
-            if value is not None:
-                out.append(value)
-    return out
-
-
-def error_text(turn, tool):
-    for result in turn["results"]:
-        if result["name"] == tool:
+        if result["name"] == name:
             return result["content"]
     return ""
 
 
 def main():
-    out_dir, log_path, data_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    with open(log_path, encoding="utf-8") as f:
-        log = f.read()
+    reports, log_path, data_dir, work_dir = sys.argv[1:5]
+    log = open(log_path, encoding="utf-8").read()
     turns = load_turns(data_dir)
 
-    check(len(turns) == 3, f"в сессии три хода пользователя (найдено {len(turns)})")
+    check(len(turns) == 4, f"в сессии четыре сценария (найдено {len(turns)})")
+    check("run_pipeline" not in log, "локальный run_pipeline не вызывался")
 
-    all_calls = [call["name"] for turn in turns for call in turn["calls"]]
-    check("run_pipeline" not in all_calls,
-          "локальный run_pipeline не вызывался")
-    check("run_pipeline" not in log,
-          "в логе нет run_pipeline")
-    check(all_calls.count("mcp_pipeline_search") >= 3,
-          "модель вызывала mcp_pipeline_search в каждом сценарии")
+    if len(turns) != 4:
+        print(f"ИТОГ: FAIL ({checks - failures}/{checks})")
+        return 1
 
-    if len(turns) == 3:
-        happy, empty, failed = turns
+    # 1. Успешная цепочка.
+    first = turns[0]
+    schedules = calls_named(first, "run_forex_schedule")
+    saves = calls_named(first, "mcp_pipeline_save_to_file")
+    check(bool(schedules), "сценарий 1: запущен run_forex_schedule")
+    if schedules:
+        args = schedules[0]["args"]
+        check(str(args.get("pair", "")).upper() == "USD/RUB",
+              "сценарий 1: пара USD/RUB")
+        check(int(args.get("interval_seconds", 0)) == 3,
+              "сценарий 1: шаг 3 секунды")
+        check(int(args.get("duration_seconds", 0)) == 30,
+              "сценарий 1: длительность 30 секунд")
+        check(int(args.get("summary_every_seconds", 0) or 0) == 0,
+              "сценарий 1: без текстовой сводки")
+    check(bool(saves), "сценарий 1: вызван save_to_file")
+    if saves:
+        check(saves[0]["args"].get("path") == "usd_rub_avg.md",
+              "сценарий 1: путь usd_rub_avg.md")
+    avg_path = os.path.join(reports, "usd_rub_avg.md")
+    check(os.path.isfile(avg_path), "сценарий 1: файл среднего создан")
+    if os.path.isfile(avg_path):
+        body = open(avg_path, encoding="utf-8").read()
+        check("82." in body, "сценарий 1: в файле среднее USD/RUB")
+        check("средн" in body.lower(), "сценарий 1: в файле есть слово «среднее»")
 
-        # --- Сценарий 1: обычная цепочка ---
-        hn = names(happy)
-        check("mcp_pipeline_search" in hn,
-              "успешный сценарий: search вызван")
-        check("mcp_pipeline_summarize" in hn,
-              "успешный сценарий: summarize вызван")
-        check("mcp_pipeline_save_to_file" in hn,
-              "успешный сценарий: save_to_file вызван")
-        check(0 <= first_index(happy, "mcp_pipeline_search")
-              < first_index(happy, "mcp_pipeline_summarize")
-              < first_index(happy, "mcp_pipeline_save_to_file"),
-              "порядок вызовов: search → summarize → save_to_file")
+    # 2. Ошибка первого шага.
+    second = turns[1]
+    fetches = calls_named(second, "mcp_forex_fetch_fx")
+    check(bool(fetches), "сценарий 2: вызван fetch_fx")
+    if fetches:
+        args = fetches[0]["args"]
+        check(str(args.get("base", "")).upper() == "USD",
+              "сценарий 2: base=USD")
+        check(str(args.get("quote", "")).upper() == "ZZZ",
+              "сценарий 2: quote=ZZZ")
+    check(not calls_named(second, "calc"),
+          "сценарий 2: calc не вызывался")
+    check(not calls_named(second, "mcp_pipeline_save_to_file"),
+          "сценарий 2: save_to_file не вызывался")
+    fetch_error = result_for(second, "mcp_forex_fetch_fx").lower()
+    check("404" in fetch_error or "not found" in fetch_error,
+          "сценарий 2: fetch_fx вернул 404/not found")
+    check("перв" in second["text"].lower() or "шаг 1" in second["text"].lower(),
+          "сценарий 2: модель назвала остановку на первом шаге")
 
-        searches = [c["args"] for c in happy["calls"]
-                    if c["name"] == "mcp_pipeline_search"]
-        check(any("mcp" in str(a.get("query", "")).lower() for a in searches),
-              "search искал MCP")
+    # 3. Деление на ноль.
+    third = turns[2]
+    check(bool(calls_named(third, "run_forex_schedule")),
+          "сценарий 3: серия запущена")
+    calcs = calls_named(third, "calc")
+    check(bool(calcs), "сценарий 3: вызван calc")
+    exprs = [str(c["args"].get("expr", "")).replace(" ", "") for c in calcs]
+    check(any("/0" in expr for expr in exprs),
+          "сценарий 3: хотя бы одно выражение делит на ноль")
+    calc_errors = [
+        r["content"].lower()
+        for r in third["results"]
+        if r["name"] == "calc"
+    ]
+    check(any("деление на ноль" in text for text in calc_errors),
+          "сценарий 3: calc вернул «деление на ноль»")
+    check(not calls_named(third, "mcp_pipeline_save_to_file"),
+          "сценарий 3: save_to_file не вызывался")
+    check(not os.path.exists(os.path.join(reports, "zero.md")),
+          "сценарий 3: файл zero.md не создан")
 
-        summaries = [c["args"] for c in happy["calls"]
-                     if c["name"] == "mcp_pipeline_summarize"]
-        check(bool(summaries) and all(isinstance(a.get("items"), list)
-                                      and len(a["items"]) > 0 for a in summaries),
-              "summarize получил непустой items от search")
+    # 4. Ошибка сохранения.
+    fourth = turns[3]
+    check(bool(calls_named(fourth, "run_forex_schedule")),
+          "сценарий 4: серия запущена")
+    saves = calls_named(fourth, "mcp_pipeline_save_to_file")
+    check(bool(saves), "сценарий 4: вызван save_to_file")
+    if saves:
+        check(saves[0]["args"].get("path") == "~/secret/report.md",
+              "сценарий 4: путь ~/secret/report.md передан без замены")
+    save_error = result_for(fourth, "mcp_pipeline_save_to_file").lower()
+    check("начинается с ~" in save_error or "~" in save_error,
+          "сценарий 4: save_to_file отклонил путь с ~")
+    check(not os.path.exists(os.path.expanduser("~/secret/report.md")),
+          "сценарий 4: файл в ~/secret не создан")
 
-        saves = [c["args"] for c in happy["calls"]
-                 if c["name"] == "mcp_pipeline_save_to_file"]
-        check(bool(saves) and saves[0].get("path") == "mcp-summary.md",
-              "save_to_file сохраняет в mcp-summary.md")
+    # Общие проверки.
+    files = sorted(
+        os.path.relpath(p, reports)
+        for p in glob.glob(f"{reports}/**/*", recursive=True)
+        if os.path.isfile(p)
+    )
+    check(files == ["usd_rub_avg.md"],
+          f"в reports только успешный файл (найдено {files})")
+    check("без промежуточных сводок" in log,
+          "в логе нет промежуточных сводок")
+    check("[сводка]" not in log,
+          "локальная модель не писала сводок")
+    check(log.count("mcp_forex_fetch_fx") >= 1,
+          "в логе виден вызов fetch_fx")
+    check("начинается с ~" in log,
+          "в логе видна ошибка пути с ~")
 
-        search_results = results(happy, "mcp_pipeline_search")
-        check(any(r.get("count", 0) >= 2 for r in search_results),
-              "search нашёл хотя бы два документа")
-        check(any(bool(r.get("items")) for r in search_results),
-              "search вернул items")
-
-        summary_results = results(happy, "mcp_pipeline_summarize")
-        check(bool(summary_results) and bool(summary_results[0].get("summary")),
-              "summarize вернул непустой summary")
-
-        save_results = results(happy, "mcp_pipeline_save_to_file")
-        check(bool(save_results) and save_results[0].get("saved") is True,
-              "save_to_file подтвердил сохранение")
-
-        if summaries and saves and summary_results:
-            summary = summary_results[0].get("summary", "")
-            content = str(saves[0].get("content", ""))
-            bullets = [line[2:].strip() for line in summary.splitlines()
-                       if line.startswith("- ")]
-            connected = any(b[:30] in content for b in bullets)
-            check(connected,
-                  "save_to_file получил текст из summary, а не выдуманный")
-
-        # --- Сценарий 2: пустой поиск ---
-        en = names(empty)
-        empty_searches = [c["args"] for c in empty["calls"]
-                          if c["name"] == "mcp_pipeline_search"]
-        check(bool(empty_searches) and empty_searches[0].get("empty") is True,
-              "пустой сценарий: search с empty=true")
-        check("mcp_pipeline_summarize" not in en,
-              "пустой сценарий: summarize не вызывался")
-        check("mcp_pipeline_save_to_file" not in en,
-              "пустой сценарий: save_to_file не вызывался")
-        empty_results = results(empty, "mcp_pipeline_search")
-        check(bool(empty_results) and empty_results[0].get("count") == 0,
-              "пустой сценарий: search вернул count=0")
-        check(not empty_results or not empty_results[0].get("items"),
-              "пустой сценарий: items пустой")
-
-        # --- Сценарий 3: ошибка summarize ---
-        fn = names(failed)
-        check("mcp_pipeline_search" in fn,
-              "ошибочный сценарий: search вызван")
-        check("mcp_pipeline_summarize" in fn,
-              "ошибочный сценарий: summarize вызван")
-        check("mcp_pipeline_save_to_file" not in fn,
-              "ошибочный сценарий: save_to_file не вызывался")
-        check(0 <= first_index(failed, "mcp_pipeline_search")
-              < first_index(failed, "mcp_pipeline_summarize"),
-              "ошибочный сценарий: summarize вызван после search")
-        failed_summaries = [c["args"] for c in failed["calls"]
-                            if c["name"] == "mcp_pipeline_summarize"]
-        check(bool(failed_summaries) and failed_summaries[0].get("fail") is True,
-              "ошибочный сценарий: summarize с fail=true")
-        failed_text = error_text(failed, "mcp_pipeline_summarize").lower()
-        check("тестовый сбой" in failed_text or "ошибка инструмента" in failed_text,
-              "ошибочный сценарий: агент получил ошибку summarize")
-
-    # --- Файл и лог ---
-    summary_path = os.path.join(out_dir, "mcp-summary.md")
-    check(os.path.isfile(summary_path), "файл mcp-summary.md создан")
-    if os.path.isfile(summary_path):
-        with open(summary_path, encoding="utf-8") as f:
-            body = f.read()
-        check("Резюме" in body, "в файле есть резюме")
-        check("MCP" in body, "в файле есть содержание про MCP")
-
-    files = [p for p in glob.glob(f"{out_dir}/**/*", recursive=True)
-             if os.path.isfile(p)]
-    check(len(files) == 1,
-          f"в каталоге reports ровно один файл (найдено {len(files)})")
-
-    check(log.count("mcp_pipeline_search(") >= 3,
-          "в логе видны вызовы search")
-    check(log.count("mcp_pipeline_summarize(") >= 2,
-          "в логе видны summarize в успешном и ошибочном сценариях")
-    check(log.count("mcp_pipeline_save_to_file(") >= 1,
-          "в логе виден save_to_file только в успешном сценарии")
-
-    print(f"ИТОГ: {'ok' if failures == 0 else 'FAIL'} ({checks - failures}/{checks})")
+    total = checks
+    print(f"ИТОГ: {'ok' if failures == 0 else 'FAIL'} ({checks - failures}/{total})")
     return 0 if failures == 0 else 1
 
 
