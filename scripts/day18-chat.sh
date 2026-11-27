@@ -27,9 +27,9 @@ rm -rf "$ROOT"
 mkdir -p "$DATA" bin
 
 GOTOOLCHAIN=local go build -o bin/mcp-forex ./cmd/mcp-forex
-GOTOOLCHAIN=local go build -o agent .
+GOTOOLCHAIN=local go build -o goagent .
 
-FOREX_STORE="$STORE" ./agent \
+FOREX_STORE="$STORE" ./goagent \
   -data "$DATA" \
   -session demo \
   -model "$MODEL" \

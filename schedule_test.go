@@ -5,6 +5,26 @@ import (
 	"time"
 )
 
+func TestOptionalSecondsDuration(t *testing.T) {
+	got, err := optionalSecondsDuration(0)
+	if err != nil {
+		t.Fatalf("0: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("0 = %s, ожидался 0", got)
+	}
+	got, err = optionalSecondsDuration(30)
+	if err != nil {
+		t.Fatalf("30: %v", err)
+	}
+	if got != 30*time.Second {
+		t.Fatalf("30 = %s, ожидалось 30s", got)
+	}
+	if _, err := optionalSecondsDuration(-1); err == nil {
+		t.Fatal("отрицательная задержка должна быть ошибкой")
+	}
+}
+
 func TestSecondsDuration(t *testing.T) {
 	got, err := secondsDuration(3600)
 	if err != nil {

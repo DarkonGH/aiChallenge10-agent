@@ -35,14 +35,31 @@ type saveTickResult struct {
 }
 
 type readPeriodArgs struct {
+	From    string `json:"from,omitempty" jsonschema:"начало периода RFC3339; пусто — без ограничения"`
+	To      string `json:"to,omitempty" jsonschema:"конец периода RFC3339; пусто — без ограничения"`
+	Quote   string `json:"quote,omitempty" jsonschema:"котируемая валюта, например RUB"`
+	Summary bool   `json:"summary,omitempty" jsonschema:"вернуть агрегаты и серии вместо сырых замеров"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"сколько сырых замеров вернуть; 0 — все"`
+	Offset  int    `json:"offset,omitempty" jsonschema:"сколько сырых замеров пропустить"`
+}
+
+type readPeriodResult struct {
+	Count   int           `json:"count"`
+	Ticks   []forex.Tick  `json:"ticks,omitempty"`
+	Summary *forex.Report `json:"summary,omitempty"`
+}
+
+type listPeriodsArgs struct {
 	From  string `json:"from,omitempty" jsonschema:"начало периода RFC3339; пусто — без ограничения"`
 	To    string `json:"to,omitempty" jsonschema:"конец периода RFC3339; пусто — без ограничения"`
 	Quote string `json:"quote,omitempty" jsonschema:"котируемая валюта, например RUB"`
 }
 
-type readPeriodResult struct {
-	Count int          `json:"count"`
-	Ticks []forex.Tick `json:"ticks"`
+type listPeriodsResult struct {
+	Count int         `json:"count"`
+	First string      `json:"first,omitempty"`
+	Last  string      `json:"last,omitempty"`
+	Runs  []forex.Run `json:"runs"`
 }
 
 func main() {
@@ -101,7 +118,9 @@ func main() {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_period",
 		Description: "Прочитать накопленные замеры за период [from, to]. " +
-			"Пустые границы означают всё накопленное; quote фильтрует пару.",
+			"Пустые границы означают всё накопленное; quote фильтрует пару. " +
+			"Для отчёта передай summary=true: вернутся count, first/last, min/max/avg/delta " +
+			"и серии runs, без сырых тиков. Для больших наборов используй limit/offset.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, args readPeriodArgs) (*mcp.CallToolResult, readPeriodResult, error) {
 		from, err := optionalTime(args.From)
 		if err != nil {
@@ -111,14 +130,72 @@ func main() {
 		if err != nil {
 			return nil, readPeriodResult{}, fmt.Errorf("to: %w", err)
 		}
+		if args.Limit < 0 || args.Offset < 0 {
+			return nil, readPeriodResult{}, fmt.Errorf("limit и offset не могут быть отрицательными")
+		}
 		ticks, err := store.ReadPeriod(from, to, args.Quote)
 		if err != nil {
 			return nil, readPeriodResult{}, err
 		}
-		result := readPeriodResult{Count: len(ticks), Ticks: ticks}
+		result := readPeriodResult{Count: len(ticks)}
+		if args.Summary {
+			if len(ticks) > 0 {
+				rep, err := forex.BuildReport(ticks)
+				if err != nil {
+					return nil, readPeriodResult{}, err
+				}
+				result.Summary = &rep
+			}
+		} else {
+			if args.Offset > 0 {
+				if args.Offset >= len(ticks) {
+					ticks = nil
+				} else {
+					ticks = ticks[args.Offset:]
+				}
+			}
+			if args.Limit > 0 && len(ticks) > args.Limit {
+				ticks = ticks[:args.Limit]
+			}
+			result.Ticks = ticks
+		}
 		content, err := jsonContent(result)
 		if err != nil {
 			return nil, readPeriodResult{}, err
+		}
+		return content, result, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_periods",
+		Description: "Показать серии замеров за период [from, to] без сырых тиков: " +
+			"count, first, last и runs [{from,to,count}]. Удобно, когда нужно понять, " +
+			"какие интервалы есть в журнале, не выгружая сотни записей.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, args listPeriodsArgs) (*mcp.CallToolResult, listPeriodsResult, error) {
+		from, err := optionalTime(args.From)
+		if err != nil {
+			return nil, listPeriodsResult{}, fmt.Errorf("from: %w", err)
+		}
+		to, err := optionalTime(args.To)
+		if err != nil {
+			return nil, listPeriodsResult{}, fmt.Errorf("to: %w", err)
+		}
+		ticks, err := store.ReadPeriod(from, to, args.Quote)
+		if err != nil {
+			return nil, listPeriodsResult{}, err
+		}
+		runs, err := forex.BuildRuns(ticks, forex.DefaultRunGap)
+		if err != nil {
+			return nil, listPeriodsResult{}, err
+		}
+		result := listPeriodsResult{Count: len(ticks), Runs: runs}
+		if len(runs) > 0 {
+			result.First = runs[0].From
+			result.Last = runs[len(runs)-1].To
+		}
+		content, err := jsonContent(result)
+		if err != nil {
+			return nil, listPeriodsResult{}, err
 		}
 		return content, result, nil
 	})

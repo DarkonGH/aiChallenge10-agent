@@ -21,7 +21,7 @@ rm -rf "$DATA"
 mkdir -p "$DATA"
 
 echo "демо дня 15: данные $DATA, чат $MODEL, сжатие и память $SUMMARY_MODEL"
-./agent -data "$DATA" -session demo \
+./goagent -data "$DATA" -session demo \
   -model "$MODEL" -summary-model "$SUMMARY_MODEL" \
   -no-reasoning -skip-profile \
   -script testdata/day15-demo.txt -script-delay "$SCRIPT_DELAY"

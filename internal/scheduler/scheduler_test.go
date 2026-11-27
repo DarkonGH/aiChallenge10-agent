@@ -17,12 +17,14 @@ type fakeCaller struct {
 	mu    sync.Mutex
 	ticks []forex.Tick
 	calls []string
+	times []time.Time
 }
 
 func (f *fakeCaller) CallTrusted(_ context.Context, server, tool string, raw json.RawMessage) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, server+"/"+tool)
+	f.times = append(f.times, time.Now())
 	switch tool {
 	case "fetch_fx":
 		var args map[string]string
@@ -192,6 +194,34 @@ func TestRunDurationUsesFixedStart(t *testing.T) {
 	}
 }
 
+func TestRunDurationWithoutSummary(t *testing.T) {
+	caller := &fakeCaller{}
+	var logs []string
+	err := Run(context.Background(), caller, Config{
+		Server:       "forex",
+		Base:         "USD",
+		Quote:        "RUB",
+		Interval:     5 * time.Millisecond,
+		Duration:     20 * time.Millisecond,
+		SummaryEvery: 0,
+		Runs:         4,
+		Log:          func(s string) { logs = append(logs, s) },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "без промежуточных сводок") {
+		t.Fatalf("в логе нет режима без сводок:\n%s", joined)
+	}
+	if !strings.Contains(joined, "[отчёт после 4] USD/RUB: count=4") {
+		t.Fatalf("нет финального числового отчёта:\n%s", joined)
+	}
+	if strings.Contains(joined, "[сводка]") {
+		t.Fatalf("сводка напечатана без запроса:\n%s", joined)
+	}
+}
+
 func TestRunValidatesConfig(t *testing.T) {
 	if err := Run(context.Background(), &fakeCaller{}, Config{}); err == nil {
 		t.Fatal("ожидалась ошибка для пустого интервала")
@@ -225,4 +255,28 @@ type failingCaller struct{}
 
 func (f *failingCaller) CallTrusted(context.Context, string, string, json.RawMessage) (string, error) {
 	return "", errors.New("client is closing: EOF")
+}
+
+func TestRunDelaysFirstCollection(t *testing.T) {
+	caller := &fakeCaller{}
+	start := time.Now()
+	err := Run(context.Background(), caller, Config{
+		Server:      "forex",
+		Base:        "USD",
+		Quote:       "RUB",
+		Interval:    10 * time.Millisecond,
+		Delay:       40 * time.Millisecond,
+		Runs:        1,
+		ReportEvery: 1,
+		Log:         func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(caller.ticks) != 1 {
+		t.Fatalf("ticks = %d, want 1", len(caller.ticks))
+	}
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("первый замер не ждал задержку: %s", elapsed)
+	}
 }

@@ -14,11 +14,21 @@ import (
 
 // DefaultStorePath возвращает путь к журналу замеров. Демо задаёт
 // FOREX_STORE, чтобы данные не попадали в рабочий каталог репозитория.
+// По умолчанию журнал лежит рядом с данными агента, а не в конкретной
+// сессии: замеры — это временной ряд, который должен переживать /new,
+// перезапуск и смену диалога.
 func DefaultStorePath() string {
 	if path := strings.TrimSpace(os.Getenv("FOREX_STORE")); path != "" {
 		return path
 	}
-	return filepath.Join("data", "day18", "forex.jsonl")
+	if dir := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); dir != "" {
+		return filepath.Join(dir, "goagent", "forex", "forex.jsonl")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join("data", "forex", "forex.jsonl")
+	}
+	return filepath.Join(home, ".local", "share", "goagent", "forex", "forex.jsonl")
 }
 
 // Store — append-only JSONL-журнал. Каждый запуск планировщика добавляет

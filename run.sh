@@ -29,8 +29,11 @@ if [ -z "${LLM_SUMMARY_BASE_URL:-}" ] &&
   export LLM_INVARIANT_MODEL=${LLM_INVARIANT_MODEL:-$LLM_SUMMARY_MODEL}
 fi
 
-go build -o agent .
+go build -o goagent .
 mkdir -p bin
 go build -o bin/mcp-cbr ./cmd/mcp-cbr
 go build -o bin/mcp-forex ./cmd/mcp-forex
-exec ./agent "$@"
+go build -o bin/mcp-pipeline ./cmd/mcp-pipeline
+# Defaults live in main.go: -max-prompt-tokens 10000 and -max-tool-chars 4000.
+# Arguments after run.sh override them, e.g. ./run.sh -max-tool-chars 6000.
+exec ./goagent "$@"

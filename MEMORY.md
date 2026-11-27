@@ -33,7 +33,7 @@ data/
 Файлы — источник истины, они же читаемая проекция: слой можно открыть глазами и
 поправить руками. Каждое изменение дополнительно пишется в `session.jsonl`
 событием `memory` с диффом — это журнал для аудита и реплея
-(`./agent -print-session <id>` показывает строки «— память: working +2, knowledge +1»).
+(`./goagent -print-session <id>` показывает строки «— память: working +2, knowledge +1»).
 Запись атомарная (`.tmp` + `rename`), поэтому оборванный процесс не оставляет
 полуфайл.
 
@@ -216,7 +216,7 @@ knowledge уже очищен, поэтому падают и вопросы п�
 эхо адреса уводится четвёртой репликой.
 
 Сборка: `asciinema rec --overwrite -f asciicast-v2 --window-size 148x50 -c
-"./agent -data /tmp/day11-video -session demo -strategy window -window 2
+"./goagent -data /tmp/day11-video -session demo -strategy window -window 2
 -model glm-5.3-flash -summary-model glm-5.3-flash -no-reasoning
 -script testdata/day11-demo.txt" /tmp/day11-demo.cast`, затем
 `python3 scripts/render_cast.py --cast /tmp/day11-demo.cast --out
@@ -228,8 +228,8 @@ video/память-день-11.mp4`.
 /memory                                  # слои, лимиты, токены, отбор знаний
 /memory clear knowledge                  # очистить слой
 /memory add working срок=15 декабря      # добавить запись руками
-./agent -memory-report <сессия|last>     # то же офлайн, с блоками промпта
-./agent -import-memory <сессия> -session <новая>   # перенести факты дня 10
+./goagent -memory-report <сессия|last>     # то же офлайн, с блоками промпта
+./goagent -import-memory <сессия> -session <новая>   # перенести факты дня 10
 ```
 
 `-import-memory` читает последний снимок `facts` из сессии дня 10 и раскладывает

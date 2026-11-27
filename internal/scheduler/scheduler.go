@@ -27,6 +27,7 @@ type Config struct {
 	Base         string        // базовая валюта, обычно USD
 	Quote        string        // котируемая валюта, обычно RUB
 	Interval     time.Duration // пауза между запусками
+	Delay        time.Duration // пауза перед первым запуском
 	Runs         int           // 0 — бесконечно; игнорируется, если задан Duration
 	Duration     time.Duration // 0 — работать по Runs; иначе остановиться по времени
 	ReportEvery  int           // отчёт после каждых N успешных запусков (режим Runs)
@@ -50,14 +51,17 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 	if cfg.Interval <= 0 {
 		return fmt.Errorf("планировщик: интервал должен быть больше нуля")
 	}
+	if cfg.Delay < 0 {
+		return fmt.Errorf("планировщик: задержка не может быть отрицательной")
+	}
 	if cfg.Duration < 0 {
 		return fmt.Errorf("планировщик: длительность не может быть отрицательной")
 	}
 	if cfg.Duration == 0 && cfg.ReportEvery <= 0 {
 		return fmt.Errorf("планировщик: ReportEvery должен быть больше нуля")
 	}
-	if cfg.Duration > 0 && cfg.SummaryEvery <= 0 {
-		return fmt.Errorf("планировщик: SummaryEvery должен быть больше нуля")
+	if cfg.Duration > 0 && cfg.SummaryEvery < 0 {
+		return fmt.Errorf("планировщик: SummaryEvery не может быть отрицательным")
 	}
 	if cfg.Duration == 0 && cfg.Runs < 0 {
 		return fmt.Errorf("планировщик: Runs не может быть отрицательным")
@@ -76,15 +80,25 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 		logf = func(s string) { fmt.Println(s) }
 	}
 
-	started := time.Now().UTC()
-	lastReport := started
 	if cfg.Duration > 0 {
-		logf(fmt.Sprintf("[планировщик] интервал %s, длительность %s, сводка каждые %s, пара %s/%s",
-			cfg.Interval, cfg.Duration, cfg.SummaryEvery, cfg.Base, cfg.Quote))
+		summaryPlan := "без промежуточных сводок"
+		if cfg.SummaryEvery > 0 {
+			summaryPlan = fmt.Sprintf("сводка каждые %s", cfg.SummaryEvery)
+		}
+		logf(fmt.Sprintf("[планировщик] интервал %s, длительность %s, %s, пара %s/%s",
+			cfg.Interval, cfg.Duration, summaryPlan, cfg.Base, cfg.Quote))
 	} else {
 		logf(fmt.Sprintf("[планировщик] интервал %s, запусков %s, отчёт каждые %d, пара %s/%s",
 			cfg.Interval, runLimit(cfg.Runs), cfg.ReportEvery, cfg.Base, cfg.Quote))
 	}
+	if cfg.Delay > 0 {
+		logf(fmt.Sprintf("[планировщик] старт через %s", cfg.Delay))
+	}
+	if err := wait(ctx, cfg.Delay); err != nil {
+		return err
+	}
+	started := time.Now().UTC()
+	lastReport := started
 
 	// В режиме Duration число запусков считается заранее: 600 с / 10 с = 60.
 	// Паузу отсчитываем от общего старта, а не от конца предыдущего вызова.
@@ -147,7 +161,7 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 			progress(attempts, cfg.Runs), tick.Base, tick.Quote, tick.Rate, total))
 
 		if cfg.Duration > 0 {
-			if time.Since(lastReport) >= cfg.SummaryEvery {
+			if cfg.SummaryEvery > 0 && time.Since(lastReport) >= cfg.SummaryEvery {
 				if err := report(ctx, caller, cfg, started, success, logf, &summaryWG); err != nil {
 					return err
 				}

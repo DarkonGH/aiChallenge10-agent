@@ -17,6 +17,27 @@ func tickAt(at time.Time, quote string, rate float64) Tick {
 	}
 }
 
+func TestDefaultStorePath(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("FOREX_STORE", "")
+	want := filepath.Join(dataHome, "goagent", "forex", "forex.jsonl")
+	if got := DefaultStorePath(); got != want {
+		t.Fatalf("DefaultStorePath = %q, want %q", got, want)
+	}
+
+	explicit := filepath.Join(t.TempDir(), "custom.jsonl")
+	t.Setenv("FOREX_STORE", explicit)
+	if got := DefaultStorePath(); got != explicit {
+		t.Fatalf("DefaultStorePath с FOREX_STORE = %q, want %q", got, explicit)
+	}
+
+	t.Setenv("FOREX_STORE", "   ")
+	if got := DefaultStorePath(); got != want {
+		t.Fatalf("DefaultStorePath с пустым FOREX_STORE = %q, want %q", got, want)
+	}
+}
+
 func TestStoreAppendReadPeriod(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "forex.jsonl")
 	store, err := NewStore(path)

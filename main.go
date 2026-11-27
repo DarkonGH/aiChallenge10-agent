@@ -21,6 +21,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/workspace"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,11 +32,15 @@ import (
 	"time"
 )
 
+// appName is the user-facing binary and prompt name.
+const appName = "goagent"
+
 // app wires the CLI, the agent and the session together.
 type app struct {
 	client       *llm.ChatClient
 	tools        *tools.ToolRegistry
 	dataDir      string
+	workDir      string
 	system       string
 	budget       compact.Budget
 	maxSteps     int
@@ -358,14 +363,15 @@ func main() {
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
 	dataFlag := flag.String("data", "", "каталог сессий")
+	workdirFlag := flag.String("workdir", "", "рабочий каталог модели (по умолчанию AGENT_WORK_DIR или ~/goagent-work)")
 	tasksFlag := flag.String("tasks", "tasks.txt", "список загадок для find_riddle")
 	maxSteps := flag.Int("max-steps", 8, "максимум шагов с инструментами на один запрос")
-	maxPrompt := flag.Int("max-prompt-tokens", 6000, "бюджет токенов промпта")
+	maxPrompt := flag.Int("max-prompt-tokens", 10000, "бюджет токенов промпта")
 	reserve := flag.Int("reserve-output", 1024, "токены, зарезервированные под ответ")
 	minTail := flag.Int("min-tail-tokens", 1200, "сколько свежей истории держать дословно")
 	temp := flag.Float64("temperature", 0.2, "температура сэмплирования")
 	maxTokens := flag.Int("max-tokens", 4096, "лимит токенов ответа (включая рассуждения reasoning-моделей)")
-	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
+	maxToolChars := flag.Int("max-tool-chars", 4000, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
 	noMemory := flag.Bool("no-memory", false, "не обновлять слоистую память (история и /memory остаются)")
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
@@ -507,6 +513,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
 	}
 
+	// The model gets one sandbox directory, outside the source tree. MCP
+	// servers receive its subpaths through the environment, so filesystem and
+	// pipeline tools cannot reach the rest of the disk.
+	workRoot, err := workspace.ResolveRoot(*workdirFlag)
+	if err != nil {
+		fatalf("workdir: %v", err)
+	}
+	if err := workspace.EnsureLayout(workRoot); err != nil {
+		fatalf("workdir: %v", err)
+	}
+	os.Setenv("AGENT_WORK_DIR", workRoot)
+	os.Setenv("MCP_FS_ROOT", workRoot)
+	os.Setenv("PIPELINE_SEARCH_ROOT", workRoot)
+	os.Setenv("PIPELINE_OUT_DIR", filepath.Join(workRoot, "reports"))
+	fmt.Printf("рабочий каталог: %s\n", workRoot)
+
 	// MCP is discovered and connected after the offline branches: listing
 	// sessions or printing a log must not spawn external processes. A missing
 	// config simply means "local tools only"; an explicit broken config is an
@@ -602,6 +624,7 @@ func main() {
 		client:       client,
 		tools:        tools.NewToolRegistry(tasks),
 		dataDir:      dataDir,
+		workDir:      workRoot,
 		system:       system,
 		budget:       compact.Budget{MaxPromptTokens: *maxPrompt, ReserveOutput: *reserve, MinTailTokens: *minTail},
 		maxSteps:     *maxSteps,
@@ -636,11 +659,14 @@ func main() {
 		a.tools.Add(&tools.Tool{
 			Name: "run_forex_schedule",
 			Description: "Запускает проверку курса по расписанию: каждые interval_seconds " +
-				"получает курс через MCP forex и сохраняет его, каждые summary_every_seconds " +
-				"строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку. " +
+				"получает курс через MCP forex и сохраняет его. Если задан summary_every_seconds, " +
+				"дополнительно строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку; " +
+				"без этого параметра (или 0) текстовых сводок нет — только финальный числовой отчёт. " +
 				"Работает duration_seconds и блокирует диалог до завершения. " +
+				"delay_seconds откладывает первый запуск, если просят подождать. " +
 				"Используй этот инструмент, когда пользователь просит запустить проверку " +
-				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария.",
+				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария. " +
+				"Не заполняй summary_every_seconds, если пользователь не просил сводку.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -653,6 +679,11 @@ func main() {
 						"description": "Интервал между проверками в секундах, по умолчанию 5",
 						"minimum":     1,
 					},
+					"delay_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Подождать перед первым запуском, секунд; 0 — сразу",
+						"minimum":     0,
+					},
 					"duration_seconds": map[string]any{
 						"type":        "integer",
 						"description": "Сколько секунд работать, по умолчанию 120; верхнего предела нет, остановить можно Ctrl-C",
@@ -660,8 +691,8 @@ func main() {
 					},
 					"summary_every_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Как часто выводить сводку в секундах, по умолчанию 60",
-						"minimum":     10,
+						"description": "0 или не указано — без текстовых сводок; N — отчёт и сводка каждые N секунд",
+						"minimum":     0,
 					},
 				},
 				"additionalProperties": false,
@@ -669,41 +700,53 @@ func main() {
 			Run: a.runForexSchedule,
 		})
 	}
+	// Day 19: the three pipeline tools are exposed as ordinary MCP tools.
+	// There is deliberately no local run_pipeline macro: the model must build
+	// the chain itself, passing search.items into summarize and
+	// summarize.summary into save_to_file.
 	// Универсальный планировщик намеренно ограничен безопасными инструментами:
 	// арифметикой и двумя read-only источниками курсов. Он не даёт модели
 	// запускать в фоне произвольный MCP-инструмент.
 	a.tools.Add(&tools.Tool{
 		Name: "run_tool_schedule",
 		Description: "Повторяет один разрешённый инструмент по расписанию и возвращает " +
-			"все успешные результаты. Разрешены: calc, mcp_rates_currency_rate " +
-			"(курс ЦБ РФ) и mcp_forex_fetch_fx (рыночный курс USD/RUB). " +
-			"Для сохранения каждого замера forex и текстовой сводки используй " +
-			"run_forex_schedule. Блокирует диалог до завершения.",
+			"все успешные результаты. Используй только для повторяющихся действий; " +
+			"для одного вызова через N секунд или разовой сборки отчёта используй " +
+			"run_tool_once. Разрешены: calc, mcp_rates_currency_rate " +
+			"(курс ЦБ РФ), mcp_forex_fetch_fx (рыночный курс), mcp_forex_read_period " +
+			"(summary:true даёт агрегат по журналу) и mcp_forex_list_periods (серии журнала). " +
+			"delay_seconds откладывает первый запуск. Для сохранения каждого замера forex " +
+			"и текстовой сводки используй run_forex_schedule. Блокирует диалог до завершения.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"tool": map[string]any{
 					"type":        "string",
 					"description": "Какой инструмент вызывать по расписанию",
-					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx"},
+					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx", "mcp_forex_read_period", "mcp_forex_list_periods"},
 				},
 				"args": map[string]any{
 					"type":        "object",
-					"description": "Аргументы инструмента: для calc — {\"expr\":\"...\"}, для rates — {\"currency\":\"USD\",\"date\":\"20.11.2026\"}, для forex — {\"base\":\"USD\",\"quote\":\"RUB\"}",
+					"description": "Аргументы инструмента: для calc — {\"expr\":\"...\"}, для rates — {\"currency\":\"USD\",\"date\":\"20.11.2026\"}, для forex — {\"base\":\"USD\",\"quote\":\"RUB\"}, для read_period — {\"from\":\"...\",\"to\":\"...\",\"quote\":\"RUB\",\"summary\":true}",
 				},
 				"interval_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Интервал между вызовами в секундах, по умолчанию 5",
+					"description": "Интервал между повторными вызовами, секунд; только для повторяющегося сценария",
 					"minimum":     1,
+				},
+				"delay_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Подождать перед первым запуском, секунд; 0 — сразу",
+					"minimum":     0,
 				},
 				"duration_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Сколько секунд работать, по умолчанию 120; верхнего предела нет, остановить можно Ctrl-C",
+					"description": "Сколько секунд повторять вызовы; только для повторяющегося сценария, верхнего предела нет",
 					"minimum":     10,
 				},
 				"report_every_seconds": map[string]any{
 					"type":        "integer",
-					"description": "Как часто печатать промежуточный отчёт в секундах, по умолчанию 60",
+					"description": "Как часто печатать промежуточный отчёт, секунд; только для повторяющегося сценария",
 					"minimum":     10,
 				},
 			},
@@ -711,6 +754,39 @@ func main() {
 			"additionalProperties": false,
 		},
 		Run: a.runToolSchedule,
+	})
+	// One-shot path for «сделай это через 30 секунд» and «собери отчёт один
+	// раз». Without it the model used run_tool_schedule with a fake calc timer
+	// or filled interval/duration/report that the user never asked for.
+	a.tools.Add(&tools.Tool{
+		Name: "run_tool_once",
+		Description: "Выполняет один разрешённый инструмент один раз, при необходимости " +
+			"после delay_seconds. Используй для просьб «через N секунд», «один раз», " +
+			"«собери отчёт сейчас/через N секунд». Для повторяющихся вызовов используй " +
+			"run_tool_schedule. Разрешены: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, " +
+			"mcp_forex_read_period (summary:true) и mcp_forex_list_periods.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tool": map[string]any{
+					"type":        "string",
+					"description": "Какой инструмент вызвать один раз",
+					"enum":        []string{"calc", "mcp_rates_currency_rate", "mcp_forex_fetch_fx", "mcp_forex_read_period", "mcp_forex_list_periods"},
+				},
+				"args": map[string]any{
+					"type":        "object",
+					"description": "Аргументы инструмента: для read_period — {\"from\":\"...\",\"to\":\"...\",\"quote\":\"RUB\",\"summary\":true}",
+				},
+				"delay_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Подождать перед единственным вызовом, секунд; 0 — сразу",
+					"minimum":     0,
+				},
+			},
+			"required":             []string{"tool"},
+			"additionalProperties": false,
+		},
+		Run: a.runToolOnce,
 	})
 	// The task machine is per-session, so the registry holds a provider, not
 	// a pointer: the task_transition tool always acts on the current session.
@@ -886,7 +962,7 @@ func (a *app) repl() {
 	a.onboardProfile(ed)
 
 	for {
-		line, err := ed.Read("agent> ")
+		line, err := ed.Read(appName + "> ")
 		if err != nil {
 			break
 		}
@@ -1573,7 +1649,7 @@ func (a *app) runScript(path string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fmt.Printf("agent> %s\n", line)
+		fmt.Printf("%s> %s\n", appName, line)
 		// Lines starting with "/" are chat commands, not prompts. Handling them
 		// here is what makes a demo reproducible: /memory and /memory clear can
 		// run between the dialogue turns instead of being typed by hand.
@@ -1717,7 +1793,7 @@ const helpText = `Команды:
   /recall <текст>  поиск по архиву
 
 Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
-  ./agent -print-session <id|last>
+  ./goagent -print-session <id|last>
 
 Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
 Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,
@@ -1760,6 +1836,86 @@ var scheduledTools = map[string]scheduledTool{
 	"calc":                    {},
 	"mcp_rates_currency_rate": {Server: "rates", Remote: "currency_rate"},
 	"mcp_forex_fetch_fx":      {Server: "forex", Remote: "fetch_fx"},
+	"mcp_forex_read_period":   {Server: "forex", Remote: "read_period"},
+	"mcp_forex_list_periods":  {Server: "forex", Remote: "list_periods"},
+}
+
+// runToolOnce is the one-shot wrapper: «через 30 секунд», «собери отчёт один
+// раз». It intentionally has no interval/duration/report — those belong to
+// run_tool_schedule, not to a single delayed call.
+func (a *app) runToolOnce(raw json.RawMessage) (string, error) {
+	args := struct {
+		Tool         string          `json:"tool"`
+		Args         json.RawMessage `json:"args"`
+		DelaySeconds int             `json:"delay_seconds"`
+	}{}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("run_tool_once: %w", err)
+		}
+	}
+	args.Tool = strings.TrimSpace(args.Tool)
+	if args.Tool == "" {
+		return "", fmt.Errorf("run_tool_once: tool обязателен")
+	}
+	meta, ok := scheduledTools[args.Tool]
+	if !ok {
+		return "", fmt.Errorf("run_tool_once: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, mcp_forex_read_period, mcp_forex_list_periods", args.Tool)
+	}
+	delay, err := optionalSecondsDuration(args.DelaySeconds)
+	if err != nil {
+		return "", fmt.Errorf("run_tool_once: delay_seconds: %w", err)
+	}
+	callArgs := args.Args
+	if len(callArgs) == 0 || string(callArgs) == "null" {
+		callArgs = json.RawMessage("{}")
+	}
+	var argObject map[string]any
+	if err := json.Unmarshal(callArgs, &argObject); err != nil {
+		return "", fmt.Errorf("run_tool_once: args должен быть JSON-объектом: %w", err)
+	}
+	if meta.Server == "" && args.Tool != "calc" {
+		return "", fmt.Errorf("run_tool_once: локальный инструмент %q не поддержан", args.Tool)
+	}
+	if meta.Server != "" {
+		if a.mcpClient == nil {
+			return "", fmt.Errorf("run_tool_once: MCP не подключён")
+		}
+		if !a.mcpClient.Has(meta.Server) {
+			return "", fmt.Errorf("run_tool_once: MCP-сервер %s не подключён; проверьте mcp.json", meta.Server)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(a.turnContext())
+	defer cancel()
+
+	res, err := scheduler.RunOnce(ctx, a, scheduler.ToolConfig{
+		Tool:  args.Tool,
+		Args:  callArgs,
+		Delay: delay,
+		Log:   a.ui.trace,
+	})
+	if err != nil {
+		return "", fmt.Errorf("run_tool_once: %w", err)
+	}
+
+	out, err := json.Marshal(struct {
+		Tool         string    `json:"tool"`
+		Run          int       `json:"run"`
+		DelaySeconds int       `json:"delay_seconds"`
+		At           time.Time `json:"at"`
+		Output       string    `json:"output"`
+	}{
+		Tool:         args.Tool,
+		Run:          res.Run,
+		DelaySeconds: args.DelaySeconds,
+		At:           res.At,
+		Output:       res.Output,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // runToolSchedule is the generic, deliberately narrow scheduler: the model may
@@ -1771,6 +1927,7 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 		Tool        string          `json:"tool"`
 		Args        json.RawMessage `json:"args"`
 		IntervalSec int             `json:"interval_seconds"`
+		DelaySec    int             `json:"delay_seconds"`
 		DurationSec int             `json:"duration_seconds"`
 		ReportEvery int             `json:"report_every_seconds"`
 	}{
@@ -1789,10 +1946,14 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 	}
 	meta, ok := scheduledTools[args.Tool]
 	if !ok {
-		return "", fmt.Errorf("run_tool_schedule: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx", args.Tool)
+		return "", fmt.Errorf("run_tool_schedule: инструмент %q не разрешён; доступны: calc, mcp_rates_currency_rate, mcp_forex_fetch_fx, mcp_forex_read_period, mcp_forex_list_periods", args.Tool)
 	}
 	if args.IntervalSec < 1 {
 		return "", fmt.Errorf("run_tool_schedule: interval_seconds должен быть не меньше 1")
+	}
+	delay, err := optionalSecondsDuration(args.DelaySec)
+	if err != nil {
+		return "", fmt.Errorf("run_tool_schedule: delay_seconds: %w", err)
 	}
 	if args.DurationSec < 10 {
 		return "", fmt.Errorf("run_tool_schedule: duration_seconds должен быть не меньше 10")
@@ -1837,6 +1998,7 @@ func (a *app) runToolSchedule(raw json.RawMessage) (string, error) {
 		Tool:        args.Tool,
 		Args:        callArgs,
 		Interval:    time.Duration(args.IntervalSec) * time.Second,
+		Delay:       delay,
 		Duration:    duration,
 		ReportEvery: time.Duration(args.ReportEvery) * time.Second,
 		Log:         a.ui.trace,
@@ -1893,13 +2055,14 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	args := struct {
 		Pair               string `json:"pair"`
 		IntervalSeconds    int    `json:"interval_seconds"`
+		DelaySeconds       int    `json:"delay_seconds"`
 		DurationSeconds    int    `json:"duration_seconds"`
 		SummaryEverySecond int    `json:"summary_every_seconds"`
 	}{
 		Pair:               "USD/RUB",
 		IntervalSeconds:    5,
 		DurationSeconds:    120,
-		SummaryEverySecond: 60,
+		SummaryEverySecond: 0,
 	}
 	if len(raw) > 0 && string(raw) != "null" {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -1913,6 +2076,10 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	if args.IntervalSeconds < 1 {
 		return "", fmt.Errorf("run_forex_schedule: interval_seconds должен быть не меньше 1")
 	}
+	delay, err := optionalSecondsDuration(args.DelaySeconds)
+	if err != nil {
+		return "", fmt.Errorf("run_forex_schedule: delay_seconds: %w", err)
+	}
 	if args.DurationSeconds < 10 {
 		return "", fmt.Errorf("run_forex_schedule: duration_seconds должен быть не меньше 10")
 	}
@@ -1920,8 +2087,14 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("run_forex_schedule: duration_seconds: %w", err)
 	}
-	if args.SummaryEverySecond < 10 || args.SummaryEverySecond > args.DurationSeconds {
-		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть от 10 до duration_seconds")
+	if args.SummaryEverySecond < 0 {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds не может быть отрицательным")
+	}
+	if args.SummaryEverySecond > 0 && args.SummaryEverySecond < 10 {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть 0 или не меньше 10")
+	}
+	if args.SummaryEverySecond > args.DurationSeconds {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds не может быть больше duration_seconds")
 	}
 	if a.mcpClient == nil {
 		return "", fmt.Errorf("run_forex_schedule: MCP не подключён")
@@ -1932,7 +2105,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 
 	var last forex.Report
 	runs := 0
-	var summaries []string
+	summaries := make([]string, 0)
 	var summaryMu sync.Mutex
 	ctx, cancel := context.WithCancel(a.turnContext())
 	defer cancel()
@@ -1942,13 +2115,22 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 		Base:         base,
 		Quote:        quote,
 		Interval:     time.Duration(args.IntervalSeconds) * time.Second,
+		Delay:        delay,
 		Duration:     duration,
 		SummaryEvery: time.Duration(args.SummaryEverySecond) * time.Second,
 		// Runs не ограничивает цикл в режиме Duration, но даёт прогрессу
 		// ожидаемый знаменатель: [запуск 1/24], а не [запуск 1].
 		Runs: args.DurationSeconds / args.IntervalSeconds,
 		Log:  a.ui.trace,
-		Summarize: func(ctx context.Context, rep forex.Report) (string, error) {
+		OnReport: func(success int, rep forex.Report) {
+			runs = success
+			last = rep
+		},
+	}
+	// Summarize is opt-in: a schedule without an explicit summary request
+	// must not spend a local-model call and must not print [сводка] lines.
+	if args.SummaryEverySecond > 0 {
+		cfg.Summarize = func(ctx context.Context, rep forex.Report) (string, error) {
 			text, err := a.summarizeForexReport(ctx, rep)
 			if err == nil {
 				summaryMu.Lock()
@@ -1956,11 +2138,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 				summaryMu.Unlock()
 			}
 			return text, err
-		},
-		OnReport: func(success int, rep forex.Report) {
-			runs = success
-			last = rep
-		},
+		}
 	}
 	if err := scheduler.Run(ctx, a.mcpClient, cfg); err != nil {
 		return "", fmt.Errorf("run_forex_schedule: %w", err)
@@ -2041,6 +2219,18 @@ func secondsDuration(n int) (time.Duration, error) {
 		return 0, fmt.Errorf("слишком большая длительность")
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+// optionalSecondsDuration разрешает 0 (без задержки) и проверяет верхнюю
+// границу time.Duration для остальных значений.
+func optionalSecondsDuration(n int) (time.Duration, error) {
+	if n < 0 {
+		return 0, fmt.Errorf("не может быть отрицательной")
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	return secondsDuration(n)
 }
 
 func parsePair(value string) (string, string, error) {

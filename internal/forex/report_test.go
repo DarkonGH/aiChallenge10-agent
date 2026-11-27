@@ -50,3 +50,49 @@ func TestBuildReportRejectsMixedPairs(t *testing.T) {
 		t.Fatal("ожидалась ошибка для смешанных пар")
 	}
 }
+
+func TestBuildReportSplitsRuns(t *testing.T) {
+	t0 := time.Date(2026, 11, 26, 18, 41, 0, 0, time.UTC)
+	report, err := BuildReport([]Tick{
+		tickAt(t0, "RUB", 82.1),
+		tickAt(t0.Add(10*time.Second), "RUB", 82.2),
+		tickAt(t0.Add(120*time.Second), "RUB", 82.3),
+	})
+	if err != nil {
+		t.Fatalf("BuildReport: %v", err)
+	}
+	if len(report.Runs) != 2 {
+		t.Fatalf("runs = %+v", report.Runs)
+	}
+	if report.Runs[0].Count != 2 || report.Runs[1].Count != 1 {
+		t.Fatalf("runs counts = %+v", report.Runs)
+	}
+	if report.Runs[0].From != t0.Format(time.RFC3339Nano) {
+		t.Fatalf("from = %q", report.Runs[0].From)
+	}
+}
+
+func TestBuildRunsUsesGap(t *testing.T) {
+	t0 := time.Date(2026, 11, 26, 18, 41, 0, 0, time.UTC)
+	runs, err := BuildRuns([]Tick{
+		tickAt(t0, "RUB", 82.1),
+		tickAt(t0.Add(10*time.Second), "RUB", 82.2),
+		tickAt(t0.Add(45*time.Second), "RUB", 82.3),
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("BuildRuns: %v", err)
+	}
+	if len(runs) != 2 || runs[0].Count != 2 || runs[1].Count != 1 {
+		t.Fatalf("runs = %+v", runs)
+	}
+}
+
+func TestBuildRunsEmpty(t *testing.T) {
+	runs, err := BuildRuns(nil, time.Minute)
+	if err != nil {
+		t.Fatalf("BuildRuns: %v", err)
+	}
+	if runs != nil {
+		t.Fatalf("runs = %+v", runs)
+	}
+}
