@@ -51,7 +51,7 @@ func TestResolveRejectsEscapes(t *testing.T) {
 	if _, err := Resolve(root, "notes/a.md"); err != nil {
 		t.Fatalf("обычный путь: %v", err)
 	}
-	for _, rel := range []string{"../escape", "/etc/passwd", "a/../../escape"} {
+	for _, rel := range []string{"../escape", "/etc/passwd", "a/../../escape", "~/secret", "~user/secret"} {
 		if _, err := Resolve(root, rel); err == nil {
 			t.Fatalf("ожидалась ошибка для %q", rel)
 		}

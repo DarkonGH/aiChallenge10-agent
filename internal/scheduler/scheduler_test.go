@@ -194,6 +194,34 @@ func TestRunDurationUsesFixedStart(t *testing.T) {
 	}
 }
 
+func TestRunDurationWithoutSummary(t *testing.T) {
+	caller := &fakeCaller{}
+	var logs []string
+	err := Run(context.Background(), caller, Config{
+		Server:       "forex",
+		Base:         "USD",
+		Quote:        "RUB",
+		Interval:     5 * time.Millisecond,
+		Duration:     20 * time.Millisecond,
+		SummaryEvery: 0,
+		Runs:         4,
+		Log:          func(s string) { logs = append(logs, s) },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "без промежуточных сводок") {
+		t.Fatalf("в логе нет режима без сводок:\n%s", joined)
+	}
+	if !strings.Contains(joined, "[отчёт после 4] USD/RUB: count=4") {
+		t.Fatalf("нет финального числового отчёта:\n%s", joined)
+	}
+	if strings.Contains(joined, "[сводка]") {
+		t.Fatalf("сводка напечатана без запроса:\n%s", joined)
+	}
+}
+
 func TestRunValidatesConfig(t *testing.T) {
 	if err := Run(context.Background(), &fakeCaller{}, Config{}); err == nil {
 		t.Fatal("ожидалась ошибка для пустого интервала")

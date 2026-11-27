@@ -60,8 +60,8 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 	if cfg.Duration == 0 && cfg.ReportEvery <= 0 {
 		return fmt.Errorf("планировщик: ReportEvery должен быть больше нуля")
 	}
-	if cfg.Duration > 0 && cfg.SummaryEvery <= 0 {
-		return fmt.Errorf("планировщик: SummaryEvery должен быть больше нуля")
+	if cfg.Duration > 0 && cfg.SummaryEvery < 0 {
+		return fmt.Errorf("планировщик: SummaryEvery не может быть отрицательным")
 	}
 	if cfg.Duration == 0 && cfg.Runs < 0 {
 		return fmt.Errorf("планировщик: Runs не может быть отрицательным")
@@ -81,8 +81,12 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 	}
 
 	if cfg.Duration > 0 {
-		logf(fmt.Sprintf("[планировщик] интервал %s, длительность %s, сводка каждые %s, пара %s/%s",
-			cfg.Interval, cfg.Duration, cfg.SummaryEvery, cfg.Base, cfg.Quote))
+		summaryPlan := "без промежуточных сводок"
+		if cfg.SummaryEvery > 0 {
+			summaryPlan = fmt.Sprintf("сводка каждые %s", cfg.SummaryEvery)
+		}
+		logf(fmt.Sprintf("[планировщик] интервал %s, длительность %s, %s, пара %s/%s",
+			cfg.Interval, cfg.Duration, summaryPlan, cfg.Base, cfg.Quote))
 	} else {
 		logf(fmt.Sprintf("[планировщик] интервал %s, запусков %s, отчёт каждые %d, пара %s/%s",
 			cfg.Interval, runLimit(cfg.Runs), cfg.ReportEvery, cfg.Base, cfg.Quote))
@@ -157,7 +161,7 @@ func Run(ctx context.Context, caller Caller, cfg Config) error {
 			progress(attempts, cfg.Runs), tick.Base, tick.Quote, tick.Rate, total))
 
 		if cfg.Duration > 0 {
-			if time.Since(lastReport) >= cfg.SummaryEvery {
+			if cfg.SummaryEvery > 0 && time.Since(lastReport) >= cfg.SummaryEvery {
 				if err := report(ctx, caller, cfg, started, success, logf, &summaryWG); err != nil {
 					return err
 				}

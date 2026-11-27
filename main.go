@@ -659,12 +659,14 @@ func main() {
 		a.tools.Add(&tools.Tool{
 			Name: "run_forex_schedule",
 			Description: "Запускает проверку курса по расписанию: каждые interval_seconds " +
-				"получает курс через MCP forex и сохраняет его, каждые summary_every_seconds " +
-				"строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку. " +
+				"получает курс через MCP forex и сохраняет его. Если задан summary_every_seconds, " +
+				"дополнительно строит отчёт по ВСЕМ замерам с начала и добавляет текстовую сводку; " +
+				"без этого параметра (или 0) текстовых сводок нет — только финальный числовой отчёт. " +
 				"Работает duration_seconds и блокирует диалог до завершения. " +
 				"delay_seconds откладывает первый запуск, если просят подождать. " +
 				"Используй этот инструмент, когда пользователь просит запустить проверку " +
-				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария.",
+				"курсов по расписанию; не вызывай fetch_fx/save_tick вручную для такого сценария. " +
+				"Не заполняй summary_every_seconds, если пользователь не просил сводку.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -689,8 +691,8 @@ func main() {
 					},
 					"summary_every_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Как часто выводить сводку в секундах, по умолчанию 60",
-						"minimum":     10,
+						"description": "0 или не указано — без текстовых сводок; N — отчёт и сводка каждые N секунд",
+						"minimum":     0,
 					},
 				},
 				"additionalProperties": false,
@@ -2060,7 +2062,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 		Pair:               "USD/RUB",
 		IntervalSeconds:    5,
 		DurationSeconds:    120,
-		SummaryEverySecond: 60,
+		SummaryEverySecond: 0,
 	}
 	if len(raw) > 0 && string(raw) != "null" {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -2085,8 +2087,14 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("run_forex_schedule: duration_seconds: %w", err)
 	}
-	if args.SummaryEverySecond < 10 || args.SummaryEverySecond > args.DurationSeconds {
-		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть от 10 до duration_seconds")
+	if args.SummaryEverySecond < 0 {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds не может быть отрицательным")
+	}
+	if args.SummaryEverySecond > 0 && args.SummaryEverySecond < 10 {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds должен быть 0 или не меньше 10")
+	}
+	if args.SummaryEverySecond > args.DurationSeconds {
+		return "", fmt.Errorf("run_forex_schedule: summary_every_seconds не может быть больше duration_seconds")
 	}
 	if a.mcpClient == nil {
 		return "", fmt.Errorf("run_forex_schedule: MCP не подключён")
@@ -2097,7 +2105,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 
 	var last forex.Report
 	runs := 0
-	var summaries []string
+	summaries := make([]string, 0)
 	var summaryMu sync.Mutex
 	ctx, cancel := context.WithCancel(a.turnContext())
 	defer cancel()
@@ -2114,7 +2122,15 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 		// ожидаемый знаменатель: [запуск 1/24], а не [запуск 1].
 		Runs: args.DurationSeconds / args.IntervalSeconds,
 		Log:  a.ui.trace,
-		Summarize: func(ctx context.Context, rep forex.Report) (string, error) {
+		OnReport: func(success int, rep forex.Report) {
+			runs = success
+			last = rep
+		},
+	}
+	// Summarize is opt-in: a schedule without an explicit summary request
+	// must not spend a local-model call and must not print [сводка] lines.
+	if args.SummaryEverySecond > 0 {
+		cfg.Summarize = func(ctx context.Context, rep forex.Report) (string, error) {
 			text, err := a.summarizeForexReport(ctx, rep)
 			if err == nil {
 				summaryMu.Lock()
@@ -2122,11 +2138,7 @@ func (a *app) runForexSchedule(raw json.RawMessage) (string, error) {
 				summaryMu.Unlock()
 			}
 			return text, err
-		},
-		OnReport: func(success int, rep forex.Report) {
-			runs = success
-			last = rep
-		},
+		}
 	}
 	if err := scheduler.Run(ctx, a.mcpClient, cfg); err != nil {
 		return "", fmt.Errorf("run_forex_schedule: %w", err)

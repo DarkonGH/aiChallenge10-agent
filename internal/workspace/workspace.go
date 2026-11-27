@@ -78,6 +78,9 @@ func Resolve(root, rel string) (string, error) {
 		return "", fmt.Errorf("корень %q: %w", root, err)
 	}
 	rel = strings.TrimSpace(rel)
+	if strings.HasPrefix(rel, "~") {
+		return "", fmt.Errorf("путь %q начинается с ~; укажите путь относительно рабочего каталога", rel)
+	}
 	if rel == "" || rel == "." {
 		return rootAbs, nil
 	}
