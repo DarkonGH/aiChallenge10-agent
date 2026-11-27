@@ -27,7 +27,7 @@ rm -rf "$DATA"
 mkdir -p "$DATA"
 cp testdata/day14-invariants.json "$DATA/invariants.json"
 
-./agent \
+./goagent \
   -data "$DATA" \
   -session demo \
   -model "$MODEL" \

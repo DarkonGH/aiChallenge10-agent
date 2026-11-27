@@ -30,7 +30,7 @@ questions=$(grep -v '^#' testdata/day11-questions.txt | sed '/^[[:space:]]*$/d')
 } > "$script"
 
 rm -rf "$data"
-./agent -data "$data" -session cascade -strategy window -window 2 \
+./goagent -data "$data" -session cascade -strategy window -window 2 \
   -model "$model" -summary-model "$model" -no-reasoning -script "$script"
 
 python3 scripts/check_memory.py --log "$data/cascade/session.jsonl"

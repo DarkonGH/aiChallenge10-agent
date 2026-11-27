@@ -39,6 +39,8 @@ type Rule struct {
 	PathUnder string `json:"path_under,omitempty"`
 	// URLHosts разрешает только эти домены (точное совпадение или поддомен).
 	URLHosts []string `json:"url_hosts,omitempty"`
+	// DenyNames запрещает читать файлы с такими именами (glob, без учёта регистра).
+	DenyNames []string `json:"deny_names,omitempty"`
 }
 
 // FindConfig ищет mcp.json в порядке приоритета. Пустая строка и nil
@@ -132,6 +134,9 @@ func Load(path string) (Config, error) {
 			rule.PathUnder = expand(rule.PathUnder)
 			for j := range rule.URLHosts {
 				rule.URLHosts[j] = strings.ToLower(strings.TrimSpace(rule.URLHosts[j]))
+			}
+			for j := range rule.DenyNames {
+				rule.DenyNames[j] = strings.ToLower(strings.TrimSpace(rule.DenyNames[j]))
 			}
 			sc.Rules[tool] = rule
 		}

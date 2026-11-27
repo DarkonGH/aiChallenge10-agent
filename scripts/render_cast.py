@@ -180,7 +180,7 @@ def video_times(snaps, fast=0.05, cap=0.45, pause=1.8, read=0.14, read_max=3.0, 
         # командой на экране осел крупный блок — держим его отдельно.
         burst = added if dt > 0.5 else prev_burst + added
         last = [l for l in text.splitlines() if l.strip()]
-        if prev_burst >= 6 and last and last[-1].startswith("agent> "):
+        if prev_burst >= 6 and last and last[-1].startswith("goagent> "):
             step += settle
         times.append(times[-1] + step)
         prev_t, prev_text, prev_burst = t, text, burst

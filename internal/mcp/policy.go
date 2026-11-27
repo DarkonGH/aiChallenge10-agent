@@ -50,6 +50,22 @@ func CheckArgs(sc ServerConfig, tool string, raw json.RawMessage) error {
 			return err
 		}
 	}
+
+	if len(rule.DenyNames) > 0 {
+		value, _ := args["path"].(string)
+		if value == "" {
+			return fmt.Errorf("инструмент %s: нет path для проверки имени", tool)
+		}
+		base := strings.ToLower(filepath.Base(value))
+		for _, pattern := range rule.DenyNames {
+			if pattern == "" {
+				continue
+			}
+			if matched, _ := filepath.Match(pattern, base); matched {
+				return fmt.Errorf("файл %q запрещён: похоже на секрет", value)
+			}
+		}
+	}
 	return nil
 }
 

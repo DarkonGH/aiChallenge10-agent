@@ -21,6 +21,7 @@ import (
 	"github.com/DarkonGH/aiChallenge10-agent/internal/task"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tokens"
 	"github.com/DarkonGH/aiChallenge10-agent/internal/tools"
+	"github.com/DarkonGH/aiChallenge10-agent/internal/workspace"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,11 +32,15 @@ import (
 	"time"
 )
 
+// appName is the user-facing binary and prompt name.
+const appName = "goagent"
+
 // app wires the CLI, the agent and the session together.
 type app struct {
 	client       *llm.ChatClient
 	tools        *tools.ToolRegistry
 	dataDir      string
+	workDir      string
 	system       string
 	budget       compact.Budget
 	maxSteps     int
@@ -358,14 +363,15 @@ func main() {
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
 	dataFlag := flag.String("data", "", "каталог сессий")
+	workdirFlag := flag.String("workdir", "", "рабочий каталог модели (по умолчанию AGENT_WORK_DIR или ~/goagent-work)")
 	tasksFlag := flag.String("tasks", "tasks.txt", "список загадок для find_riddle")
 	maxSteps := flag.Int("max-steps", 8, "максимум шагов с инструментами на один запрос")
-	maxPrompt := flag.Int("max-prompt-tokens", 6000, "бюджет токенов промпта")
+	maxPrompt := flag.Int("max-prompt-tokens", 10000, "бюджет токенов промпта")
 	reserve := flag.Int("reserve-output", 1024, "токены, зарезервированные под ответ")
 	minTail := flag.Int("min-tail-tokens", 1200, "сколько свежей истории держать дословно")
 	temp := flag.Float64("temperature", 0.2, "температура сэмплирования")
 	maxTokens := flag.Int("max-tokens", 4096, "лимит токенов ответа (включая рассуждения reasoning-моделей)")
-	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
+	maxToolChars := flag.Int("max-tool-chars", 4000, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
 	noMemory := flag.Bool("no-memory", false, "не обновлять слоистую память (история и /memory остаются)")
 	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
@@ -507,6 +513,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "предупреждение: список загадок не загружен (%v); find_riddle будет пустым\n", err)
 	}
 
+	// The model gets one sandbox directory, outside the source tree. MCP
+	// servers receive its subpaths through the environment, so filesystem and
+	// pipeline tools cannot reach the rest of the disk.
+	workRoot, err := workspace.ResolveRoot(*workdirFlag)
+	if err != nil {
+		fatalf("workdir: %v", err)
+	}
+	if err := workspace.EnsureLayout(workRoot); err != nil {
+		fatalf("workdir: %v", err)
+	}
+	os.Setenv("AGENT_WORK_DIR", workRoot)
+	os.Setenv("MCP_FS_ROOT", workRoot)
+	os.Setenv("PIPELINE_SEARCH_ROOT", workRoot)
+	os.Setenv("PIPELINE_OUT_DIR", filepath.Join(workRoot, "reports"))
+	fmt.Printf("рабочий каталог: %s\n", workRoot)
+
 	// MCP is discovered and connected after the offline branches: listing
 	// sessions or printing a log must not spawn external processes. A missing
 	// config simply means "local tools only"; an explicit broken config is an
@@ -602,6 +624,7 @@ func main() {
 		client:       client,
 		tools:        tools.NewToolRegistry(tasks),
 		dataDir:      dataDir,
+		workDir:      workRoot,
 		system:       system,
 		budget:       compact.Budget{MaxPromptTokens: *maxPrompt, ReserveOutput: *reserve, MinTailTokens: *minTail},
 		maxSteps:     *maxSteps,
@@ -675,6 +698,10 @@ func main() {
 			Run: a.runForexSchedule,
 		})
 	}
+	// Day 19: the three pipeline tools are exposed as ordinary MCP tools.
+	// There is deliberately no local run_pipeline macro: the model must build
+	// the chain itself, passing search.items into summarize and
+	// summarize.summary into save_to_file.
 	// Универсальный планировщик намеренно ограничен безопасными инструментами:
 	// арифметикой и двумя read-only источниками курсов. Он не даёт модели
 	// запускать в фоне произвольный MCP-инструмент.
@@ -933,7 +960,7 @@ func (a *app) repl() {
 	a.onboardProfile(ed)
 
 	for {
-		line, err := ed.Read("agent> ")
+		line, err := ed.Read(appName + "> ")
 		if err != nil {
 			break
 		}
@@ -1620,7 +1647,7 @@ func (a *app) runScript(path string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fmt.Printf("agent> %s\n", line)
+		fmt.Printf("%s> %s\n", appName, line)
 		// Lines starting with "/" are chat commands, not prompts. Handling them
 		// here is what makes a demo reproducible: /memory and /memory clear can
 		// run between the dialogue turns instead of being typed by hand.
@@ -1764,7 +1791,7 @@ const helpText = `Команды:
   /recall <текст>  поиск по архиву
 
 Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
-  ./agent -print-session <id|last>
+  ./goagent -print-session <id|last>
 
 Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
 Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,

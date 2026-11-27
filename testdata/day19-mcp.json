@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "approval": "allow",
+  "servers": [
+    {
+      "name": "pipeline",
+      "command": "./bin/mcp-pipeline",
+      "args": [],
+      "required": true,
+      "env": {
+        "PIPELINE_SEARCH_ROOT": "${PIPELINE_SEARCH_ROOT}",
+        "PIPELINE_OUT_DIR": "${PIPELINE_OUT_DIR}"
+      },
+      "allow": [
+        "search",
+        "summarize",
+        "save_to_file"
+      ],
+      "approval": {
+        "search": "allow",
+        "summarize": "allow",
+        "save_to_file": "allow"
+      },
+      "descriptions": {
+        "search": "Найти локальные заметки по запросу; count=0 означает, что данных нет.",
+        "summarize": "Сделать резюме по items от search; пустой items — ошибка шага 2.",
+        "save_to_file": "Сохранить готовый текст в файл внутри каталога вывода."
+      }
+    }
+  ]
+}

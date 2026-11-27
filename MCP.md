@@ -26,7 +26,8 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
   проверка намерения перед вызовом.
 - `internal/tools/tools.go` — `Tool.Source/Server/Approval`, `AddMCP`, `Meta`.
 - `internal/agent/agent.go` — `Approver` и отказ до `Execute`.
-- `cmd/mcp-cbr`, `cmd/mcp-forex`, `cmd/mcp-fetch` — свои MCP-серверы на Go SDK.
+- `cmd/mcp-cbr`, `cmd/mcp-forex`, `cmd/mcp-pipeline`, `cmd/mcp-fetch` — свои
+  MCP-серверы на Go SDK.
 - `main.go` — флаги, запуск MCP до первой сессии, `/mcp`, интерактивный апрув,
   режим планировщика.
 
@@ -62,7 +63,10 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
         "read_file": "Прочитать текстовый файл внутри разрешённого каталога"
       },
       "rules": {
-        "read_file": {"path_under": "${MCP_FS_ROOT}"},
+        "read_file": {
+          "path_under": "${MCP_FS_ROOT}",
+          "deny_names": [".env", "*.pem", "*.key", "id_rsa*", "credentials*"]
+        },
         "list_directory": {"path_under": "${MCP_FS_ROOT}"}
       }
     },
@@ -82,7 +86,9 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
 - `allow` — белый список инструментов сервера. Если пуст, регистрируются все.
 - `approval` — `allow`, `ask` или `deny`; можно задать `*`.
 - `descriptions` — необязательное перекрытие описания от сервера.
-- `rules` — проверка аргументов; сейчас `path_under` и `url_hosts`.
+- `rules` — проверка аргументов; сейчас `path_under`, `url_hosts` и
+  `deny_names`. `deny_names` — glob-список имён, которые нельзя читать
+  (`read_file`), даже если путь внутри разрешённого каталога.
   `"url_hosts": ["*"]` разрешает любой публичный хост, но не отменяет
   блокировку localhost и приватных адресов.
 - `required: false` — если сервер не поднялся, агент продолжает работу с
@@ -90,10 +96,11 @@ agent (Go) ──stdio JSON-RPC──> MCP server (Python/Node/Go)
 - `enabled: false` — не запускать сервер.
 
 `${MCP_FS_ROOT}`, `${CWD}`, `${WORKSPACE}` при отсутствии переменной
-разворачиваются в текущий каталог. Для демо:
+разворачиваются в текущий каталог. Обычный запуск сам выставляет
+`MCP_FS_ROOT` в `-workdir`:
 
 ```bash
-MCP_FS_ROOT=/tmp/day16-fs/data ./agent ...
+./goagent -workdir /tmp/day16-fs/work ...
 ```
 
 В `mcp.json` проекта кроме `fs` и `web` есть свои серверы: `rates`
@@ -174,6 +181,36 @@ JSONL-журнал). Для демо дня 18 используется отде
 MCP-инструмент; по умолчанию выключено. Каждое решение guard пишется событием
 `guard` в `session.jsonl`.
 
+## Композиция инструментов (день 19)
+
+`cmd/mcp-pipeline` — один сервер с тремя инструментами, которые образуют
+пайплайн:
+
+| Инструмент | Что делает | Ключевые аргументы |
+|---|---|---|
+| `search` | рекурсивно ищет по текстовым файлам workdir, возвращает `items` | `query`, `path`, `limit`, `empty` |
+| `summarize` | делает экстрактивное резюме по `items` | `items`, `max_sentences`, `fail` |
+| `save_to_file` | пишет текст в файл внутри каталога вывода | `path`, `content`, `format`, `fail` |
+
+Каталоги: `PIPELINE_SEARCH_ROOT` (основной процесс выставляет его в
+`-workdir`; устаревший алиас — `PIPELINE_NOTES_DIR`) и `PIPELINE_OUT_DIR`
+(по умолчанию `<workdir>/reports`, автономно —
+`~/.local/share/goagent/pipeline/reports`). `search` не выходит за
+`PIPELINE_SEARCH_ROOT`, пропускает скрытые имена, секреты и бинарники;
+`save_to_file` принимает только относительный путь, приводит его через
+`Abs`/`Rel` + `EvalSymlinks` и отклоняет выход за `PIPELINE_OUT_DIR`,
+включая `..`, абсолютные пути и symlink.
+
+Связывает шаги сама модель: она вызывает `search`, передаёт полученный
+массив `items` в `summarize`, а `summary` — в `content` для `save_to_file`.
+Локального макроса `run_pipeline` в агенте больше нет. Если `search` вернул
+`count=0`, следующий шаг не вызывается; если `summarize` вернул ошибку,
+`save_to_file` не вызывается. Это закреплено правилами 6 и 7 системного
+промпта, а не отдельным оркестратором.
+
+Флаги `empty` и `fail` — тестовые, для воспроизводимого показа сбоев. Демо —
+`scripts/day19-demo.sh`, проверка — `scripts/check_day19.py` (34 проверки).
+
 ## Фоновый вызов без модели
 
 Планировщику нужен результат инструмента как данные, а не как текст для
@@ -193,7 +230,7 @@ destructive-инструмент подставить нельзя.
 ## Дамп запроса
 
 ```bash
-./agent -dump-request /tmp/requests.ndjson ...
+./goagent -dump-request /tmp/requests.ndjson ...
 ```
 
 Каждая строка — тело одного запроса к чат-модели. В нём видны `model`,
@@ -231,6 +268,18 @@ bash scripts/day18-chat.sh
 
 Старый фоновый режим без чата — `scripts/day18-demo.sh`: шесть запусков,
 отчёты после 3-го и 6-го, `check_day18.py`.
+
+День 19 — композиция трёх инструментов на одном сервере:
+
+```bash
+bash scripts/day19-demo.sh
+```
+
+Модель сама вызывает `mcp_pipeline_search` → `mcp_pipeline_summarize` →
+`mcp_pipeline_save_to_file` и передаёт `items`/`summary`. Затем два сбоя:
+`search.empty=true` останавливает цепочку на шаге 1, `summarize.fail=true` —
+на шаге 2. `check_day19.py` проверяет порядок вызовов, передачу данных,
+отсутствие `run_pipeline`, содержимое файла и обе остановки (34 проверки).
 
 ## Если MCP-сервер завершился
 

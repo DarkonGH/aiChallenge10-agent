@@ -12,7 +12,7 @@ session.jsonl, неизбежно отличается от консоли: пр
 строки в каст. Ничего не синтезируется и не додумывается: если строки нет в
 логе, её не будет и в видео, а если есть — она будет дословно.
 
-    ./agent … -script testdata/day15-demo.txt 2>&1 | tee /tmp/day15-demo.log
+    ./goagent … -script testdata/day15-demo.txt 2>&1 | tee /tmp/day15-demo.log
     python3 scripts/log_to_cast.py /tmp/day15-demo.log /tmp/day15-demo.cast
 
 Дальше каст собирает render_cast.py с карточками из testdata/dayNN-cards.json.
@@ -60,11 +60,11 @@ def convert(in_path, out_path, line_delay=0.06, prompt_delay=0.9, blank_delay=0.
             # Приглашение в консоли отделено от предыдущего вывода пустой
             # строкой; в логе её нет, потому что prompt печатается сразу после
             # последней строки ответа.
-            if piece.startswith("agent> ") and last and last != "\n":
+            if piece.startswith("goagent> ") and last and last != "\n":
                 lead = "\n"
             out.append((round(t, 3), "o", f"{lead}{piece}\n"))
             last = f"{lead}{piece}\n"
-            if piece.startswith("agent> "):
+            if piece.startswith("goagent> "):
                 t += prompt_delay  # пользователь набирает команду
             elif piece == "":
                 t += blank_delay
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     ap.add_argument("--line-delay", type=float, default=0.06,
                     help="пауза между строками вывода, секунды")
     ap.add_argument("--prompt-delay", type=float, default=0.9,
-                    help="пауза после приглашения agent>, секунды")
+                    help="пауза после приглашения goagent>, секунды")
     ap.add_argument("--blank-delay", type=float, default=0.15,
                     help="пауза на пустой строке, секунды")
     args = ap.parse_args()

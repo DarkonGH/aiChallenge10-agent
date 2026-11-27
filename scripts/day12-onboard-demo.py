@@ -52,7 +52,7 @@ def main() -> None:
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", HEIGHT, WIDTH, 0, 0))
     proc = subprocess.Popen(
-        ["./agent", "-data", DATA, "-session", "demo", "-profile", "demo",
+        ["./goagent", "-data", DATA, "-session", "demo", "-profile", "demo",
          "-model", MODEL, "-summary-model", MODEL, "-no-reasoning"],
         stdin=slave, stdout=slave, stderr=slave,
         start_new_session=True, close_fds=True)
@@ -151,7 +151,7 @@ def main() -> None:
         print(f"… онбординг {i}/3", flush=True)
         type_line(answer)
     wait_for("профиль пополнен из диалога")
-    wait_for("agent> ")
+    wait_for("goagent> ")
 
     # Вопрос в исходном профиле: кратко, без кода.
     ask(QUESTION)

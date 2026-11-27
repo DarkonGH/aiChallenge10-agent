@@ -29,7 +29,8 @@
       },
       "rules": {
         "read_file": {
-          "path_under": "${MCP_FS_ROOT}"
+          "path_under": "${MCP_FS_ROOT}",
+          "deny_names": [".env", ".env.*", "*.pem", "*.key", "*.p12", "id_rsa*", "id_ed25519*", "credentials*", "secrets*"]
         },
         "list_directory": {
           "path_under": "${MCP_FS_ROOT}"
@@ -100,6 +101,31 @@
         "save_tick": "Сохранить замер курса в append-only JSONL-журнал; возвращает общее число записей.",
         "read_period": "Прочитать замеры за период [from, to]. summary=true — count, first/last, min/max/avg/delta и серии runs без сырых тиков; limit/offset — порционный вывод.",
         "list_periods": "Показать серии замеров за период [from, to] без сырых тиков: count, first, last, runs [{from,to,count}]."
+      }
+    },
+    {
+      "name": "pipeline",
+      "command": "./bin/mcp-pipeline",
+      "args": [],
+      "required": false,
+      "env": {
+        "PIPELINE_SEARCH_ROOT": "${PIPELINE_SEARCH_ROOT}",
+        "PIPELINE_OUT_DIR": "${PIPELINE_OUT_DIR}"
+      },
+      "allow": [
+        "search",
+        "summarize",
+        "save_to_file"
+      ],
+      "approval": {
+        "search": "allow",
+        "summarize": "allow",
+        "save_to_file": "ask"
+      },
+      "descriptions": {
+        "search": "Найти текст в рабочем каталоге модели по запросу; count=0 означает, что данных нет.",
+        "summarize": "Сделать резюме по items от search; пустой items — ошибка шага 2.",
+        "save_to_file": "Сохранить готовый текст в файл внутри каталога вывода."
       }
     }
   ]

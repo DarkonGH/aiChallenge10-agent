@@ -4,7 +4,7 @@
 Зачем: живая запись демо на модели нестабильна (модель недетерминирована,
 иногда не доходит до финала). Удачный прогон — единственный полный; здесь тот
 же диалог перекладывается в каст без новых вызовов модели: user-реплики
-печатаются как 'agent> <текст>', assistant-текст и вывод инструмента — следом,
+печатаются как 'goagent> <текст>', assistant-текст и вывод инструмента — следом,
 память — приглушённо, отказ кода — строкой «⛔ код: …». Дальше каст собирает
 render_cast.py с карточками из testdata/dayNN-cards.json.
 
@@ -153,7 +153,7 @@ def convert(in_path, out_path, commands_path=""):
                                 events.append(("command_out", "", plain_text(out_line)))
                             pending.remove(c)
                     flush_memory()
-                    text = wrap_text(plain_text(raw), COLS - len("agent> "))
+                    text = wrap_text(plain_text(raw), COLS - len("goagent> "))
                     events.append(("user", "", text))
             elif role == "assistant":
                 flush_memory()
@@ -191,14 +191,14 @@ def convert(in_path, out_path, commands_path=""):
         # В консоли приглашение отделено от предыдущего вывода пустой строкой.
         # Баннер уже заканчивается пустой строкой — вторую не добавляем, а вот
         # после ответа, таблицы или trace пустая строка нужна: иначе в видео
-        # реплики сливаются и «agent>» трудно найти.
+        # реплики сливаются и «goagent>» трудно найти.
         if out and out[-1][2].endswith("\n\n"):
             return ""
         return "\n"
 
     for kind, name, text in events:
         if kind == "user":
-            out.append((round(t, 3), "o", f"{prompt_lead()}agent> {text}\n"))
+            out.append((round(t, 3), "o", f"{prompt_lead()}goagent> {text}\n"))
             t += 1.0
         elif kind == "assistant":
             out.append((round(t, 3), "o", f"{text}\n"))
@@ -210,8 +210,8 @@ def convert(in_path, out_path, commands_path=""):
             out.append((round(t, 3), "o", f"  ⛔ код: {text}\n"))
             t += 0.8
         elif kind == "command":
-            body = wrap_text(text, COLS - len("agent> "))
-            out.append((round(t, 3), "o", f"{prompt_lead()}agent> {body}\n"))
+            body = wrap_text(text, COLS - len("goagent> "))
+            out.append((round(t, 3), "o", f"{prompt_lead()}goagent> {body}\n"))
             t += 0.9
         elif kind == "command_out":
             body = wrap_text(text, COLS - 2)

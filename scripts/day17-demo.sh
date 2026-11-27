@@ -22,9 +22,9 @@ rm -rf "$ROOT"
 mkdir -p "$DATA" bin
 
 go build -o bin/mcp-cbr ./cmd/mcp-cbr
-go build -o agent .
+go build -o goagent .
 
-./agent -data "$DATA" -session demo \
+./goagent -data "$DATA" -session demo \
   -model "$MODEL" -summary-model "$SUMMARY_MODEL" \
   -no-reasoning -skip-profile -no-memory \
   -mcp-approval=allow -mcp-guard=heuristic \

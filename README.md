@@ -1,4 +1,4 @@
-# agent — первый CLI-агент с инструментами
+# goagent — первый CLI-агент с инструментами
 
 Интерактивный чат-агент на Go. Пользователь пишет запрос в консоль, агент
 отправляет его в LLM, сам решает, какой инструмент вызвать, получает результат
@@ -18,11 +18,11 @@ export OPENAI_API_KEY="..."
 
 ./run.sh                 # интерактивный чат
 ./run.sh -script testdata/checks.txt   # три проверки из задания
-./agent -list-models
-./agent -list-sessions
-./agent -continue     # продолжить последнюю сессию
-./agent -print-session 20261111-204115-1820   # весь лог сессии, офлайн
-./agent -print-session last                   # то же для последней
+./goagent -list-models
+./goagent -list-sessions
+./goagent -continue     # продолжить последнюю сессию
+./goagent -print-session 20261111-204115-1820   # весь лог сессии, офлайн
+./goagent -print-session last                   # то же для последней
 ```
 
 `-print-session` читает только `session.jsonl` с диска: ни сети, ни ключей,
@@ -31,11 +31,18 @@ export OPENAI_API_KEY="..."
 моделей; в заголовке — модели, с которыми сессия закончила.
 
 Флаги: `-model`, `-summary-model`, `-session`, `-continue`, `-data`,
-`-max-steps`, `-max-prompt-tokens`, `-reserve-output`, `-min-tail-tokens`,
-`-max-tool-chars`, `-temperature`, `-max-tokens`, `-system`, `-script`,
-`-no-reasoning`, `-profile`, `-skip-profile`, `-print-session`.
+`-workdir`, `-max-steps`, `-max-prompt-tokens`, `-reserve-output`,
+`-min-tail-tokens`, `-max-tool-chars`, `-temperature`, `-max-tokens`,
+`-system`, `-script`, `-no-reasoning`, `-profile`, `-skip-profile`,
+`-print-session`.
 Модели по умолчанию берутся из `LLM_MODEL` / `LLM_SUMMARY_MODEL`.
 `run.sh` сам подхватывает `~/.env`, если переменные не экспортированы.
+
+`-workdir` задаёт единственный каталог, который модель может читать и
+куда может писать. По умолчанию это `~/goagent-work` (или `AGENT_WORK_DIR`);
+внутри создаются `notes/` и `reports/`. Абсолютные пути, `..` и symlink за
+пределы каталога отклоняются; секреты и скрытые файлы не попадают в поиск.
+Каталог сессий (`-data`) с рабочим каталогом не пересекается.
 Если `LLM_SUMMARY_BASE_URL` не задан и локальный Ollama отвечает на
 `localhost:11434`, `run.sh` направляет сжатие и проверку инвариантов на
 `qwen2.5:14b`; иначе они идут на чат-клиент (`opencode`).
@@ -102,9 +109,10 @@ export OPENAI_API_KEY="..."
 защиту дают allowlist, проверка путей/URL и подтверждение пользователя.
 
 В репозитории есть и свои MCP-серверы на Go: `cmd/mcp-cbr` (курс ЦБ РФ),
-`cmd/mcp-forex` (Coinbase spot + JSONL) и `cmd/mcp-fetch` (локальный HTTP).
-Они запускаются как обычные дочерние процессы по `mcp.json`; `rates` и
-`forex` уже прописаны в конфиге проекта.
+`cmd/mcp-forex` (Coinbase spot + JSONL), `cmd/mcp-pipeline` (`search` →
+`summarize` → `save_to_file`) и `cmd/mcp-fetch` (локальный HTTP). Они
+запускаются как обычные дочерние процессы по `mcp.json`; `rates`, `forex` и
+`pipeline` уже прописаны в конфиге проекта.
 
 ## Планировщик и накопление (день 18)
 
@@ -143,7 +151,7 @@ export OPENAI_API_KEY="..."
 
 ```bash
 FOREX_STORE=/tmp/day18/forex.jsonl \
-  ./agent -mcp-config testdata/day18-mcp.json -mcp-approval=allow \
+  ./goagent -mcp-config testdata/day18-mcp.json -mcp-approval=allow \
   -schedule-interval 10s -schedule-runs 6 -schedule-report-every 3 \
   -schedule-pair USD/RUB
 ```
@@ -153,6 +161,33 @@ FOREX_STORE=/tmp/day18/forex.jsonl \
 перезапуск: `NewStore` читает существующий JSONL и продолжает нумерацию.
 Чат-демо — `scripts/day18-chat.sh` и `scripts/check_day18_chat.py`; старое
 CLI-демо — `scripts/day18-demo.sh` и `scripts/check_day18.py`.
+
+## Композиция MCP (день 19)
+
+Один MCP-сервер `pipeline` содержит три инструмента: `search` рекурсивно
+ищет по текстовым файлам рабочего каталога, `summarize` делает резюме по
+найденным `items`, а `save_to_file` сохраняет текст в файл. Локального
+`run_pipeline` нет — модель сама строит цепочку:
+
+```json
+mcp_pipeline_search({"query": "MCP", "path": "notes"})
+mcp_pipeline_summarize({"items": [...], "max_sentences": 5})
+mcp_pipeline_save_to_file({"path": "mcp-summary.md", "content": "..."})
+```
+
+Если `search` вернул 0 документов, `summarize` не вызывается. Если ошибку
+вернул `summarize`, не вызывается `save_to_file`. В системный промпт
+добавлены правила 6 и 7: не выдумывать данные при пустом результате или
+ошибке и самому передавать `items`/`summary` между шагами. Флаги `empty` и
+`fail` нужны для воспроизводимой проверки сбоев.
+
+Рабочий каталог модели — `~/goagent-work` (флаг `-workdir` или
+`AGENT_WORK_DIR`). Внутри `notes/` и `reports/`; поиск идёт по всему
+каталогу, запись — только в `reports/`. Секреты (`.env*`, `*.pem`, `*.key`,
+`id_rsa*`, `credentials*`), скрытые файлы и бинарники пропускаются.
+`PIPELINE_SEARCH_ROOT` и `PIPELINE_OUT_DIR` выставляются из workdir; старый
+`PIPELINE_NOTES_DIR` остаётся алиасом. Демо — `scripts/day19-demo.sh`,
+проверка — `scripts/check_day19.py` (34 проверки).
 
 ## Цикл агента
 
@@ -237,7 +272,7 @@ $XDG_DATA_HOME/goagent/sessions/<session-id>/session.jsonl
 
 ## Сжатие контекста
 
-Бюджет: `-max-prompt-tokens` (6000) минус `-reserve-output` (1024). Перед каждым
+Бюджет: `-max-prompt-tokens` (10000) минус `-reserve-output` (1024). Перед каждым
 запросом считается размер промпта; при заполнении выше 85% запускается сжатие.
 
 Второй, независимый триггер — `-compact-every N` (по умолчанию 0, выключен):
@@ -248,7 +283,7 @@ N триггер срабатывал бы каждый ход. Что наст�
 сжатие; по счётчику делается один проход, по бюджету — до трёх, чтобы окно
 гарантированно влезло.
 
-1. **Усечение tool-выводов в промпте** до `-max-tool-chars` (800). Полный
+1. **Усечение tool-выводов в промпте** до `-max-tool-chars` (4000). Полный
    результат остаётся в логе.
 2. **Скользящее окно** — последние ходы (не меньше `-min-tail-tokens`, 1200)
    остаются дословно. Граница окна всегда по сообщению `user`, поэтому пара
@@ -460,7 +495,7 @@ summary-фазы, в `window`/`facts` хранится в журнале, но �
 
 Считаются на трёх уровнях:
 
-- **текущий запрос** — `промпт ~X/6000` в футере после каждого ответа: оценка
+- **текущий запрос** — `промпт ~X/10000` в футере после каждого ответа: оценка
   system + конспекта + активного окна (tool-выводы усечены так же, как в
   реальном запросе);
 - **ответ модели** — `ответ ~N ток` из реального `usage.completion_tokens`
@@ -480,10 +515,10 @@ summary-фазы, в `window`/`facts` хранится в журнале, но �
 Как растут числа по ходу диалога (реальный прогон на glm-5.3-flash):
 
 ```
-промпт ~507/6000  · ответ ~23   · $0.0010
-промпт ~940/6000  · ответ ~193  · $0.0016
-промпт ~2129/6000 · ответ ~671  · $0.0028
-промпт ~3800/6000 · ответ ~1185 · $0.0049
+промпт ~507/10000  · ответ ~23   · $0.0010
+промпт ~940/10000  · ответ ~193  · $0.0016
+промпт ~2129/10000 · ответ ~671  · $0.0028
+промпт ~3800/10000 · ответ ~1185 · $0.0049
 ```
 
 Что бывает при переполнении:
@@ -536,7 +571,7 @@ change | remove | history]`, `/mcp [status | approvals | reset]`. `/session` б�
   не поддерживает стрим, агент автоматически повторяет
   запрос в обычном режиме; частично напечатанный ответ при обрыве не
   дублируется.
-- Пока модель думает, под строкой `agent> ` крутится односимвольный спиннер
+- Пока модель думает, под строкой `goagent> ` крутится односимвольный спиннер
   `/ - \ |` (только в TTY; в `-script`-режиме — сообщение каждые 10 с, пока
   стрим молчит).
 - **Рассуждения модели** (reasoning-дельты) печатаются там же серым, построчно:

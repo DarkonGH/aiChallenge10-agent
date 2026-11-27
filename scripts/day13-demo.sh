@@ -19,6 +19,6 @@ delay=${SCRIPT_DELAY:-45s}
 rm -rf "$data"
 mkdir -p "$data"
 
-exec ./agent -data "$data" -session demo \
+exec ./goagent -data "$data" -session demo \
   -model "$model" -summary-model "$model" -no-reasoning -script testdata/day13-demo.txt \
   -script-delay "$delay"

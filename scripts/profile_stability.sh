@@ -17,7 +17,7 @@ mkdir -p "$root/profiles/кратко"
 cp testdata/day12-profiles/кратко/profile.json "$root/profiles/кратко/profile.json"
 { grep -v '^#' testdata/day12-stability.txt | sed '/^[[:space:]]*$/d'; echo '/exit'; } > "$root/script.txt"
 
-./agent -data "$root" -session run -profile кратко \
+./goagent -data "$root" -session run -profile кратко \
   -model "$model" -summary-model "$model" -no-reasoning -skip-profile -script "$root/script.txt" \
   > "$root/run.log" 2>&1
 

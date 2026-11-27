@@ -1,4 +1,4 @@
-/agent
+/goagent
 /data/
 .env
 .env.*

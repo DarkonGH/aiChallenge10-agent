@@ -91,6 +91,22 @@ func TestCheckArgsURLAnyPublicHost(t *testing.T) {
 	}
 }
 
+func TestCheckArgsDenyNames(t *testing.T) {
+	root := t.TempDir()
+	sc := ServerConfig{Rules: map[string]Rule{"read_file": {
+		PathUnder: root,
+		DenyNames: []string{".env", "*.pem", "credentials*"},
+	}}}
+	for _, name := range []string{".env", "server.pem", "credentials.json"} {
+		if err := CheckArgs(sc, "read_file", args(map[string]any{"path": filepath.Join(root, name)})); err == nil {
+			t.Errorf("%s allowed", name)
+		}
+	}
+	if err := CheckArgs(sc, "read_file", args(map[string]any{"path": filepath.Join(root, "notes.md")})); err != nil {
+		t.Errorf("notes.md rejected: %v", err)
+	}
+}
+
 func TestCheckArgsNoRule(t *testing.T) {
 	if err := CheckArgs(ServerConfig{}, "anything", args(map[string]any{"x": 1})); err != nil {
 		t.Errorf("unexpected error: %v", err)
